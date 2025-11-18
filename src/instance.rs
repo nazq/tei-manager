@@ -48,8 +48,8 @@ impl TeiInstance {
     }
 
     /// Start the TEI process
-    pub async fn start(&self) -> Result<()> {
-        let mut cmd = Command::new("text-embeddings-router");
+    pub async fn start(&self, tei_binary_path: &str) -> Result<()> {
+        let mut cmd = Command::new(tei_binary_path);
 
         // Set GPU assignment if specified
         if let Some(gpu_id) = self.config.gpu_id {
@@ -149,12 +149,12 @@ impl TeiInstance {
     }
 
     /// Restart the instance
-    pub async fn restart(&self) -> Result<()> {
+    pub async fn restart(&self, tei_binary_path: &str) -> Result<()> {
         tracing::info!(instance = %self.config.name, "Restarting instance");
 
         self.stop().await?;
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        self.start().await?;
+        self.start(tei_binary_path).await?;
 
         let mut stats = self.stats.write().await;
         stats.restarts += 1;

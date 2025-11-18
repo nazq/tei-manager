@@ -106,6 +106,7 @@ docker run -d \
     -p 8081:8081 \
     -p 8082:8082 \
     -e TEI_MANAGER_STATE_FILE=/tmp/state.toml \
+    -e TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router-mock \
     "$IMAGE_NAME" \
     --log-format pretty --log-level info || log_fail "Failed to start container"
 

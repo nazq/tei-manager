@@ -11,14 +11,16 @@ use tokio::sync::RwLock;
 pub struct Registry {
     instances: Arc<RwLock<HashMap<String, Arc<TeiInstance>>>>,
     max_instances: Option<usize>,
+    tei_binary_path: Arc<str>,
 }
 
 impl Registry {
     /// Create a new registry
-    pub fn new(max_instances: Option<usize>) -> Self {
+    pub fn new(max_instances: Option<usize>, tei_binary_path: String) -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
             max_instances,
+            tei_binary_path: Arc::from(tei_binary_path),
         }
     }
 
@@ -97,6 +99,11 @@ impl Registry {
         let instances = self.instances.read().await;
         instances.len()
     }
+
+    /// Get TEI binary path
+    pub fn tei_binary_path(&self) -> &str {
+        &self.tei_binary_path
+    }
 }
 
 #[cfg(test)]
@@ -105,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_add_and_get() {
-        let registry = Registry::new(None);
+        let registry = Registry::new(None, "text-embeddings-router".to_string());
 
         let config = InstanceConfig {
             name: "test".to_string(),
@@ -129,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_name_rejection() {
-        let registry = Registry::new(None);
+        let registry = Registry::new(None, "text-embeddings-router".to_string());
 
         let config1 = InstanceConfig {
             name: "test".to_string(),
@@ -161,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_port_conflict_detection() {
-        let registry = Registry::new(None);
+        let registry = Registry::new(None, "text-embeddings-router".to_string());
 
         let config1 = InstanceConfig {
             name: "test1".to_string(),
@@ -193,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_max_instances_limit() {
-        let registry = Registry::new(Some(2));
+        let registry = Registry::new(Some(2), "text-embeddings-router".to_string());
 
         for i in 0..2 {
             let config = InstanceConfig {

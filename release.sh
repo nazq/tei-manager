@@ -178,20 +178,20 @@ fi
 
 # Create git tag
 log_info "Creating git tag v${VERSION}..."
-if git tag -a "v${VERSION}" -m "Release version ${VERSION}"; then
+if git tag -a -f "v${VERSION}" -m "Release version ${VERSION}"; then
     log_success "Created git tag v${VERSION}"
 
     read -p "Push git tag to origin? (y/N) " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        if git push origin "v${VERSION}"; then
+        if git push -f origin "v${VERSION}"; then
             log_success "Pushed git tag to origin"
         else
             log_warn "Failed to push git tag (you may need to push manually)"
         fi
     fi
 else
-    log_warn "Git tag already exists or creation failed"
+    log_warn "Git tag creation failed"
 fi
 
 # Summary

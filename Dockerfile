@@ -50,14 +50,14 @@ RUN uv python install 3.14
 # Copy tei-manager binary from builder
 COPY --from=builder /build/target/release/tei-manager /usr/local/bin/tei-manager
 
-# Copy real text-embeddings-router from official TEI image
-COPY --from=tei /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router-real
+# Copy real text-embeddings-router from official TEI image (default for production use)
+COPY --from=tei /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router
 
-# Copy mock TEI router for testing (install as default for E2E tests)
-COPY tests/mock-tei-router /usr/local/bin/text-embeddings-router
+# Copy mock TEI router for testing only (use TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router-mock)
+COPY tests/mock-tei-router /usr/local/bin/text-embeddings-router-mock
 
 # Make scripts executable
-RUN chmod +x /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router-real
+RUN chmod +x /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router-mock
 
 # Create data directory for state persistence
 RUN mkdir -p /data && chmod 777 /data

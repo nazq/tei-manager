@@ -71,12 +71,13 @@ async fn main() -> Result<()> {
     let prometheus_handle = metrics::setup_metrics()?;
 
     // Initialize registry
-    let registry = Arc::new(Registry::new(config.max_instances));
+    let registry = Arc::new(Registry::new(config.max_instances, config.tei_binary_path.clone()));
 
     // Initialize state manager
     let state_manager = Arc::new(StateManager::new(
         config.state_file.clone(),
         registry.clone(),
+        config.tei_binary_path.clone(),
     ));
 
     // Restore instances or seed from config
@@ -91,7 +92,7 @@ async fn main() -> Result<()> {
         for instance_config in config.instances {
             match registry.add(instance_config.clone()).await {
                 Ok(instance) => {
-                    if let Err(e) = instance.start().await {
+                    if let Err(e) = instance.start(&config.tei_binary_path).await {
                         tracing::error!(
                             error = %e,
                             instance = %instance_config.name,
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
         config.health_check_initial_delay_secs,
         config.max_failures_before_restart,
         true, // auto_restart
+        config.tei_binary_path.clone(),
     ));
 
     let monitor_handle = tokio::spawn({

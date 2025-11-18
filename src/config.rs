@@ -18,6 +18,9 @@ pub struct ManagerConfig {
     pub auto_restore_on_restart: bool,
     pub max_instances: Option<usize>,
     pub instances: Vec<InstanceConfig>,
+
+    #[serde(default = "default_tei_binary_path")]
+    pub tei_binary_path: String,
 }
 
 impl Default for ManagerConfig {
@@ -32,6 +35,7 @@ impl Default for ManagerConfig {
             auto_restore_on_restart: false,
             max_instances: None,
             instances: Vec::new(),
+            tei_binary_path: default_tei_binary_path(),
         }
     }
 }
@@ -58,6 +62,9 @@ impl ManagerConfig {
             config.health_check_interval_secs = interval
                 .parse()
                 .context("Invalid TEI_MANAGER_HEALTH_CHECK_INTERVAL value")?;
+        }
+        if let Ok(binary_path) = std::env::var("TEI_BINARY_PATH") {
+            config.tei_binary_path = binary_path;
         }
 
         Ok(config)
@@ -176,6 +183,9 @@ fn default_max_batch_tokens() -> u32 {
 }
 fn default_max_concurrent_requests() -> u32 {
     512
+}
+fn default_tei_binary_path() -> String {
+    "text-embeddings-router".to_string()
 }
 
 #[cfg(test)]

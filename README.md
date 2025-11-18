@@ -121,12 +121,20 @@ cargo build --release
 
 The Docker image includes:
 - ✅ Pre-compiled `tei-manager` binary
-- ✅ Real `text-embeddings-router` from official TEI image (1.8.3-grpc)
-- ✅ Mock TEI router for testing
+- ✅ Real `text-embeddings-router` from official TEI image (1.8.3-grpc, default)
+- ✅ Mock TEI router for testing (`/usr/local/bin/text-embeddings-router-mock`)
 - ✅ Python 3.14 via `uv` for mock router execution
 
 ```bash
 docker build -t tei-manager:latest .
+
+# Run with real TEI binary (default)
+docker run -d -p 9000:9000 tei-manager:latest
+
+# Run with mock for testing (use TEI_BINARY_PATH env var)
+docker run -d -p 9000:9000 \
+  -e TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router-mock \
+  tei-manager:latest
 ```
 
 ---
@@ -182,6 +190,16 @@ Override config file values with environment variables:
 TEI_MANAGER_API_PORT=9000
 TEI_MANAGER_STATE_FILE=/data/state.toml
 TEI_MANAGER_HEALTH_CHECK_INTERVAL=30
+TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router  # Path to TEI binary
+```
+
+**Docker Users:** The Docker image includes both real and mock TEI binaries:
+- `/usr/local/bin/text-embeddings-router` - Real TEI binary (default, 838MB)
+- `/usr/local/bin/text-embeddings-router-mock` - Mock for testing (5KB)
+
+To use the mock for testing:
+```bash
+docker run -e TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router-mock tei-manager:latest
 ```
 
 ### CLI Arguments

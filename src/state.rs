@@ -13,14 +13,16 @@ use tokio::io::AsyncWriteExt;
 pub struct StateManager {
     state_file: PathBuf,
     registry: Arc<Registry>,
+    tei_binary_path: Arc<str>,
 }
 
 impl StateManager {
     /// Create a new state manager
-    pub fn new(state_file: PathBuf, registry: Arc<Registry>) -> Self {
+    pub fn new(state_file: PathBuf, registry: Arc<Registry>, tei_binary_path: String) -> Self {
         Self {
             state_file,
             registry,
+            tei_binary_path: Arc::from(tei_binary_path),
         }
     }
 
@@ -109,7 +111,7 @@ impl StateManager {
         for config in state.instances {
             match self.registry.add(config.clone()).await {
                 Ok(instance) => {
-                    if let Err(e) = instance.start().await {
+                    if let Err(e) = instance.start(&self.tei_binary_path).await {
                         tracing::error!(
                             instance = %config.name,
                             error = %e,
@@ -157,8 +159,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let state_file = temp_dir.path().join("state.toml");
 
-        let registry = Arc::new(Registry::new(None));
-        let state_manager = StateManager::new(state_file.clone(), registry.clone());
+        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let state_manager = StateManager::new(state_file.clone(), registry.clone(), "text-embeddings-router".to_string());
 
         // Add an instance
         let config = InstanceConfig {
@@ -196,8 +198,8 @@ mod tests {
         // Write corrupted TOML
         std::fs::write(&state_file, "this is not valid TOML {{{}").unwrap();
 
-        let registry = Arc::new(Registry::new(None));
-        let state_manager = StateManager::new(state_file, registry);
+        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let state_manager = StateManager::new(state_file, registry, "text-embeddings-router".to_string());
 
         // Should fail hard
         assert!(state_manager.load().await.is_err());

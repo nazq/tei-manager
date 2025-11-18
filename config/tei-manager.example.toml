@@ -24,6 +24,13 @@ auto_restore_on_restart = true
 # Maximum number of instances (optional, omit for unlimited)
 max_instances = 5
 
+# Path to text-embeddings-router binary
+# Default: "text-embeddings-router" (searches PATH)
+# Override via environment variable: TEI_BINARY_PATH=/path/to/binary
+# Docker users: Real binary is at /usr/local/bin/text-embeddings-router (default)
+#               Mock binary for testing is at /usr/local/bin/text-embeddings-router-mock
+# tei_binary_path = "text-embeddings-router"
+
 # Optional: Seed instances on first boot
 # These will be created and started automatically when the manager starts
 

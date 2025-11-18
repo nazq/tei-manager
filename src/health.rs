@@ -12,6 +12,7 @@ pub struct HealthMonitor {
     initial_delay: Duration,
     auto_restart: bool,
     max_failures_before_restart: u32,
+    tei_binary_path: Arc<str>,
 }
 
 impl HealthMonitor {
@@ -22,6 +23,7 @@ impl HealthMonitor {
         initial_delay_secs: u64,
         max_failures_before_restart: u32,
         auto_restart: bool,
+        tei_binary_path: String,
     ) -> Self {
         Self {
             registry,
@@ -29,6 +31,7 @@ impl HealthMonitor {
             initial_delay: Duration::from_secs(initial_delay_secs),
             auto_restart,
             max_failures_before_restart,
+            tei_binary_path: Arc::from(tei_binary_path),
         }
     }
 
@@ -135,7 +138,7 @@ impl HealthMonitor {
 
             drop(stats); // Release lock before restart
 
-            if let Err(e) = instance.restart().await {
+            if let Err(e) = instance.restart(&self.tei_binary_path).await {
                 tracing::error!(
                     instance = %instance.config.name,
                     error = %e,
@@ -154,8 +157,8 @@ mod tests {
 
     #[test]
     fn test_health_monitor_creation() {
-        let registry = Arc::new(Registry::new(None));
-        let monitor = HealthMonitor::new(registry, 30, 60, 3, true);
+        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let monitor = HealthMonitor::new(registry, 30, 60, 3, true, "text-embeddings-router".to_string());
 
         assert_eq!(monitor.check_interval.as_secs(), 30);
         assert_eq!(monitor.initial_delay.as_secs(), 60);

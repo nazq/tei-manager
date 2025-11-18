@@ -56,6 +56,7 @@ pub async fn create_instance(
         max_concurrent_requests: req.max_concurrent_requests.unwrap_or(512),
         pooling: req.pooling,
         gpu_id: req.gpu_id,
+        prometheus_port: req.prometheus_port,
         extra_args: req.extra_args.unwrap_or_default(),
         created_at: Some(chrono::Utc::now()),
     };

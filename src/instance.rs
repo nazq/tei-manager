@@ -74,6 +74,11 @@ impl TeiInstance {
             cmd.arg("--pooling").arg(pooling);
         }
 
+        // Set Prometheus port (default auto-assigned, 0 = disabled)
+        if let Some(prom_port) = self.config.prometheus_port {
+            cmd.arg("--prometheus-port").arg(prom_port.to_string());
+        }
+
         // Add extra args
         for arg in &self.config.extra_args {
             cmd.arg(arg);
@@ -189,6 +194,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: None,
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };
@@ -208,6 +214,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: Some(1),
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };

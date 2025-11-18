@@ -171,6 +171,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: Some(1),
+            prometheus_port: None,
             extra_args: vec![],
             created_at: Some(chrono::Utc::now()),
         };

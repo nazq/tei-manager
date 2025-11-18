@@ -30,6 +30,9 @@ pub struct CreateInstanceRequest {
     pub gpu_id: Option<u32>,
 
     #[serde(default)]
+    pub prometheus_port: Option<u16>,
+
+    #[serde(default)]
     pub extra_args: Option<Vec<String>>,
 }
 
@@ -47,6 +50,7 @@ pub struct InstanceInfo {
     pub health_check_failures: u32,
     pub last_health_check: Option<chrono::DateTime<chrono::Utc>>,
     pub gpu_id: Option<u32>,
+    pub prometheus_port: Option<u16>,
 }
 
 impl InstanceInfo {
@@ -72,6 +76,7 @@ impl InstanceInfo {
             health_check_failures: stats.health_check_failures,
             last_health_check: stats.last_health_check,
             gpu_id: instance.config.gpu_id,
+            prometheus_port: instance.config.prometheus_port,
         }
     }
 }

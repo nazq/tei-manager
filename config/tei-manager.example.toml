@@ -41,6 +41,7 @@ port = 8080
 max_batch_tokens = 16384
 max_concurrent_requests = 512
 # gpu_id = 0  # Optional: pin to specific GPU (omit to use all GPUs)
+# prometheus_port = 9100  # Optional: Prometheus port (auto-assigned if omitted, 0 to disable)
 
 [[instances]]
 name = "all-mpnet"
@@ -49,6 +50,7 @@ port = 8081
 max_batch_tokens = 16384
 max_concurrent_requests = 512
 gpu_id = 1  # Example: pin to GPU 1
+# prometheus_port = 9101  # Auto-assigned starting from 9100
 
 # Multi-GPU Configuration Notes:
 # - If gpu_id is omitted, the instance can access all GPUs

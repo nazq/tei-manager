@@ -150,6 +150,12 @@ pub struct InstanceConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_id: Option<u32>,
 
+    /// Prometheus metrics port for this TEI instance
+    /// If None, auto-assigned starting from 9100
+    /// Set to 0 to disable Prometheus metrics
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prometheus_port: Option<u16>,
+
     /// Additional CLI args to pass to text-embeddings-router
     #[serde(default)]
     pub extra_args: Vec<String>,
@@ -222,6 +228,7 @@ mod tests {
                     max_concurrent_requests: 10,
                     pooling: None,
                     gpu_id: None,
+                    prometheus_port: None,
                     extra_args: vec![],
                     created_at: None,
                 },
@@ -233,6 +240,7 @@ mod tests {
                     max_concurrent_requests: 10,
                     pooling: None,
                     gpu_id: None,
+                    prometheus_port: None,
                     extra_args: vec![],
                     created_at: None,
                 },
@@ -253,6 +261,7 @@ mod tests {
                 max_concurrent_requests: 10,
                 pooling: None,
                 gpu_id: None,
+                prometheus_port: None,
                 extra_args: vec![],
                 created_at: None,
             }],

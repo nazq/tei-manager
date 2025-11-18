@@ -263,7 +263,8 @@ GET /instances
     "restarts": 0,
     "health_check_failures": 0,
     "last_health_check": "2025-11-18T19:59:30Z",
-    "gpu_id": null
+    "gpu_id": null,
+    "prometheus_port": 9100
   }
 ]
 ```
@@ -295,6 +296,7 @@ Content-Type: application/json
   "max_concurrent_requests": 512,
   "pooling": "splade",
   "gpu_id": 0,
+  "prometheus_port": 9100,
   "extra_args": ["--dtype", "float16"]
 }
 ```
@@ -309,6 +311,7 @@ Content-Type: application/json
 - `max_concurrent_requests` - Default: 512
 - `pooling` - Pooling method (e.g., "splade" for sparse models)
 - `gpu_id` - GPU ID to pin instance to (omit to use all GPUs)
+- `prometheus_port` - Prometheus metrics port (auto-assigned from 9100+, 0 to disable)
 - `extra_args` - Additional CLI arguments for `text-embeddings-router`
 
 **Response:** `201 Created` with instance details

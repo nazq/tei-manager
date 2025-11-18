@@ -12,6 +12,7 @@ pub struct Registry {
     instances: Arc<RwLock<HashMap<String, Arc<TeiInstance>>>>,
     max_instances: Option<usize>,
     tei_binary_path: Arc<str>,
+    next_prometheus_port: Arc<RwLock<u16>>,
 }
 
 impl Registry {
@@ -21,12 +22,13 @@ impl Registry {
             instances: Arc::new(RwLock::new(HashMap::new())),
             max_instances,
             tei_binary_path: Arc::from(tei_binary_path),
+            next_prometheus_port: Arc::new(RwLock::new(9100)),
         }
     }
 
     /// Add a new instance to the registry
     /// Returns error if name exists, port conflicts, or max instances reached
-    pub async fn add(&self, config: InstanceConfig) -> Result<Arc<TeiInstance>> {
+    pub async fn add(&self, mut config: InstanceConfig) -> Result<Arc<TeiInstance>> {
         let mut instances = self.instances.write().await;
 
         // Validate uniqueness
@@ -52,12 +54,20 @@ impl Registry {
             anyhow::bail!("Maximum instance count ({}) reached", max);
         }
 
+        // Auto-assign Prometheus port if not specified
+        if config.prometheus_port.is_none() {
+            let mut next_port = self.next_prometheus_port.write().await;
+            config.prometheus_port = Some(*next_port);
+            *next_port += 1;
+        }
+
         let instance = Arc::new(TeiInstance::new(config));
         instances.insert(instance.config.name.clone(), instance.clone());
 
         tracing::info!(
             instance = %instance.config.name,
             total_instances = instances.len(),
+            prometheus_port = ?instance.config.prometheus_port,
             "Instance added to registry"
         );
 
@@ -122,6 +132,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: None,
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };
@@ -146,6 +157,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: None,
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };
@@ -158,6 +170,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: None,
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };
@@ -178,6 +191,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: None,
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };
@@ -190,6 +204,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: None,
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };
@@ -211,6 +226,7 @@ mod tests {
                 max_concurrent_requests: 10,
                 pooling: None,
                 gpu_id: None,
+                prometheus_port: None,
                 extra_args: vec![],
                 created_at: None,
             };
@@ -226,6 +242,7 @@ mod tests {
             max_concurrent_requests: 10,
             pooling: None,
             gpu_id: None,
+            prometheus_port: None,
             extra_args: vec![],
             created_at: None,
         };

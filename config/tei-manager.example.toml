@@ -1,0 +1,49 @@
+# TEI Manager Example Configuration
+
+# API server port
+api_port = 9000
+
+# State file location for persisting instance configurations
+state_file = "/data/tei-manager-state.toml"
+
+# Health check interval in seconds
+health_check_interval_secs = 30
+
+# Initial delay before starting health checks (gives instances time to start)
+health_check_initial_delay_secs = 60
+
+# Number of consecutive health check failures before auto-restart
+max_failures_before_restart = 3
+
+# Graceful shutdown timeout in seconds
+graceful_shutdown_timeout_secs = 30
+
+# Auto-restore instances from state file on manager restart
+auto_restore_on_restart = true
+
+# Maximum number of instances (optional, omit for unlimited)
+max_instances = 5
+
+# Optional: Seed instances on first boot
+# These will be created and started automatically when the manager starts
+
+[[instances]]
+name = "bge-small"
+model_id = "BAAI/bge-small-en-v1.5"
+port = 8080
+max_batch_tokens = 16384
+max_concurrent_requests = 512
+# gpu_id = 0  # Optional: pin to specific GPU (omit to use all GPUs)
+
+[[instances]]
+name = "all-mpnet"
+model_id = "sentence-transformers/all-mpnet-base-v2"
+port = 8081
+max_batch_tokens = 16384
+max_concurrent_requests = 512
+gpu_id = 1  # Example: pin to GPU 1
+
+# Multi-GPU Configuration Notes:
+# - If gpu_id is omitted, the instance can access all GPUs
+# - User is responsible for VRAM management to avoid OOM errors
+# - Example: 2x 24GB GPUs can typically run 3-4 large embedding models

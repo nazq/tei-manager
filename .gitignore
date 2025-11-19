@@ -1,1 +1,4 @@
 /target
+/coverage
+tests/text-embeddings-router
+docs/refactor

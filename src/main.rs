@@ -71,7 +71,10 @@ async fn main() -> Result<()> {
     let prometheus_handle = metrics::setup_metrics()?;
 
     // Initialize registry
-    let registry = Arc::new(Registry::new(config.max_instances, config.tei_binary_path.clone()));
+    let registry = Arc::new(Registry::new(
+        config.max_instances,
+        config.tei_binary_path.clone(),
+    ));
 
     // Initialize state manager
     let state_manager = Arc::new(StateManager::new(

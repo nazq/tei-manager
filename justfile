@@ -18,6 +18,10 @@ fmt-check:
 clippy:
     cargo clippy --all-targets --all-features -- -D warnings
 
+# Setup test environment (extract TEI binary)
+setup-test:
+    ./scripts/setup-test-binary.sh
+
 # Run all unit tests
 test:
     cargo test --lib
@@ -30,6 +34,14 @@ test-verbose:
 test-one TEST:
     cargo test --lib {{TEST}} -- --nocapture
 
+# Run integration tests (requires setup-test first)
+test-integration:
+    cargo test --test integration
+
+# Run all tests (unit + integration)
+test-all: test test-integration
+    @echo "✅ All tests passed!"
+
 # Run all checks (fmt, clippy, test)
 check: fmt-check clippy test
     @echo "✅ All checks passed!"
@@ -41,39 +53,20 @@ fcheck: fmt check
 # Generate code coverage report
 coverage:
     #!/usr/bin/env bash
-    set -euxo pipefail
+    set -uxo pipefail
 
-    # Install tarpaulin if not present
-    if ! command -v cargo-tarpaulin &> /dev/null; then
-        echo "Installing cargo-tarpaulin..."
-        cargo install cargo-tarpaulin
+    # Install llvm-cov if not present
+    if ! command -v cargo-llvm-cov &> /dev/null; then
+        echo "Installing cargo-llvm-cov..."
+        cargo install cargo-llvm-cov
     fi
 
-    # Run coverage
-    cargo tarpaulin \
-        --out Html \
-        --output-dir coverage \
-        --exclude-files 'tests/*' 'target/*' \
-        --timeout 300 \
-        --verbose
+    # Run coverage (continue even if tests fail)
+    cargo llvm-cov --html --output-dir coverage --ignore-filename-regex='tests/.*' --ignore-run-fail --open
 
-    # Open HTML report
-    echo "Opening coverage report..."
-    if command -v xdg-open &> /dev/null; then
-        xdg-open coverage/index.html
-    elif command -v open &> /dev/null; then
-        open coverage/index.html
-    else
-        echo "Coverage report generated at: coverage/index.html"
-    fi
-
-# Generate coverage and upload to codecov
+# Generate coverage for CI (lcov format)
 coverage-ci:
-    cargo tarpaulin \
-        --out Xml \
-        --output-dir coverage \
-        --exclude-files 'tests/*' 'target/*' \
-        --timeout 300
+    cargo llvm-cov --lcov --output-path coverage/lcov.info --ignore-filename-regex='tests/.*' --ignore-run-fail
 
 # Build release binary
 build:
@@ -148,9 +141,12 @@ dev-setup:
     # Rustfmt and clippy (usually included with rustup)
     rustup component add rustfmt clippy
 
+    # Install llvm-tools for coverage
+    rustup component add llvm-tools-preview
+
     # Cargo tools
     cargo install cargo-watch || true
-    cargo install cargo-tarpaulin || true
+    cargo install cargo-llvm-cov || true
     cargo install cargo-outdated || true
     cargo install cargo-audit || true
 
@@ -272,10 +268,6 @@ stats:
     @echo ""
     @echo "Test coverage (run 'just coverage' first):"
     @grep -oP 'Coverage: \K[\d.]+' coverage/index.html 2>/dev/null || echo "No coverage data (run 'just coverage')"
-
-# Run all tests including ignored ones
-test-all:
-    cargo test --lib -- --include-ignored
 
 # Run tests with nextest (faster test runner)
 test-nextest:

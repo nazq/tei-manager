@@ -67,7 +67,10 @@ pub async fn create_instance(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    instance.start(state.registry.tei_binary_path()).await.map_err(ApiError::Internal)?;
+    instance
+        .start(state.registry.tei_binary_path())
+        .await
+        .map_err(ApiError::Internal)?;
 
     // Save state asynchronously
     let state_manager = state.state_manager.clone();
@@ -137,7 +140,10 @@ pub async fn start_instance(
         .await
         .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
 
-    instance.start(state.registry.tei_binary_path()).await.map_err(ApiError::Internal)?;
+    instance
+        .start(state.registry.tei_binary_path())
+        .await
+        .map_err(ApiError::Internal)?;
 
     let info = InstanceInfo::from_instance(&instance).await;
 

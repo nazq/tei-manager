@@ -29,12 +29,15 @@ pub fn create_router(state: AppState) -> Router {
         // Instance management (no PATCH - delete and recreate instead)
         .route("/instances", get(handlers::list_instances))
         .route("/instances", post(handlers::create_instance))
-        .route("/instances/:name", get(handlers::get_instance))
-        .route("/instances/:name", delete(handlers::delete_instance))
+        .route("/instances/{name}", get(handlers::get_instance))
+        .route("/instances/{name}", delete(handlers::delete_instance))
         // Instance lifecycle
-        .route("/instances/:name/start", post(handlers::start_instance))
-        .route("/instances/:name/stop", post(handlers::stop_instance))
-        .route("/instances/:name/restart", post(handlers::restart_instance))
+        .route("/instances/{name}/start", post(handlers::start_instance))
+        .route("/instances/{name}/stop", post(handlers::stop_instance))
+        .route(
+            "/instances/{name}/restart",
+            post(handlers::restart_instance),
+        )
         .with_state(state)
         .layer(
             ServiceBuilder::new()

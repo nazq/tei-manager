@@ -3,6 +3,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.91+-orange.svg)](https://www.rust-lang.org/)
 [![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![codecov](https://codecov.io/gh/nazq/tei-manager/branch/main/graph/badge.svg)](https://codecov.io/gh/nazq/tei-manager)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](Dockerfile)
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](test-e2e.sh)
 [![TEI](https://img.shields.io/badge/TEI-1.8.3-purple.svg)](https://github.com/huggingface/text-embeddings-inference)

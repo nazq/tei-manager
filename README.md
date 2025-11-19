@@ -110,7 +110,7 @@ Deploy TEI Manager on RunPod's GPU cloud platform for scalable embedding inferen
 ### Quick Deploy
 
 1. **Create Pod** with the following settings:
-   - **Container Image**: `nazq/tei-manager:latest`
+   - **Container Image**: `ghcr.io/nazq/tei-manager:latest`
    - **Container Disk**: 20 GB
    - **Volume**: 50 GB (recommended for model caching)
    - **Expose HTTP Ports**: `8000,9000`

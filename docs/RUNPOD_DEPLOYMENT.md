@@ -20,14 +20,14 @@ Deploy TEI Manager on RunPod's GPU cloud platform for scalable embedding inferen
 #### Option A: Using Docker Hub Image (Recommended)
 ```bash
 # Use the pre-built image
-docker pull ghcr.io/nazq/tei-manager:latest
+docker pull nazq/tei-manager:latest
 ```
 
 #### Option B: Custom Deployment
 1. Go to RunPod Console
 2. Click "Deploy" → "Custom"
 3. Use the following settings:
-   - **Container Image**: `ghcr.io/nazq/tei-manager:latest`
+   - **Container Image**: `nazq/tei-manager:latest`
    - **Container Disk**: 20 GB (minimum)
    - **Volume**: 50 GB (recommended for model caching)
    - **Expose HTTP Ports**: `8000,9000`
@@ -65,7 +65,7 @@ Save this as a RunPod template for easy deployment:
 {
   "name": "TEI Manager",
   "description": "Dynamic multi-instance manager for HuggingFace Text Embeddings Inference",
-  "imageName": "ghcr.io/nazq/tei-manager:latest",
+  "imageName": "nazq/tei-manager:latest",
   "dockerArgs": "",
   "ports": "8000/http,9000/http,8080/tcp,8081/tcp,8082/tcp,8083/tcp,8084/tcp,8085/tcp,8086/tcp,8087/tcp,8088/tcp,8089/tcp",
   "volumeInGb": 50,

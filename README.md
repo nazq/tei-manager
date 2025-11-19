@@ -41,6 +41,7 @@ Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https
 ## 📋 Table of Contents
 
 - [Quick Start](#-quick-start)
+- [RunPod Deployment](#-runpod-deployment)
 - [Installation](#-installation)
 - [Configuration](#-configuration)
 - [API Reference](#-api-reference)
@@ -99,6 +100,55 @@ TEI_MANAGER_API_PORT=9000 \
 TEI_MANAGER_STATE_FILE=/tmp/state.toml \
 ./target/release/tei-manager --log-format pretty
 ```
+
+---
+
+## ☁️ RunPod Deployment
+
+Deploy TEI Manager on RunPod's GPU cloud platform for scalable embedding inference.
+
+### Quick Deploy
+
+1. **Create Pod** with the following settings:
+   - **Container Image**: `ghcr.io/nazq/tei-manager:latest`
+   - **Container Disk**: 20 GB
+   - **Volume**: 50 GB (recommended for model caching)
+   - **Expose HTTP Ports**: `8000,9000`
+   - **Expose TCP Ports**: `8080-8089`
+
+2. **Set Environment Variables**:
+   ```bash
+   TEI_MANAGER_API_PORT=8000
+   TEI_MANAGER_STATE_FILE=/workspace/state.toml
+   RUST_LOG=info
+   ```
+
+3. **Access Your Instance**:
+   ```bash
+   # Your pod will be available at:
+   https://{POD_ID}-8000.proxy.runpod.net
+
+   # Create a TEI instance
+   curl -X POST https://{POD_ID}-8000.proxy.runpod.net/instances \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "bge-small",
+       "model_id": "BAAI/bge-small-en-v1.5",
+       "port": 8080,
+       "gpu_id": 0
+     }'
+
+   # Generate embeddings
+   curl -X POST https://{POD_ID}-8080.proxy.runpod.net/embed \
+     -H "Content-Type: application/json" \
+     -d '{"inputs": "Hello from RunPod!"}'
+   ```
+
+**📚 Full Guide**: See [docs/RUNPOD_DEPLOYMENT.md](docs/RUNPOD_DEPLOYMENT.md) for:
+- Complete deployment templates
+- Multi-GPU configuration
+- Production best practices
+- Troubleshooting guide
 
 ---
 

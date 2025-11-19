@@ -1,0 +1,46 @@
+# Example usage patterns for justfile
+
+# Show all available commands
+just
+
+# Format code
+just fmt
+
+# Run clippy
+just clippy
+
+# Run tests
+just test
+
+# Run all checks
+just check
+
+# Format then check everything
+just fcheck
+
+# Generate coverage report (opens in browser)
+just coverage
+
+# Build release binary
+just build
+
+# Run with example config
+just run-example
+
+# Build Docker image
+just docker-build
+
+# Run E2E tests
+just e2e
+
+# Watch for changes and run tests
+just watch
+
+# Full CI validation
+just ci
+
+# Setup dev environment
+just dev-setup
+
+# Release new version
+just release 1.8.4

@@ -1,4 +1,4 @@
 /target
 /coverage
 tests/text-embeddings-router
-docs/refactor
+docs/refactorlcov.info

@@ -44,17 +44,29 @@ metrics-exporter-prometheus = "0.17"
 
 # gRPC client for health checks and TEI communication
 tonic = "0.14"
+tonic-prost = "0.14"
+tonic-reflection = "0.14"
 prost = "0.14"
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-stream = "0.3"
 
 # Async trait support
 async-trait = "0.1"
+dashmap = "6"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+prost-build = "0.14"
+tonic-build = "0.14"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3.10"
 tokio-test = "0.4"
 axum-test = "18.2"
 http-body-util = "0.1"
 serial_test = "3.2"
+futures = "0.3"
 
 [lib]
 name = "tei_manager"
@@ -63,3 +75,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "tei-manager"
 path = "src/main.rs"
+
+[[bench]]
+name = "multiplexer_overhead"
+harness = false

@@ -21,6 +21,14 @@ pub struct ManagerConfig {
 
     #[serde(default = "default_tei_binary_path")]
     pub tei_binary_path: String,
+
+    /// gRPC multiplexer port (default: 9001)
+    #[serde(default = "default_grpc_port")]
+    pub grpc_port: u16,
+
+    /// Enable gRPC multiplexer server (default: true)
+    #[serde(default = "default_grpc_enabled")]
+    pub grpc_enabled: bool,
 }
 
 impl Default for ManagerConfig {
@@ -36,6 +44,8 @@ impl Default for ManagerConfig {
             max_instances: None,
             instances: Vec::new(),
             tei_binary_path: default_tei_binary_path(),
+            grpc_port: default_grpc_port(),
+            grpc_enabled: default_grpc_enabled(),
         }
     }
 }
@@ -66,6 +76,16 @@ impl ManagerConfig {
         if let Ok(binary_path) = std::env::var("TEI_BINARY_PATH") {
             config.tei_binary_path = binary_path;
         }
+        if let Ok(port) = std::env::var("TEI_MANAGER_GRPC_PORT") {
+            config.grpc_port = port
+                .parse()
+                .context("Invalid TEI_MANAGER_GRPC_PORT value")?;
+        }
+        if let Ok(enabled) = std::env::var("TEI_MANAGER_GRPC_ENABLED") {
+            config.grpc_enabled = enabled
+                .parse()
+                .context("Invalid TEI_MANAGER_GRPC_ENABLED value")?;
+        }
 
         Ok(config)
     }
@@ -93,6 +113,13 @@ impl ManagerConfig {
             if instance.port == self.api_port {
                 anyhow::bail!(
                     "Instance '{}' port {} conflicts with API port",
+                    instance.name,
+                    instance.port
+                );
+            }
+            if self.grpc_enabled && instance.port == self.grpc_port {
+                anyhow::bail!(
+                    "Instance '{}' port {} conflicts with gRPC port",
                     instance.name,
                     instance.port
                 );
@@ -192,6 +219,12 @@ fn default_max_concurrent_requests() -> u32 {
 }
 fn default_tei_binary_path() -> String {
     "text-embeddings-router".to_string()
+}
+fn default_grpc_port() -> u16 {
+    9001
+}
+fn default_grpc_enabled() -> bool {
+    true
 }
 
 #[cfg(test)]

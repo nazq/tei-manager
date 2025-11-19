@@ -6,7 +6,20 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
+
+/// Events that occur during instance lifecycle
+#[derive(Debug, Clone)]
+pub enum InstanceEvent {
+    /// Instance was added to registry
+    Added(String),
+    /// Instance was removed from registry
+    Removed(String),
+    /// Instance was started
+    Started(String),
+    /// Instance was stopped
+    Stopped(String),
+}
 
 /// Thread-safe registry for managing TEI instances
 pub struct Registry {
@@ -14,17 +27,28 @@ pub struct Registry {
     max_instances: Option<usize>,
     tei_binary_path: Arc<str>,
     next_prometheus_port: Arc<RwLock<u16>>,
+    event_tx: broadcast::Sender<InstanceEvent>,
 }
 
 impl Registry {
     /// Create a new registry
     pub fn new(max_instances: Option<usize>, tei_binary_path: String) -> Self {
+        // Create broadcast channel for lifecycle events
+        // Capacity of 100 should be sufficient for most use cases
+        let (event_tx, _) = broadcast::channel(100);
+
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
             max_instances,
             tei_binary_path: Arc::from(tei_binary_path),
             next_prometheus_port: Arc::new(RwLock::new(9100)),
+            event_tx,
         }
+    }
+
+    /// Subscribe to lifecycle events
+    pub fn subscribe_events(&self) -> broadcast::Receiver<InstanceEvent> {
+        self.event_tx.subscribe()
     }
 
     /// Add a new instance to the registry
@@ -68,14 +92,18 @@ impl Registry {
         }
 
         let instance = Arc::new(TeiInstance::new(config));
-        instances.insert(instance.config.name.clone(), instance.clone());
+        let instance_name = instance.config.name.clone();
+        instances.insert(instance_name.clone(), instance.clone());
 
         tracing::info!(
-            instance = %instance.config.name,
+            instance = %instance_name,
             total_instances = instances.len(),
             prometheus_port = ?instance.config.prometheus_port,
             "Instance added to registry"
         );
+
+        // Notify listeners of the add event
+        let _ = self.event_tx.send(InstanceEvent::Added(instance_name));
 
         Ok(instance)
     }
@@ -100,6 +128,9 @@ impl Registry {
         instance.stop().await?;
 
         tracing::info!(instance = %name, "Instance removed from registry");
+
+        // Notify listeners of the removal
+        let _ = self.event_tx.send(InstanceEvent::Removed(name.to_string()));
 
         Ok(())
     }

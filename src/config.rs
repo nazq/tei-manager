@@ -197,6 +197,10 @@ fn default_tei_binary_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::env;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_default_config() {
@@ -205,6 +209,150 @@ mod tests {
         assert_eq!(config.health_check_interval_secs, 30);
         // Note: validate() may fail if /data doesn't exist, which is expected
         // In real usage, state_file is typically overridden to a writable location
+    }
+
+    #[test]
+    fn test_load_from_file() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+api_port = 9090
+health_check_interval_secs = 60
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let config = ManagerConfig::load(Some(temp_file.path().to_path_buf())).unwrap();
+        assert_eq!(config.api_port, 9090);
+        assert_eq!(config.health_check_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_load_from_nonexistent_file() {
+        let result = ManagerConfig::load(Some(PathBuf::from("/nonexistent/config.toml")));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_invalid_toml() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(b"invalid toml {{").unwrap();
+        temp_file.flush().unwrap();
+
+        let result = ManagerConfig::load(Some(temp_file.path().to_path_buf()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_api_port_override() {
+        unsafe {
+            env::set_var("TEI_MANAGER_API_PORT", "9999");
+        }
+        let config = ManagerConfig::load(None).unwrap();
+        assert_eq!(config.api_port, 9999);
+        unsafe {
+            env::remove_var("TEI_MANAGER_API_PORT");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_api_port_invalid() {
+        unsafe {
+            env::set_var("TEI_MANAGER_API_PORT", "not_a_number");
+        }
+        let result = ManagerConfig::load(None);
+        assert!(result.is_err());
+        unsafe {
+            env::remove_var("TEI_MANAGER_API_PORT");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_state_file_override() {
+        unsafe {
+            env::set_var("TEI_MANAGER_STATE_FILE", "/tmp/custom-state.toml");
+        }
+        let config = ManagerConfig::load(None).unwrap();
+        assert_eq!(config.state_file, PathBuf::from("/tmp/custom-state.toml"));
+        unsafe {
+            env::remove_var("TEI_MANAGER_STATE_FILE");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_health_check_interval_override() {
+        unsafe {
+            env::set_var("TEI_MANAGER_HEALTH_CHECK_INTERVAL", "120");
+        }
+        let config = ManagerConfig::load(None).unwrap();
+        assert_eq!(config.health_check_interval_secs, 120);
+        unsafe {
+            env::remove_var("TEI_MANAGER_HEALTH_CHECK_INTERVAL");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_health_check_interval_invalid() {
+        unsafe {
+            env::set_var("TEI_MANAGER_HEALTH_CHECK_INTERVAL", "invalid");
+        }
+        let result = ManagerConfig::load(None);
+        assert!(result.is_err());
+        unsafe {
+            env::remove_var("TEI_MANAGER_HEALTH_CHECK_INTERVAL");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_env_var_tei_binary_path_override() {
+        unsafe {
+            env::set_var("TEI_BINARY_PATH", "/custom/path/to/tei");
+        }
+        let config = ManagerConfig::load(None).unwrap();
+        assert_eq!(config.tei_binary_path, "/custom/path/to/tei");
+        unsafe {
+            env::remove_var("TEI_BINARY_PATH");
+        }
+    }
+
+    #[test]
+    fn test_state_file_directory_creation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state_file = temp_dir.path().join("subdir/state.toml");
+
+        let config = ManagerConfig {
+            state_file: state_file.clone(),
+            ..Default::default()
+        };
+
+        // Directory should not exist yet
+        assert!(!state_file.parent().unwrap().exists());
+
+        // validate() should create it
+        config.validate().unwrap();
+
+        // Now it should exist
+        assert!(state_file.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn test_default_functions() {
+        // Test default_max_batch_tokens
+        assert_eq!(default_max_batch_tokens(), 16384);
+
+        // Test default_max_concurrent_requests
+        assert_eq!(default_max_concurrent_requests(), 512);
+
+        // Verify they're used in InstanceConfig deserialization
+        let config_json = r#"{"name":"test","model_id":"model","port":8080}"#;
+        let instance: InstanceConfig = serde_json::from_str(config_json).unwrap();
+        assert_eq!(instance.max_batch_tokens, 16384);
+        assert_eq!(instance.max_concurrent_requests, 512);
     }
 
     #[test]

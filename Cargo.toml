@@ -12,21 +12,21 @@ repository = "https://github.com/nazq/tei-manager"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "process", "sync", "time", "fs", "io-util"] }
 
 # Web framework
-axum = "0.7"
+axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "0.9"
 
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging
 tracing = "0.1"
@@ -36,19 +36,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Process management
-nix = { version = "0.29", features = ["signal"] }
+nix = { version = "0.30", features = ["signal"] }
 
 # Metrics
-metrics = "0.23"
-metrics-exporter-prometheus = "0.15"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"
 
-# HTTP client for health checks
-reqwest = { version = "0.12", features = ["json"] }
+# gRPC client for health checks and TEI communication
+tonic = "0.14"
+prost = "0.14"
+
+# Async trait support
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3.10"
 tokio-test = "0.4"
-axum-test = "15.7"
+axum-test = "18.2"
+http-body-util = "0.1"
+serial_test = "3.2"
 
 [lib]
 name = "tei_manager"

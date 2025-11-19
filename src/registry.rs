@@ -4,6 +4,7 @@ use crate::config::InstanceConfig;
 use crate::instance::TeiInstance;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::net::TcpListener;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,8 +58,13 @@ impl Registry {
         // Auto-assign Prometheus port if not specified
         if config.prometheus_port.is_none() {
             let mut next_port = self.next_prometheus_port.write().await;
-            config.prometheus_port = Some(*next_port);
-            *next_port += 1;
+
+            // Find next available port starting from current next_port
+            let assigned_port = Self::find_free_port(*next_port)?;
+            config.prometheus_port = Some(assigned_port);
+
+            // Update next_port for next allocation
+            *next_port = assigned_port + 1;
         }
 
         let instance = Arc::new(TeiInstance::new(config));
@@ -113,6 +119,27 @@ impl Registry {
     /// Get TEI binary path
     pub fn tei_binary_path(&self) -> &str {
         &self.tei_binary_path
+    }
+
+    /// Find next available port starting from the given port
+    /// Tries up to 1000 ports to find a free one
+    fn find_free_port(start_port: u16) -> Result<u16> {
+        const MAX_ATTEMPTS: u16 = 1000;
+
+        for offset in 0..MAX_ATTEMPTS {
+            let port = start_port.saturating_add(offset);
+
+            // Try to bind to the port to check if it's free
+            if TcpListener::bind(("0.0.0.0", port)).is_ok() {
+                return Ok(port);
+            }
+        }
+
+        anyhow::bail!(
+            "Could not find free port in range {}-{}",
+            start_port,
+            start_port.saturating_add(MAX_ATTEMPTS)
+        )
     }
 }
 

@@ -75,7 +75,16 @@ impl TeiInstance {
         }
 
         // Set Prometheus port (default auto-assigned, 0 = disabled)
-        if let Some(prom_port) = self.config.prometheus_port {
+        // Only add if not already in extra_args to avoid duplicate argument error
+        let has_prometheus_port_in_extra_args = self
+            .config
+            .extra_args
+            .iter()
+            .any(|arg| arg == "--prometheus-port");
+
+        if !has_prometheus_port_in_extra_args
+            && let Some(prom_port) = self.config.prometheus_port
+        {
             cmd.arg("--prometheus-port").arg(prom_port.to_string());
         }
 

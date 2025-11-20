@@ -925,6 +925,7 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
+    #[serial]
     async fn test_service_creation() {
         let service = create_test_service();
         assert_eq!(service.max_parallel_stream_requests, 1024);

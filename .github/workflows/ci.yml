@@ -30,6 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,6 +71,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -111,6 +117,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -150,6 +159,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@nightly

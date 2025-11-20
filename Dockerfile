@@ -9,13 +9,21 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
 
+# Copy build script and proto files for gRPC compilation
+COPY build.rs ./
+COPY proto ./proto
+
 # Copy source code
 COPY src ./src
+
+# Copy benches for Cargo.toml references (not built, just needed for manifest parsing)
+COPY benches ./benches
 
 # Build release binary
 RUN cargo build --release --locked

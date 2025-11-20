@@ -6,6 +6,7 @@
 pub mod api;
 pub mod config;
 pub mod error;
+pub mod grpc;
 pub mod health;
 pub mod instance;
 pub mod metrics;
@@ -16,5 +17,5 @@ pub use config::{InstanceConfig, ManagerConfig};
 pub use error::ApiError;
 pub use health::HealthMonitor;
 pub use instance::{InstanceStats, InstanceStatus, TeiInstance};
-pub use registry::Registry;
+pub use registry::{InstanceEvent, Registry};
 pub use state::StateManager;

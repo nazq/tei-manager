@@ -141,17 +141,46 @@ async fn main() -> Result<()> {
     let app = api::create_router(app_state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.api_port));
-    tracing::info!(addr = %addr, "Starting API server");
+    tracing::info!(addr = %addr, "Starting HTTP API server");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .context("Failed to bind API server")?;
 
-    // Graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("API server error")?;
+    // Start gRPC server in background if enabled
+    let grpc_handle = if config.grpc_enabled {
+        let grpc_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.grpc_port));
+        let grpc_registry = registry.clone();
+
+        Some(tokio::spawn(async move {
+            tracing::info!(addr = %grpc_addr, "Starting gRPC multiplexer server");
+            if let Err(e) =
+                tei_manager::grpc::server::start_grpc_server(grpc_addr, grpc_registry).await
+            {
+                tracing::error!(error = %e, "gRPC server error");
+            }
+        }))
+    } else {
+        tracing::info!("gRPC multiplexer disabled");
+        None
+    };
+
+    // Run HTTP server with graceful shutdown
+    // If gRPC is enabled, both servers run concurrently
+    tokio::select! {
+        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+            result.context("HTTP API server error")?;
+        }
+        _ = async {
+            if let Some(handle) = grpc_handle {
+                let _ = handle.await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::error!("gRPC server exited unexpectedly");
+        }
+    }
 
     tracing::info!("Shutting down...");
 

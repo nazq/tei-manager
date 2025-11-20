@@ -18,6 +18,7 @@ Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https
 ### Core Capabilities
 - 🔄 **Dynamic Instance Management** - Create, start, stop, restart, and delete TEI instances via REST API
 - 🎯 **Multi-GPU Support** - Pin instances to specific GPUs or share across all available GPUs
+- 🌐 **gRPC Multiplexer** - Unified gRPC endpoint for routing requests to multiple instances (1-22% overhead)
 - 💾 **State Persistence** - Automatic state saving with atomic writes and crash recovery
 - 🏥 **Health Monitoring** - Continuous health checks with configurable auto-restart on failure
 - 📊 **Prometheus Metrics** - Built-in metrics export for monitoring instance lifecycle and operations
@@ -41,13 +42,15 @@ Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https
 ## 📋 Table of Contents
 
 - [Quick Start](#-quick-start)
+- [RunPod Deployment](#-runpod-deployment)
 - [Installation](#-installation)
 - [Configuration](#-configuration)
 - [API Reference](#-api-reference)
+- [gRPC Multiplexer](#-grpc-multiplexer)
 - [Examples](#-examples)
 - [Development](#-development)
 - [Testing](#-testing)
-- [Architecture](#-architecture)
+- [Documentation](#-documentation)
 - [Contributing](#-contributing)
 - [License](#-license)
 
@@ -99,6 +102,55 @@ TEI_MANAGER_API_PORT=9000 \
 TEI_MANAGER_STATE_FILE=/tmp/state.toml \
 ./target/release/tei-manager --log-format pretty
 ```
+
+---
+
+## ☁️ RunPod Deployment
+
+Deploy TEI Manager on RunPod's GPU cloud platform for scalable embedding inference.
+
+### Quick Deploy
+
+1. **Create Pod** with the following settings:
+   - **Container Image**: `nazq/tei-manager:latest`
+   - **Container Disk**: 20 GB
+   - **Volume**: 50 GB (recommended for model caching)
+   - **Expose HTTP Ports**: `8000,9000`
+   - **Expose TCP Ports**: `8080-8089`
+
+2. **Set Environment Variables**:
+   ```bash
+   TEI_MANAGER_API_PORT=8000
+   TEI_MANAGER_STATE_FILE=/workspace/state.toml
+   RUST_LOG=info
+   ```
+
+3. **Access Your Instance**:
+   ```bash
+   # Your pod will be available at:
+   https://{POD_ID}-8000.proxy.runpod.net
+
+   # Create a TEI instance
+   curl -X POST https://{POD_ID}-8000.proxy.runpod.net/instances \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "bge-small",
+       "model_id": "BAAI/bge-small-en-v1.5",
+       "port": 8080,
+       "gpu_id": 0
+     }'
+
+   # Generate embeddings
+   curl -X POST https://{POD_ID}-8080.proxy.runpod.net/embed \
+     -H "Content-Type: application/json" \
+     -d '{"inputs": "Hello from RunPod!"}'
+   ```
+
+**📚 Full Guide**: See [docs/RUNPOD_DEPLOYMENT.md](docs/RUNPOD_DEPLOYMENT.md) for:
+- Complete deployment templates
+- Multi-GPU configuration
+- Production best practices
+- Troubleshooting guide
 
 ---
 
@@ -492,33 +544,14 @@ cargo clippy
 cargo fmt
 ```
 
-### Project Structure
+---
 
-```
-tei-manager/
-├── src/
-│   ├── main.rs              # Entry point, CLI, server setup
-│   ├── config.rs            # Configuration loading & validation
-│   ├── instance.rs          # TEI instance process management
-│   ├── registry.rs          # Thread-safe instance registry
-│   ├── state.rs             # State persistence (atomic writes)
-│   ├── health.rs            # Health monitoring & auto-restart
-│   ├── metrics.rs           # Prometheus metrics
-│   ├── error.rs             # Error types & API errors
-│   ├── lib.rs               # Public API exports
-│   └── api/
-│       ├── mod.rs           # API module exports
-│       ├── routes.rs        # Router setup & AppState
-│       ├── handlers.rs      # Request handlers
-│       └── models.rs        # Request/Response DTOs
-├── tests/
-│   └── mock-tei-router      # Mock TEI for testing
-├── config/
-│   └── tei-manager.example.toml
-├── Dockerfile               # Multi-stage Docker build
-├── test-e2e.sh             # End-to-end test suite
-└── Cargo.toml
-```
+## 📚 Documentation
+
+- **[DESIGN.md](DESIGN.md)** - Internal architecture and design decisions
+- **[docs/GRPC_MULTIPLEXER.md](docs/GRPC_MULTIPLEXER.md)** - gRPC multiplexer guide and benchmarks
+- **[docs/RUNPOD_DEPLOYMENT.md](docs/RUNPOD_DEPLOYMENT.md)** - RunPod deployment guide
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines
 
 ---
 
@@ -561,50 +594,33 @@ cargo test
 
 ---
 
-## 🏗️ Architecture
+## 🌐 gRPC Multiplexer
 
-### Components
+Unified gRPC endpoint for routing embedding requests to multiple TEI instances.
 
-```
-┌───────────────────────────────────────────────────┐
-│                   TEI Manager                     │
-├───────────────────────────────────────────────────┤
-│                                                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐         │
-│  │   API    │  │ Registry │  │  State   │         │
-│  │  Server  │──│ (HashMap)│──│ Manager  │         │
-│  └──────────┘  └──────────┘  └──────────┘         │
-│       │             │              │              │
-│       │        ┌────┴────┐         │              │
-│       │        │ Health  │         │              │
-│       │        │ Monitor │         │              │
-│       │        └─────────┘         │              │
-│       │                            │              │
-│  ┌────▼─────────────────────────┐  │              │
-│  │   Instance Management        │  │              │
-│  │  ┌──────┐  ┌──────┐  ┌─────┐ │  │              │
-│  │  │ Inst │  │ Inst │  │ ... │ │  │              │
-│  │  │  #1  │  │  #2  │  │     │ │  │              │
-│  │  └──┬───┘  └──┬───┘  └─────┘ │  │              │
-│  └─────┼─────────┼──────────────┘  │              │
-└────────┼─────────┼─────────────────┼──────────────┘
-         │         │                 │
-    ┌────▼────┐ ┌──▼──────┐     ┌────▼────┐
-    │   TEI   │ │   TEI   │     │  State  │
-    │Instance │ │Instance │     │  File   │
-    │  :8080  │ │  :8081  │     │  .toml  │
-    └─────────┘ └─────────┘     └─────────┘
+**Features:**
+- Single connection point for all instances
+- Dynamic routing by instance name
+- Full TEI API support (embed, rerank, tokenize, streaming, etc.)
+- Low overhead: 1-22% depending on workload
+
+**Quick Example:**
+```python
+import grpc
+from tei_manager.grpc.proto.multiplexer.v1 import tei_multiplexer_pb2_grpc as mux_grpc
+
+channel = grpc.insecure_channel('localhost:9001')
+stub = mux_grpc.TeiMultiplexerStub(channel)
+
+# Route to specific instance by name
+response = stub.Embed(create_request(target="bge-small", text="Hello"))
 ```
 
-### Key Design Decisions
-
-- **Thread-Safe Registry** - `Arc<RwLock<HashMap>>` for concurrent access
-- **Atomic State Writes** - Write to temp file, then rename (POSIX atomic operation)
-- **Process Ownership** - Child processes killed on drop with graceful shutdown
-- **No PID Persistence** - PIDs are runtime-only (invalid after restart)
-- **Immutable Instances** - No PATCH endpoint; delete and recreate for changes
-- **Health Check Delays** - Initial delay before monitoring to allow startup
-- **Auto-Recovery** - Configurable auto-restart on health check failures
+**📚 Full Guide**: See [docs/GRPC_MULTIPLEXER.md](docs/GRPC_MULTIPLEXER.md) for:
+- Complete API reference with Python and Rust examples
+- Performance benchmarks (unary, concurrent, streaming)
+- Routing strategies and best practices
+- Troubleshooting guide
 
 ---
 

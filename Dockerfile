@@ -21,6 +21,9 @@ COPY proto ./proto
 # Copy source code
 COPY src ./src
 
+# Copy benches for Cargo.toml references (not built, just needed for manifest parsing)
+COPY benches ./benches
+
 # Build release binary
 RUN cargo build --release --locked
 

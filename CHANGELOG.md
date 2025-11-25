@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2025-11-25
+## [0.3.0] - 2025-11-25
 
 ### Added
 - **gRPC Multiplexer**: Unified gRPC endpoint for routing embedding requests to multiple TEI instances
@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Docker build: Copy benches directory for Cargo.toml parsing
 - Test isolation: Added `#[serial]` to environment variable tests
 - Connection pool management in high-concurrency scenarios
+
+## [0.2.0] - 2025-11-25
+*Unreleased*
 
 ## [0.1.0] - 2025-11-15
 

@@ -43,7 +43,7 @@ test-all: test test-integration
     @echo "✅ All tests passed!"
 
 # Run all checks (fmt, clippy, test)
-check: fmt-check clippy test
+check: fmt-check clippy test-all
     @echo "✅ All checks passed!"
 
 # Format then check (fmt + fmt-check + clippy + test)
@@ -61,12 +61,12 @@ coverage:
         cargo install cargo-llvm-cov
     fi
 
-    # Run coverage (continue even if tests fail)
-    cargo llvm-cov --html --output-dir coverage --ignore-filename-regex='tests/.*' --ignore-run-fail --open
+    # Run coverage
+    cargo llvm-cov --html --output-dir coverage --ignore-filename-regex='tests/.*' --open
 
 # Generate coverage for CI (lcov format)
 coverage-ci:
-    cargo llvm-cov --lcov --output-path coverage/lcov.info --ignore-filename-regex='tests/.*' --ignore-run-fail
+    cargo llvm-cov --lcov --output-path coverage/lcov.info --ignore-filename-regex='tests/.*'
 
 # Build release binary
 build:
@@ -76,36 +76,12 @@ build:
 build-debug:
     cargo build
 
-# Run the application in development mode
-run *ARGS:
-    cargo run -- {{ARGS}}
-
-# Run with example config
-run-example:
-    cargo run -- --config config/tei-manager.example.toml --log-format pretty --log-level debug
-
 # Clean build artifacts
 clean:
     cargo clean
     rm -rf coverage/
     rm -rf target/
 
-# Build Docker image
-docker-build TAG="latest":
-    docker build -t tei-manager:{{TAG}} .
-
-# Build Docker image with no cache
-docker-build-clean TAG="latest":
-    docker build --no-cache -t tei-manager:{{TAG}} .
-
-# Run E2E tests
-e2e:
-    ./test-e2e.sh
-
-# Run E2E tests with Docker rebuild
-e2e-clean:
-    docker rmi tei-manager:test 2>/dev/null || true
-    ./test-e2e.sh
 
 # Watch for changes and run tests
 watch:
@@ -157,12 +133,151 @@ pre-commit: fcheck
     @echo "✅ Ready to commit!"
 
 # Full CI pipeline (what CI runs)
-ci: fmt-check clippy test e2e
+ci: fmt-check clippy test
     @echo "✅ CI pipeline passed!"
 
-# Benchmark performance
+# Benchmark performance (requires bench-start first)
 bench:
     cargo bench
+
+# Benchmark and open HTML report in browser
+bench-open:
+    cargo bench -- --open
+
+# Start local benchmark environment (tei-manager + bench-instance)
+bench-start: setup-test
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Check if already running
+    if curl -s http://localhost:9000/health > /dev/null 2>&1; then
+        echo "Benchmark environment already running!"
+        just bench-status
+        exit 0
+    fi
+
+    echo "Starting tei-manager for benchmarks..."
+
+    # Build release binary
+    cargo build --release
+
+    # Get the TEI binary path (relative to justfile location)
+    TEI_BINARY="$(pwd)/tests/text-embeddings-router"
+
+    if [ ! -x "$TEI_BINARY" ]; then
+        echo "ERROR: TEI binary not found at $TEI_BINARY"
+        echo "Run: just setup-test"
+        exit 1
+    fi
+
+    # Use a persistent state file in /tmp
+    STATE_FILE="/tmp/tei-manager-bench.state"
+
+    # Start tei-manager as daemon (nohup + redirect output)
+    nohup env \
+        TEI_MANAGER_STATE_FILE="$STATE_FILE" \
+        TEI_MANAGER_API_PORT=9000 \
+        TEI_MANAGER_GRPC_PORT=9001 \
+        TEI_BINARY_PATH="$TEI_BINARY" \
+        ./target/release/tei-manager > /tmp/tei-manager-bench.log 2>&1 &
+
+    MANAGER_PID=$!
+    echo $MANAGER_PID > /tmp/tei-manager-bench.pid
+    echo "tei-manager started (PID: $MANAGER_PID)"
+
+    # Wait for manager to be ready
+    echo "Waiting for tei-manager..."
+    for i in {1..30}; do
+        if curl -s http://localhost:9000/health > /dev/null 2>&1; then
+            echo "tei-manager is ready!"
+            break
+        fi
+        sleep 1
+    done
+
+    # Create bench-instance on port 8081
+    echo "Creating bench-instance..."
+    curl -s -X POST http://localhost:9000/instances \
+        -H "Content-Type: application/json" \
+        -d '{"name": "bench-instance", "model_id": "BAAI/bge-small-en-v1.5", "port": 8081}' | jq .
+
+    # Wait for instance to be running
+    echo "Waiting for bench-instance to be ready..."
+    for i in {1..120}; do
+        STATUS=$(curl -s http://localhost:9000/instances/bench-instance | jq -r '.status // "unknown"')
+        if [ "$STATUS" = "Running" ] || [ "$STATUS" = "running" ]; then
+            echo "bench-instance is running!"
+            break
+        fi
+        if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "failed" ]; then
+            echo "ERROR: bench-instance failed to start"
+            echo "Check logs: cat /tmp/tei-manager-bench.log"
+            exit 1
+        fi
+        echo "  Status: $STATUS (attempt $i/120)"
+        sleep 2
+    done
+
+    echo ""
+    echo "Benchmark environment ready!"
+    echo "  - tei-manager API: http://localhost:9000"
+    echo "  - gRPC multiplexer: http://localhost:9001"
+    echo "  - TEI instance: http://localhost:8081"
+    echo "  - Logs: /tmp/tei-manager-bench.log"
+    echo ""
+    echo "Run: just bench"
+    echo "Stop: just bench-stop"
+
+# Stop local benchmark environment
+bench-stop:
+    #!/usr/bin/env bash
+    PID_FILE="/tmp/tei-manager-bench.pid"
+
+    if [ ! -f "$PID_FILE" ]; then
+        echo "No benchmark environment running (no PID file)"
+        exit 0
+    fi
+
+    MANAGER_PID=$(cat "$PID_FILE")
+    echo "Stopping benchmark environment (PID: $MANAGER_PID)..."
+
+    # Get child processes (TEI instances) before killing parent
+    CHILD_PIDS=$(pgrep -P "$MANAGER_PID" 2>/dev/null || true)
+
+    # Kill tei-manager
+    if kill -0 "$MANAGER_PID" 2>/dev/null; then
+        kill "$MANAGER_PID"
+        echo "  Stopped tei-manager"
+    else
+        echo "  tei-manager already stopped"
+    fi
+
+    # Kill any child processes (TEI instances)
+    for pid in $CHILD_PIDS; do
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            echo "  Stopped child process $pid"
+        fi
+    done
+
+    # Cleanup
+    rm -f "$PID_FILE"
+    rm -f /tmp/tei-manager-bench.state
+    echo "Done."
+
+# Check benchmark environment status
+bench-status:
+    #!/usr/bin/env bash
+    echo "=== Benchmark Environment Status ==="
+    echo ""
+    echo "tei-manager:"
+    curl -s http://localhost:9000/health 2>/dev/null && echo " (healthy)" || echo "  Not running"
+    echo ""
+    echo "Instances:"
+    curl -s http://localhost:9000/instances 2>/dev/null | jq -r '.[] | "  - \(.name): \(.status) (port \(.port))"' || echo "  None"
+    echo ""
+    echo "gRPC multiplexer:"
+    grpcurl -plaintext localhost:9001 list 2>/dev/null && echo " (available)" || echo "  Not available"
 
 # Generate documentation
 docs:
@@ -253,7 +368,7 @@ security-audit:
     @echo "Checking for known vulnerabilities in dependencies..."
 
 # Full local validation (everything before pushing)
-validate: clean dev-setup fcheck e2e coverage
+validate: clean dev-setup fcheck coverage
     @echo "✅ Full validation complete! Ready to push."
 
 # Show project statistics

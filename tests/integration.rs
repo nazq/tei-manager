@@ -47,6 +47,8 @@ async fn create_test_server() -> (TestServer, TempDir) {
     let registry = Arc::new(Registry::new(
         config.max_instances,
         config.tei_binary_path.clone(),
+        config.instance_port_start,
+        config.instance_port_end,
     ));
 
     let state_manager = Arc::new(StateManager::new(
@@ -59,6 +61,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
         registry,
         state_manager,
         prometheus_handle: get_metrics_handle(),
+        auth_manager: None,
     };
 
     let app = create_router(state);
@@ -127,22 +130,26 @@ async fn test_create_instance() {
 }
 
 #[tokio::test]
-async fn test_create_instance_with_gpu() {
+async fn test_create_instance_with_invalid_gpu() {
+    // Tests that invalid GPU IDs are rejected
+    // GPU validation uses nvidia-smi to detect available GPUs
+    // On machines without GPUs, any gpu_id is invalid
     let (server, _temp_dir) = create_test_server().await;
 
     let create_req = json!({
         "name": "gpu-instance",
         "model_id": "BAAI/bge-small-en-v1.5",
         "port": 8080,
-        "gpu_id": 1
+        "gpu_id": 99  // Very high GPU ID - should always be invalid
     });
 
     let response = server.post("/instances").json(&create_req).await;
 
-    assert_eq!(response.status_code(), 201);
+    // Should return 400 Bad Request for invalid GPU ID
+    assert_eq!(response.status_code(), 400);
 
-    let instance: serde_json::Value = response.json();
-    assert_eq!(instance["gpu_id"], 1);
+    let body: serde_json::Value = response.json();
+    assert!(body["error"].as_str().unwrap().contains("Invalid gpu_id"));
 }
 
 #[tokio::test]
@@ -384,6 +391,8 @@ async fn test_max_instances_limit() {
     let registry = Arc::new(Registry::new(
         config.max_instances,
         config.tei_binary_path.clone(),
+        config.instance_port_start,
+        config.instance_port_end,
     ));
 
     let state_manager = Arc::new(StateManager::new(
@@ -396,6 +405,7 @@ async fn test_max_instances_limit() {
         registry,
         state_manager,
         prometheus_handle: get_metrics_handle(),
+        auth_manager: None,
     };
 
     let app = create_router(state);
@@ -465,6 +475,8 @@ async fn test_state_persistence() {
     let registry = Arc::new(Registry::new(
         None,
         tei_binary.to_string_lossy().to_string(),
+        8080,
+        8180,
     ));
     let state_manager = Arc::new(StateManager::new(
         state_file.clone(),
@@ -484,6 +496,7 @@ async fn test_state_persistence() {
         prometheus_port: Some(9200),
         extra_args: vec!["--arg1".to_string()],
         created_at: Some(chrono::Utc::now()),
+        ..Default::default()
     };
 
     registry
@@ -523,6 +536,8 @@ async fn test_state_load_missing_file() {
     let registry = Arc::new(Registry::new(
         None,
         tei_binary.to_string_lossy().to_string(),
+        8080,
+        8180,
     ));
     let state_manager = StateManager::new(
         state_file,
@@ -551,8 +566,7 @@ async fn test_config_validation() {
                 pooling: None,
                 gpu_id: None,
                 prometheus_port: None,
-                extra_args: vec![],
-                created_at: None,
+                ..Default::default()
             },
             tei_manager::config::InstanceConfig {
                 name: "dup".to_string(), // Duplicate name
@@ -563,8 +577,7 @@ async fn test_config_validation() {
                 pooling: None,
                 gpu_id: None,
                 prometheus_port: None,
-                extra_args: vec![],
-                created_at: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -647,8 +660,7 @@ async fn test_config_validation_api_port_conflict() {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -677,8 +689,7 @@ async fn test_config_validation_empty_instance_name() {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -702,8 +713,7 @@ async fn test_config_validation_instance_port_too_low() {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -727,8 +737,7 @@ async fn test_config_validation_backslash_in_name() {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -826,6 +835,8 @@ max_concurrent_requests = 10
     let registry = Arc::new(Registry::new(
         None,
         tei_binary.to_string_lossy().to_string(),
+        8080,
+        8180,
     ));
     let state_manager = StateManager::new(
         state_file,
@@ -874,6 +885,8 @@ max_concurrent_requests = 10
     let registry = Arc::new(Registry::new(
         None,
         tei_binary.to_string_lossy().to_string(),
+        8080,
+        8180,
     ));
     let state_manager = StateManager::new(
         state_file,
@@ -908,6 +921,8 @@ instances = []
     let registry = Arc::new(Registry::new(
         None,
         tei_binary.to_string_lossy().to_string(),
+        8080,
+        8180,
     ));
     let state_manager = StateManager::new(
         state_file,
@@ -928,7 +943,12 @@ instances = []
 async fn test_health_monitor_creation_params() {
     use tei_manager::health::HealthMonitor;
 
-    let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+    let registry = Arc::new(Registry::new(
+        None,
+        "text-embeddings-router".to_string(),
+        8080,
+        8180,
+    ));
 
     let monitor = HealthMonitor::new(
         registry.clone(),
@@ -949,7 +969,12 @@ async fn test_health_check_on_stopped_instance() {
     use tei_manager::config::InstanceConfig;
     use tei_manager::health::HealthMonitor;
 
-    let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+    let registry = Arc::new(Registry::new(
+        None,
+        "text-embeddings-router".to_string(),
+        8080,
+        8180,
+    ));
 
     let config = InstanceConfig {
         name: "stopped".to_string(),
@@ -960,8 +985,7 @@ async fn test_health_check_on_stopped_instance() {
         pooling: None,
         gpu_id: None,
         prometheus_port: None,
-        extra_args: vec![],
-        created_at: None,
+        ..Default::default()
     };
 
     let instance = registry.add(config).await.expect("Failed to add instance");
@@ -981,4 +1005,154 @@ async fn test_health_check_on_stopped_instance() {
 
     // Verify instance is not running
     assert!(!instance.is_running().await);
+}
+
+// ========================================
+// Port auto-allocation tests
+// ========================================
+
+#[tokio::test]
+async fn test_create_instance_without_port() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Create instance without specifying port - should auto-allocate
+    let create_req = json!({
+        "name": "auto-port-instance",
+        "model_id": "BAAI/bge-small-en-v1.5"
+        // No port specified - should be auto-allocated from configured range
+    });
+
+    let response = server.post("/instances").json(&create_req).await;
+
+    assert_eq!(response.status_code(), 201);
+
+    let instance: serde_json::Value = response.json();
+    assert_eq!(instance["name"], "auto-port-instance");
+    // Port should be in the default range [8080, 8180)
+    let port = instance["port"].as_u64().expect("port should be a number");
+    assert!(
+        (8080..8180).contains(&port),
+        "Port {} should be in range [8080, 8180)",
+        port
+    );
+}
+
+#[tokio::test]
+async fn test_create_multiple_instances_auto_port() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    let mut ports = Vec::new();
+
+    // Create 5 instances without specifying ports
+    for i in 0..5 {
+        let create_req = json!({
+            "name": format!("auto-instance-{}", i),
+            "model_id": "BAAI/bge-small-en-v1.5"
+        });
+
+        let response = server.post("/instances").json(&create_req).await;
+        assert_eq!(response.status_code(), 201);
+
+        let instance: serde_json::Value = response.json();
+        let port = instance["port"].as_u64().expect("port should be a number") as u16;
+        ports.push(port);
+    }
+
+    // All ports should be unique
+    let unique_ports: std::collections::HashSet<_> = ports.iter().collect();
+    assert_eq!(
+        unique_ports.len(),
+        5,
+        "All auto-allocated ports should be unique"
+    );
+
+    // All ports should be in range
+    for port in &ports {
+        assert!(
+            *port >= 8080 && *port < 8180,
+            "Port {} should be in range [8080, 8180)",
+            port
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_mixed_auto_and_manual_ports_api() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Create with manual port
+    let create_req1 = json!({
+        "name": "manual-port-instance",
+        "model_id": "BAAI/bge-small-en-v1.5",
+        "port": 8085
+    });
+
+    let response = server.post("/instances").json(&create_req1).await;
+    assert_eq!(response.status_code(), 201);
+
+    let instance1: serde_json::Value = response.json();
+    assert_eq!(instance1["port"], 8085);
+
+    // Create with auto port - should not conflict with manual port
+    let create_req2 = json!({
+        "name": "auto-port-instance-2",
+        "model_id": "BAAI/bge-small-en-v1.5"
+    });
+
+    let response = server.post("/instances").json(&create_req2).await;
+    assert_eq!(response.status_code(), 201);
+
+    let instance2: serde_json::Value = response.json();
+    let auto_port = instance2["port"].as_u64().expect("port should be a number");
+    assert_ne!(
+        auto_port, 8085,
+        "Auto-allocated port should not conflict with manual port"
+    );
+}
+
+#[tokio::test]
+async fn test_port_auto_allocation_create_delete_create_api() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Create 3 instances with auto-allocated ports
+    for i in 0..3 {
+        let create_req = json!({
+            "name": format!("cdc-instance-{}", i),
+            "model_id": "BAAI/bge-small-en-v1.5"
+        });
+
+        let response = server.post("/instances").json(&create_req).await;
+        assert_eq!(response.status_code(), 201);
+    }
+
+    // Delete 2 instances
+    let response = server.delete("/instances/cdc-instance-0").await;
+    assert_eq!(response.status_code(), 204);
+
+    let response = server.delete("/instances/cdc-instance-1").await;
+    assert_eq!(response.status_code(), 204);
+
+    // Create 2 more - should reuse freed ports
+    for i in 3..5 {
+        let create_req = json!({
+            "name": format!("cdc-instance-{}", i),
+            "model_id": "BAAI/bge-small-en-v1.5"
+        });
+
+        let response = server.post("/instances").json(&create_req).await;
+        assert_eq!(response.status_code(), 201);
+    }
+
+    // Verify 3 instances exist with unique ports
+    let response = server.get("/instances").await;
+    assert_eq!(response.status_code(), 200);
+
+    let instances: Vec<serde_json::Value> = response.json();
+    assert_eq!(instances.len(), 3);
+
+    let ports: std::collections::HashSet<_> = instances
+        .iter()
+        .map(|i| i["port"].as_u64().expect("port"))
+        .collect();
+    assert_eq!(ports.len(), 3, "All ports should be unique");
 }

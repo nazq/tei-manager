@@ -104,9 +104,6 @@ cargo test
 
 # Integration tests
 cargo test --test '*'
-
-# End-to-end tests
-./test-e2e.sh
 ```
 
 ---
@@ -154,9 +151,6 @@ cargo test test_name
 
 # With output
 cargo test -- --nocapture
-
-# End-to-end tests (requires Docker)
-./test-e2e.sh
 ```
 
 ### Writing Tests
@@ -179,21 +173,10 @@ mod tests {
 }
 ```
 
-**Integration Tests** - Add to `test-e2e.sh`:
-
-```bash
-# Step X: Test new feature
-log_test "Testing new feature..."
-response=$(http_get "$API_BASE/new-endpoint")
-check_http_status "$response" "200"
-log_pass "New feature works"
-```
-
 ### Test Coverage Requirements
 
 - ✅ All new code must have tests
 - ✅ Bug fixes must include regression tests
-- ✅ E2E tests must pass before merging
 - ✅ Code coverage should not decrease
 
 ---
@@ -319,7 +302,7 @@ Add example showing how to create and use SPLADE sparse models.
 
 2. ✅ **Run all tests:**
    ```bash
-   cargo test && ./test-e2e.sh
+   cargo test
    ```
 
 3. ✅ **Run clippy:**

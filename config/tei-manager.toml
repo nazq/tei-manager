@@ -1,0 +1,25 @@
+# TEI Manager Configuration - Custom Docker Image
+# This config is baked into the custom Docker image
+
+api_port = 9000
+grpc_enabled = true
+grpc_port = 9001
+
+state_file = "/app/state/tei-manager-state.json"
+tei_binary_path = "/usr/local/bin/text-embeddings-router"
+
+max_instances = 10
+
+# Health monitoring
+health_check_interval_secs = 10      # Check every 10 seconds
+startup_timeout_secs = 300           # 5 minutes for models to load
+max_failures_before_restart = 3      # Restart after 3 consecutive failures (Running instances only)
+
+# Port range for auto-allocation [start, end)
+# When creating instances without specifying a port, one is auto-assigned from this range
+instance_port_start = 8080
+instance_port_end = 8180
+
+auto_restore_on_restart = true
+
+

@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package tei_multiplexer.v1;
+
+// We copy this from https://github.com/huggingface/text-embeddings-inference/blob/main/proto/tei.proto
+// and keep these releases in sync with TEI
+import "tei/v1/tei.proto";
+
+// TeiMultiplexer provides a unified gRPC endpoint for routing requests to multiple TEI instances.
+// Clients specify the target instance and the multiplexer routes to the correct backend.
+
+service TeiMultiplexer {
+    // Info service - Get information about a specific TEI instance
+    rpc Info (InfoRequest) returns (tei.v1.InfoResponse);
+
+    // Embed service - Generate embeddings
+    rpc Embed (EmbedRequest) returns (tei.v1.EmbedResponse);
+    rpc EmbedStream (stream EmbedRequest) returns (stream tei.v1.EmbedResponse);
+    rpc EmbedSparse (EmbedSparseRequest) returns (tei.v1.EmbedSparseResponse);
+    rpc EmbedSparseStream (stream EmbedSparseRequest) returns (stream tei.v1.EmbedSparseResponse);
+    rpc EmbedAll (EmbedAllRequest) returns (tei.v1.EmbedAllResponse);
+    rpc EmbedAllStream (stream EmbedAllRequest) returns (stream tei.v1.EmbedAllResponse);
+
+    // Arrow batch embedding - High-performance batch processing
+    rpc EmbedArrow (EmbedArrowRequest) returns (EmbedArrowResponse);
+
+    // Predict service - Classification/prediction
+    rpc Predict (PredictRequest) returns (tei.v1.PredictResponse);
+    rpc PredictPair (PredictPairRequest) returns (tei.v1.PredictResponse);
+    rpc PredictStream (stream PredictRequest) returns (stream tei.v1.PredictResponse);
+    rpc PredictPairStream (stream PredictPairRequest) returns (stream tei.v1.PredictResponse);
+
+    // Rerank service - Rerank documents
+    rpc Rerank (RerankRequest) returns (tei.v1.RerankResponse);
+    rpc RerankStream (stream RerankStreamRequest) returns (tei.v1.RerankResponse);
+
+    // Tokenize service - Tokenization operations
+    rpc Tokenize (EncodeRequest) returns (tei.v1.EncodeResponse);
+    rpc TokenizeStream (stream EncodeRequest) returns (stream tei.v1.EncodeResponse);
+    rpc Decode (DecodeRequest) returns (tei.v1.DecodeResponse);
+    rpc DecodeStream (stream DecodeRequest) returns (stream tei.v1.DecodeResponse);
+}
+
+// Routing target - specify which instance to route to
+message Target {
+    oneof routing {
+        string instance_name = 1;  // Route by instance name (e.g., "bge-small")
+        string model_id = 2;        // Route by model ID (auto-select instance)
+        uint32 instance_index = 3;  // Route by instance index (0-based)
+    }
+}
+
+// Info requests
+message InfoRequest {
+    Target target = 1;
+}
+
+// Embed requests
+message EmbedRequest {
+    Target target = 1;
+    tei.v1.EmbedRequest request = 2;
+}
+
+message EmbedSparseRequest {
+    Target target = 1;
+    tei.v1.EmbedSparseRequest request = 2;
+}
+
+message EmbedAllRequest {
+    Target target = 1;
+    tei.v1.EmbedAllRequest request = 2;
+}
+
+// Predict requests
+message PredictRequest {
+    Target target = 1;
+    tei.v1.PredictRequest request = 2;
+}
+
+message PredictPairRequest {
+    Target target = 1;
+    tei.v1.PredictPairRequest request = 2;
+}
+
+// Rerank requests
+message RerankRequest {
+    Target target = 1;
+    tei.v1.RerankRequest request = 2;
+}
+
+message RerankStreamRequest {
+    Target target = 1;
+    tei.v1.RerankStreamRequest request = 2;
+}
+
+// Tokenize requests
+message EncodeRequest {
+    Target target = 1;
+    tei.v1.EncodeRequest request = 2;
+}
+
+message DecodeRequest {
+    Target target = 1;
+    tei.v1.DecodeRequest request = 2;
+}
+
+// Arrow batch embedding - Send RecordBatch with text column, receive RecordBatch with embeddings
+message EmbedArrowRequest {
+    Target target = 1;
+    bytes arrow_ipc = 2;  // Arrow IPC RecordBatch with "text" column
+    bool truncate = 3;
+    bool normalize = 4;
+    bool noop = 5;  // If true, return dummy embeddings for round-trip testing
+}
+
+message EmbedArrowResponse {
+    bytes arrow_ipc = 1;  // Arrow IPC RecordBatch with "embeddings" FixedSizeList column
+}

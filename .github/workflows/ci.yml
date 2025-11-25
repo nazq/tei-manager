@@ -30,10 +30,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -62,6 +68,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
         env:
           CI: true
+          RUSTC_WRAPPER: sccache
 
   test:
     name: Tests
@@ -69,8 +76,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -99,11 +112,13 @@ jobs:
         run: cargo test --lib
         env:
           CI: true
+          RUSTC_WRAPPER: sccache
 
       - name: Run integration tests
         run: cargo test --test integration
         env:
           CI: true
+          RUSTC_WRAPPER: sccache
 
   e2e:
     name: E2E Tests
@@ -111,8 +126,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Install just
         uses: taiki-e/install-action@just
@@ -135,26 +156,22 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Setup test environment
-        run: ./scripts/setup-test-binary.sh
-        env:
-          CI: true
-
-      - name: Run E2E tests
-        run: just e2e
-        env:
-          CI: true
-
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Protocol Buffers compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -165,9 +182,10 @@ jobs:
           CI: true
 
       - name: Generate coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info --ignore-filename-regex='tests/.*' --ignore-run-fail
+        run: cargo llvm-cov --lcov --output-path lcov.info --ignore-filename-regex='tests/.*'
         env:
           CI: true
+          RUSTC_WRAPPER: sccache
 
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v5
@@ -175,3 +193,5 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: nazq/tei-manager

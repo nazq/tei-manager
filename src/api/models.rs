@@ -15,7 +15,12 @@ pub struct HealthResponse {
 pub struct CreateInstanceRequest {
     pub name: String,
     pub model_id: String,
-    pub port: u16,
+
+    /// Port for the TEI instance
+    /// If not provided, auto-allocated from instance_port_range in config
+    /// Required if no port range is configured
+    #[serde(default)]
+    pub port: Option<u16>,
 
     #[serde(default)]
     pub max_batch_tokens: Option<u32>,
@@ -31,6 +36,12 @@ pub struct CreateInstanceRequest {
 
     #[serde(default)]
     pub prometheus_port: Option<u16>,
+
+    /// Override startup timeout for this instance (seconds)
+    /// If not provided, uses global startup_timeout_secs from manager config
+    /// Use for large models that need more time to download/load
+    #[serde(default)]
+    pub startup_timeout_secs: Option<u64>,
 
     #[serde(default)]
     pub extra_args: Option<Vec<String>>,
@@ -79,4 +90,13 @@ impl InstanceInfo {
             prometheus_port: instance.config.prometheus_port,
         }
     }
+}
+
+/// Log file response with Python-style slicing
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogsResponse {
+    pub lines: Vec<String>,
+    pub start: usize,
+    pub end: usize,
+    pub total_lines: usize,
 }

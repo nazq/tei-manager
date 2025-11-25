@@ -2,3 +2,7 @@
 /coverage
 tests/text-embeddings-router
 docs/refactor
+/private
+lcov.info
+scripts/runpod/
+scripts/vastai/

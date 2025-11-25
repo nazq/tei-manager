@@ -1,6 +1,6 @@
 [package]
 name = "tei-manager"
-version = "1.8.3"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -43,18 +43,49 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.17"
 
 # gRPC client for health checks and TEI communication
-tonic = "0.14"
+tonic = { version = "0.14", features = ["transport", "tls-ring", "gzip"] }
+tonic-prost = "0.14"
+tonic-reflection = "0.14"
 prost = "0.14"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Apache Arrow for efficient batching
+arrow = "56"
+arrow-ipc = { version = "56", features = ["lz4"] }
+arrow-schema = "56"
+async-stream = "0.3"
+hyper-rustls = "0.27" # For tonic TLS support
 
 # Async trait support
 async-trait = "0.1"
+dashmap = "6"
+
+# Certificate parsing for mTLS
+x509-parser = "0.18"
+urlencoding = "2.1"
+
+# Native TLS support
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
+
+[build]
+incremental = true
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+prost-build = "0.14"
+tonic-build = "0.14"
 
 [dev-dependencies]
-tempfile = "3.10"
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3"
 tokio-test = "0.4"
 axum-test = "18.2"
 http-body-util = "0.1"
 serial_test = "3.2"
+futures = "0.3"
 
 [lib]
 name = "tei_manager"
@@ -63,3 +94,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "tei-manager"
 path = "src/main.rs"
+
+[[bin]]
+name = "bench-client"
+path = "src/bin/bench-client.rs"
+
+[[bench]]
+name = "multiplexer_overhead"
+harness = false

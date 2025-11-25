@@ -1,649 +1,330 @@
 # TEI Manager
 
 [![Rust](https://img.shields.io/badge/rust-1.91+-orange.svg)](https://www.rust-lang.org/)
-[![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/nazq/tei-manager/branch/main/graph/badge.svg)](https://codecov.io/gh/nazq/tei-manager)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](Dockerfile)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](test-e2e.sh)
 [![TEI](https://img.shields.io/badge/TEI-1.8.3-purple.svg)](https://github.com/huggingface/text-embeddings-inference)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) (TEI). Run multiple embedding models simultaneously with intelligent resource management, health monitoring, and automatic recovery.
 
 ---
 
-## 🚀 Features
+## Features
 
-### Core Capabilities
-- 🔄 **Dynamic Instance Management** - Create, start, stop, restart, and delete TEI instances via REST API
-- 🎯 **Multi-GPU Support** - Pin instances to specific GPUs or share across all available GPUs
-- 💾 **State Persistence** - Automatic state saving with atomic writes and crash recovery
-- 🏥 **Health Monitoring** - Continuous health checks with configurable auto-restart on failure
-- 📊 **Prometheus Metrics** - Built-in metrics export for monitoring instance lifecycle and operations
-- 🔒 **Resource Validation** - Port conflict detection, duplicate name prevention, and max instance limits
-- ⚡ **Zero Downtime** - Graceful shutdown handling and instance lifecycle management
-
-### Supported Models
-- ✅ **Dense Embeddings** - BGE, E5, Sentence-Transformers, all-MiniLM, etc.
-- ✅ **Sparse Embeddings** - SPLADE models with sparse vector output
-- ✅ **Auto-Detection** - Fetches model metadata from HuggingFace for dimension validation
-
-### API Features
-- 🌐 RESTful JSON API with OpenAPI-compatible endpoints
-- 📝 Instance CRUD operations with detailed status reporting
-- 🔍 Individual instance inspection with uptime, restarts, and health stats
-- 🎮 Lifecycle controls (start/stop/restart) with process management
-- 📈 Prometheus metrics endpoint at `/metrics`
+- **Dynamic Instance Management** - Create, start, stop, restart, and delete TEI instances via REST API
+- **Multi-GPU Support** - Pin instances to specific GPUs or share across all available GPUs
+- **gRPC Multiplexer** - Unified streaming gRPC endpoint for routing requests to multiple instances
+- **Arrow Batch Embeddings** - High-throughput batch embedding via Arrow IPC with LZ4 compression
+- **Rust Benchmark Client** - Built-in gRPC client for benchmarking and integration examples
+- **State Persistence** - Automatic state saving with atomic writes and crash recovery
+- **Health Monitoring** - Continuous health checks with configurable auto-restart on failure
+- **Prometheus Metrics** - Built-in metrics export for monitoring instance lifecycle and operations
+- **mTLS Authentication** - Optional mutual TLS for secure gRPC connections
 
 ---
 
-## 📋 Table of Contents
+## Docker Images
 
-- [Quick Start](#-quick-start)
-- [Installation](#-installation)
-- [Configuration](#-configuration)
-- [API Reference](#-api-reference)
-- [Examples](#-examples)
-- [Development](#-development)
-- [Testing](#-testing)
-- [Architecture](#-architecture)
-- [Contributing](#-contributing)
-- [License](#-license)
+TEI Manager images are built on the [TEI gRPC base images](https://github.com/huggingface/text-embeddings-inference?tab=readme-ov-file#docker-images), which provide GPU-optimized kernels for embedding inference.
+
+**Tag format:** `{manager_version}-tei-{tei_version}[-{arch}]`
+
+| Tag | Base Image | GPU Support |
+|-----|------------|-------------|
+| `0.3.0-tei-1.8.3` | `..text-embeddings-inference:1.8.3-grpc` | Multi-arch (auto-detect) |
+| `0.3.0-tei-1.8.3-ada` | `..text-embeddings-inference:89-1.8.3-grpc` | Ada (RTX 40xx, L4, L40, L40S) |
+| `0.3.0-tei-1.8.3-hopper` | `..text-embeddings-inference:hopper-1.8-grpc` | Hopper (H100, H200) |
+
+> **Note:** Only gRPC-enabled base images are supported. CPU-only and non-gRPC variants are not available.
 
 ---
 
-## 🏁 Quick Start
+## Quick Start
 
-### Using Docker (Recommended)
+### Using Docker
 
 ```bash
-# Build the image
-docker build -t tei-manager:latest .
+# Pull the image for your GPU architecture
+docker pull ghcr.io/nazq/tei-manager:0.3.0-tei-1.8.3        # Multi-arch (auto-detect)
+docker pull ghcr.io/nazq/tei-manager:0.3.0-tei-1.8.3-ada    # Ada (RTX 40xx, L4, L40, L40S)
+docker pull ghcr.io/nazq/tei-manager:0.3.0-tei-1.8.3-hopper # Hopper (H100, H200)
 
-# Run with default config
-docker run -d \
+# Run with GPU support
+docker run -d --gpus all \
   --name tei-manager \
   -p 9000:9000 \
+  -p 9001:9001 \
   -p 8080-8089:8080-8089 \
-  -e TEI_MANAGER_STATE_FILE=/data/state.toml \
-  -v $(pwd)/data:/data \
-  tei-manager:latest
+  ghcr.io/nazq/tei-manager:0.3.0-tei-1.8.3
 
-# Create your first instance
+# Create an embedding instance
 curl -X POST http://localhost:9000/instances \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "bge-small",
-    "model_id": "BAAI/bge-small-en-v1.5",
-    "port": 8080
-  }'
+  -d '{"name": "bge-small", "model_id": "BAAI/bge-small-en-v1.5"}'
 
-# Generate embeddings
+# Wait for instance to be ready (~30s for model download)
+curl http://localhost:9000/instances/bge-small
+
+# Generate embeddings via REST (direct to TEI)
 curl -X POST http://localhost:8080/embed \
   -H "Content-Type: application/json" \
   -d '{"inputs": "Hello world"}'
 ```
 
-### Using Cargo
+### Using gRPC with grpcurl
+
+```bash
+# Generate embeddings via gRPC multiplexer
+grpcurl -plaintext -d '{
+  "target": {"instance_name": "bge-small"},
+  "request": {"inputs": "Hello world", "truncate": true, "normalize": true}
+}' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/Embed
+
+# Get instance info
+grpcurl -plaintext -d '{
+  "target": {"instance_name": "bge-small"}
+}' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/Info
+
+# List available services
+grpcurl -plaintext localhost:9001 list
+```
+
+---
+
+## gRPC API
+
+The gRPC multiplexer provides a unified endpoint for routing embedding requests to any managed instance.
+
+### Available Methods
+
+| Method | Description |
+|--------|-------------|
+| `Embed` | Generate dense embeddings for a single text |
+| `EmbedStream` | Streaming dense embeddings |
+| `EmbedSparse` | Generate sparse embeddings (SPLADE) |
+| `EmbedArrow` | **High-throughput batch embedding via Arrow IPC** |
+| `Rerank` | Rerank documents by relevance |
+| `Tokenize` | Tokenize text |
+| `Info` | Get model information |
+
+### Arrow Batch Embeddings
+
+The `EmbedArrow` endpoint enables high-throughput batch processing using Apache Arrow IPC format with LZ4 compression:
+
+```bash
+# Using grpcurl with base64-encoded Arrow IPC
+grpcurl -plaintext -d '{
+  "target": {"instance_name": "bge-small"},
+  "arrow_ipc": "<base64-encoded-arrow-ipc>",
+  "truncate": true,
+  "normalize": true
+}' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedArrow
+```
+
+**Benefits:**
+- Process thousands of texts in a single request
+- LZ4 compression reduces network overhead
+- Efficient memory layout for batch processing
+- Returns embeddings as Arrow FixedSizeList for zero-copy access
+
+---
+
+## Rust Benchmark Client
+
+TEI Manager includes a built-in Rust benchmark client for testing throughput and latency. This also serves as a complete example for integrating with the gRPC API from Rust.
+
+### Installation
 
 ```bash
 # Build from source
-cargo build --release
+cargo build --release --bin bench-client
 
-# Run with custom config
-./target/release/tei-manager --config config/tei-manager.example.toml
-
-# Or with environment variables
-TEI_MANAGER_API_PORT=9000 \
-TEI_MANAGER_STATE_FILE=/tmp/state.toml \
-./target/release/tei-manager --log-format pretty
+# Or run directly
+cargo run --release --bin bench-client -- --help
 ```
+
+### Usage
+
+```bash
+# Standard mode: concurrent single-text requests
+bench-client -e http://localhost:9001 -i bge-small \
+  --mode standard --num-texts 10000 --batch-size 100
+
+# Arrow mode: batched Arrow IPC requests (recommended for throughput)
+bench-client -e http://localhost:9001 -i bge-small \
+  --mode arrow --num-texts 100000 --batch-size 1000
+
+# With mTLS
+bench-client -e https://localhost:9001 -i bge-small \
+  --cert client.pem --key client-key.pem --ca ca.pem \
+  --mode arrow --num-texts 100000 --batch-size 1000
+```
+
+### Example Output
+
+```json
+{
+  "mode": "arrow",
+  "instance_name": "bge-small",
+  "num_texts": 100000,
+  "batch_size": 1000,
+  "num_requests": 100,
+  "total_duration_secs": 12.34,
+  "throughput_per_sec": 8103.72,
+  "successful": 100000,
+  "failed": 0
+}
+```
+
+### Using as a Rust Library Example
+
+The bench-client source (`src/bin/bench-client.rs`) demonstrates:
+- Connecting to the gRPC multiplexer with/without TLS
+- Creating Arrow IPC batches with LZ4 compression
+- Sending `EmbedArrow` requests and parsing responses
+- Concurrent request handling with Tokio
 
 ---
 
-## 💿 Installation
-
-### Prerequisites
-
-- **Rust 1.91+** with Edition 2024 support
-- **Docker** (optional, for containerized deployment)
-- **Text Embeddings Inference binary** or use the provided mock for testing
-
-### From Source
-
-```bash
-git clone https://github.com/nazq/tei-manager.git
-cd tei-manager
-cargo build --release
-```
-
-### Docker Image
-
-The Docker image includes:
-- ✅ Pre-compiled `tei-manager` binary
-- ✅ Real `text-embeddings-router` from official TEI image (1.8.3-grpc, default)
-- ✅ Mock TEI router for testing (`/usr/local/bin/text-embeddings-router-mock`)
-- ✅ Python 3.14 via `uv` for mock router execution
-
-```bash
-docker build -t tei-manager:latest .
-
-# Run with real TEI binary (default)
-docker run -d -p 9000:9000 tei-manager:latest
-
-# Run with mock for testing (use TEI_BINARY_PATH env var)
-docker run -d -p 9000:9000 \
-  -e TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router-mock \
-  tei-manager:latest
-```
-
----
-
-## ⚙️ Configuration
-
-### Configuration File
-
-Create a `tei-manager.toml` file (see [config/tei-manager.example.toml](config/tei-manager.example.toml)):
-
-```toml
-# API server port
-api_port = 9000
-
-# State file location for persistence
-state_file = "/data/tei-manager-state.toml"
-
-# Health check settings
-health_check_interval_secs = 30
-health_check_initial_delay_secs = 60
-max_failures_before_restart = 3
-
-# Graceful shutdown timeout
-graceful_shutdown_timeout_secs = 30
-
-# Auto-restore instances on restart
-auto_restore_on_restart = true
-
-# Maximum number of instances (optional)
-max_instances = 5
-
-# Seed instances on first boot
-[[instances]]
-name = "bge-small"
-model_id = "BAAI/bge-small-en-v1.5"
-port = 8080
-max_batch_tokens = 16384
-max_concurrent_requests = 512
-# gpu_id = 0  # Optional: pin to GPU 0
-
-[[instances]]
-name = "all-mpnet"
-model_id = "sentence-transformers/all-mpnet-base-v2"
-port = 8081
-gpu_id = 1  # Pin to GPU 1
-```
-
-### Environment Variables
-
-Override config file values with environment variables:
-
-```bash
-TEI_MANAGER_API_PORT=9000
-TEI_MANAGER_STATE_FILE=/data/state.toml
-TEI_MANAGER_HEALTH_CHECK_INTERVAL=30
-TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router  # Path to TEI binary
-```
-
-**Docker Users:** The Docker image includes both real and mock TEI binaries:
-- `/usr/local/bin/text-embeddings-router` - Real TEI binary (default, 838MB)
-- `/usr/local/bin/text-embeddings-router-mock` - Mock for testing (5KB)
-
-To use the mock for testing:
-```bash
-docker run -e TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router-mock tei-manager:latest
-```
-
-### CLI Arguments
-
-```bash
-tei-manager \
-  --config /path/to/config.toml \
-  --port 9000 \
-  --log-level info \
-  --log-format json
-```
-
-**Options:**
-- `--config <PATH>` - Path to configuration file
-- `--port <PORT>` - Override API port
-- `--log-level <LEVEL>` - Log level: trace, debug, info, warn, error (default: info)
-- `--log-format <FORMAT>` - Log format: json, pretty (default: json)
-
----
-
-## 🌐 API Reference
-
-### Base URL
-```
-http://localhost:9000
-```
+## REST API
 
 ### Endpoints
 
-#### Health Check
-```http
-GET /health
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/instances` | List all instances |
+| `GET` | `/instances/{name}` | Get instance details |
+| `POST` | `/instances` | Create new instance |
+| `DELETE` | `/instances/{name}` | Delete instance |
+| `POST` | `/instances/{name}/start` | Start instance |
+| `POST` | `/instances/{name}/stop` | Stop instance |
+| `POST` | `/instances/{name}/restart` | Restart instance |
 
-**Response:**
-```json
-{
-  "status": "healthy",
-  "timestamp": "2025-11-18T20:00:00Z"
-}
-```
-
----
-
-#### List Instances
-```http
-GET /instances
-```
-
-**Response:**
-```json
-[
-  {
-    "name": "bge-small",
-    "model_id": "BAAI/bge-small-en-v1.5",
-    "port": 8080,
-    "status": "running",
-    "pid": 12345,
-    "created_at": "2025-11-18T19:00:00Z",
-    "uptime_secs": 3600,
-    "restarts": 0,
-    "health_check_failures": 0,
-    "last_health_check": "2025-11-18T19:59:30Z",
-    "gpu_id": null,
-    "prometheus_port": 9100
-  }
-]
-```
-
----
-
-#### Get Instance
-```http
-GET /instances/:name
-```
-
-**Response:** Same as individual instance object above.
-
----
-
-#### Create Instance
-```http
-POST /instances
-Content-Type: application/json
-```
-
-**Request Body:**
-```json
-{
-  "name": "my-model",
-  "model_id": "BAAI/bge-small-en-v1.5",
-  "port": 8080,
-  "max_batch_tokens": 16384,
-  "max_concurrent_requests": 512,
-  "pooling": "splade",
-  "gpu_id": 0,
-  "prometheus_port": 9100,
-  "extra_args": ["--dtype", "float16"]
-}
-```
-
-**Required Fields:**
-- `name` - Unique instance name (no path separators)
-- `model_id` - HuggingFace model ID
-- `port` - Port number (>= 1024, must be unique)
-
-**Optional Fields:**
-- `max_batch_tokens` - Default: 16384
-- `max_concurrent_requests` - Default: 512
-- `pooling` - Pooling method (e.g., "splade" for sparse models)
-- `gpu_id` - GPU ID to pin instance to (omit to use all GPUs)
-- `prometheus_port` - Prometheus metrics port (auto-assigned from 9100+, 0 to disable)
-- `extra_args` - Additional CLI arguments for `text-embeddings-router`
-
-**Response:** `201 Created` with instance details
-
----
-
-#### Delete Instance
-```http
-DELETE /instances/:name
-```
-
-**Response:** `204 No Content`
-
----
-
-#### Start Instance
-```http
-POST /instances/:name/start
-```
-
-**Response:** `200 OK` with instance details
-
----
-
-#### Stop Instance
-```http
-POST /instances/:name/stop
-```
-
-**Response:** `200 OK` with instance details
-
----
-
-#### Restart Instance
-```http
-POST /instances/:name/restart
-```
-
-**Response:** `200 OK` with instance details
-
----
-
-#### Prometheus Metrics
-```http
-GET /metrics
-```
-
-**Response:** Prometheus text format
-
-**Metrics:**
-- `tei_manager_instances_created_total` - Counter
-- `tei_manager_instances_deleted_total` - Counter
-- `tei_manager_instances_count` - Gauge
-- `tei_manager_health_check_failures_total` - Counter
-- `tei_manager_instance_restarts_total` - Counter
-
----
-
-## 📚 Examples
-
-### Dense Embeddings (BGE)
+### Create Instance
 
 ```bash
-# Create instance
 curl -X POST http://localhost:9000/instances \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "bge-small",
+    "name": "my-model",
     "model_id": "BAAI/bge-small-en-v1.5",
-    "port": 8080
+    "gpu_id": 0,
+    "max_batch_tokens": 16384,
+    "max_concurrent_requests": 512
   }'
-
-# Generate embeddings
-curl -X POST http://localhost:8080/embed \
-  -H "Content-Type: application/json" \
-  -d '{"inputs": "Hello world"}'
 ```
 
-**Response:**
-```json
-[[0.123, -0.456, 0.789, ...]] // 384 dimensions
+**Required Fields:**
+- `name` - Unique instance name
+- `model_id` - HuggingFace model ID
+
+**Optional Fields:**
+- `port` - HTTP port (auto-assigned if omitted)
+- `gpu_id` - GPU to pin instance to (omit to use all GPUs)
+- `max_batch_tokens` - Max tokens per batch (default: 16384)
+- `max_concurrent_requests` - Max concurrent requests (default: 512)
+- `pooling` - Pooling method (e.g., "splade" for sparse models)
+
+---
+
+## Configuration
+
+### Environment Variables
+
+```bash
+TEI_MANAGER_API_PORT=9000           # REST API port
+TEI_MANAGER_GRPC_PORT=9001          # gRPC multiplexer port
+TEI_MANAGER_STATE_FILE=/data/state.toml
+TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router
+```
+
+### Config File
+
+```toml
+api_port = 9000
+grpc_port = 9001
+state_file = "/data/state.toml"
+health_check_interval_secs = 30
+max_instances = 10
+
+# Seed instances
+[[instances]]
+name = "bge-small"
+model_id = "BAAI/bge-small-en-v1.5"
+gpu_id = 0
+```
+
+---
+
+## Examples
+
+### Multi-GPU Setup
+
+```bash
+# GPU 0: Small model for low-latency
+curl -X POST http://localhost:9000/instances \
+  -H "Content-Type: application/json" \
+  -d '{"name": "fast", "model_id": "BAAI/bge-small-en-v1.5", "gpu_id": 0}'
+
+# GPU 1: Large model for quality
+curl -X POST http://localhost:9000/instances \
+  -H "Content-Type: application/json" \
+  -d '{"name": "quality", "model_id": "BAAI/bge-large-en-v1.5", "gpu_id": 1}'
+
+# Route requests to either via gRPC
+grpcurl -plaintext -d '{"target": {"instance_name": "fast"}, "request": {"inputs": "Quick query"}}' \
+  localhost:9001 tei_multiplexer.v1.TeiMultiplexer/Embed
+
+grpcurl -plaintext -d '{"target": {"instance_name": "quality"}, "request": {"inputs": "Important document"}}' \
+  localhost:9001 tei_multiplexer.v1.TeiMultiplexer/Embed
 ```
 
 ### Sparse Embeddings (SPLADE)
 
 ```bash
-# Create SPLADE instance
 curl -X POST http://localhost:9000/instances \
   -H "Content-Type: application/json" \
   -d '{
     "name": "splade",
     "model_id": "naver/splade-cocondenser-ensembledistil",
-    "port": 8081,
     "pooling": "splade"
   }'
 
 # Generate sparse embeddings
-curl -X POST http://localhost:8081/embed \
-  -H "Content-Type: application/json" \
-  -d '{"inputs": "Information retrieval"}'
+grpcurl -plaintext -d '{
+  "target": {"instance_name": "splade"},
+  "request": {"inputs": "Information retrieval"}
+}' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparse
 ```
 
-**Response:**
-```json
-[{"1234": 2.5, "5678": 1.8, "9012": 0.9, ...}] // Sparse format
-```
+---
 
-### Multi-GPU Setup
+## Development
 
 ```bash
-# GPU 0: Small model
-curl -X POST http://localhost:9000/instances \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "bge-small-gpu0",
-    "model_id": "BAAI/bge-small-en-v1.5",
-    "port": 8080,
-    "gpu_id": 0
-  }'
+# Install just: cargo install just
+just --list              # Show all available commands
 
-# GPU 1: Large model
-curl -X POST http://localhost:9000/instances \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "bge-large-gpu1",
-    "model_id": "BAAI/bge-large-en-v1.5",
-    "port": 8081,
-    "gpu_id": 1
-  }'
-
-# All GPUs: Shared instance
-curl -X POST http://localhost:9000/instances \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "e5-base-shared",
-    "model_id": "intfloat/e5-base-v2",
-    "port": 8082
-  }'
-```
-
-### Instance Lifecycle
-
-```bash
-# Stop instance
-curl -X POST http://localhost:9000/instances/bge-small/stop
-
-# Start instance
-curl -X POST http://localhost:9000/instances/bge-small/start
-
-# Restart instance (useful after model updates)
-curl -X POST http://localhost:9000/instances/bge-small/restart
-
-# Delete instance
-curl -X DELETE http://localhost:9000/instances/bge-small
+# Common workflows
+just test                # Run unit tests
+just check               # Format check + clippy + all tests
+just coverage            # Generate HTML coverage report
+just docker-build        # Build Docker image
+just pre-commit          # Run before committing
 ```
 
 ---
 
-## 🛠️ Development
+## Documentation
 
-### Build
-
-```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run clippy
-cargo clippy
-
-# Format code
-cargo fmt
-```
-
-### Project Structure
-
-```
-tei-manager/
-├── src/
-│   ├── main.rs              # Entry point, CLI, server setup
-│   ├── config.rs            # Configuration loading & validation
-│   ├── instance.rs          # TEI instance process management
-│   ├── registry.rs          # Thread-safe instance registry
-│   ├── state.rs             # State persistence (atomic writes)
-│   ├── health.rs            # Health monitoring & auto-restart
-│   ├── metrics.rs           # Prometheus metrics
-│   ├── error.rs             # Error types & API errors
-│   ├── lib.rs               # Public API exports
-│   └── api/
-│       ├── mod.rs           # API module exports
-│       ├── routes.rs        # Router setup & AppState
-│       ├── handlers.rs      # Request handlers
-│       └── models.rs        # Request/Response DTOs
-├── tests/
-│   └── mock-tei-router      # Mock TEI for testing
-├── config/
-│   └── tei-manager.example.toml
-├── Dockerfile               # Multi-stage Docker build
-├── test-e2e.sh             # End-to-end test suite
-└── Cargo.toml
-```
+- **[DESIGN.md](DESIGN.md)** - Architecture and design decisions
+- **[docs/GRPC_MULTIPLEXER.md](docs/GRPC_MULTIPLEXER.md)** - Full gRPC API reference
 
 ---
 
-## 🧪 Testing
+## License
 
-### Unit Tests
-
-```bash
-cargo test
-```
-
-**Coverage:**
-- Configuration validation
-- Port conflict detection
-- Duplicate name detection
-- Instance name validation
-
-### End-to-End Tests
-
-```bash
-./test-e2e.sh
-```
-
-**Test Coverage:**
-- ✅ Docker image build
-- ✅ Container health checks
-- ✅ Instance CRUD operations
-- ✅ Dense embedding generation (bge-small: 384d, all-mpnet: 768d)
-- ✅ Sparse embedding generation (SPLADE: sparse format)
-- ✅ Embedding dimension validation against model metadata
-- ✅ Port conflict detection
-- ✅ Duplicate name detection
-- ✅ Instance lifecycle (start/stop/restart)
-- ✅ Prometheus metrics endpoint
-- ✅ Log error checking
-
-**Requirements:**
-- Docker
-- `curl`, `jq`, `grep` (standard Linux tools)
-
----
-
-## 🏗️ Architecture
-
-### Components
-
-```
-┌───────────────────────────────────────────────────┐
-│                   TEI Manager                     │
-├───────────────────────────────────────────────────┤
-│                                                   │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐         │
-│  │   API    │  │ Registry │  │  State   │         │
-│  │  Server  │──│ (HashMap)│──│ Manager  │         │
-│  └──────────┘  └──────────┘  └──────────┘         │
-│       │             │              │              │
-│       │        ┌────┴────┐         │              │
-│       │        │ Health  │         │              │
-│       │        │ Monitor │         │              │
-│       │        └─────────┘         │              │
-│       │                            │              │
-│  ┌────▼─────────────────────────┐  │              │
-│  │   Instance Management        │  │              │
-│  │  ┌──────┐  ┌──────┐  ┌─────┐ │  │              │
-│  │  │ Inst │  │ Inst │  │ ... │ │  │              │
-│  │  │  #1  │  │  #2  │  │     │ │  │              │
-│  │  └──┬───┘  └──┬───┘  └─────┘ │  │              │
-│  └─────┼─────────┼──────────────┘  │              │
-└────────┼─────────┼─────────────────┼──────────────┘
-         │         │                 │
-    ┌────▼────┐ ┌──▼──────┐     ┌────▼────┐
-    │   TEI   │ │   TEI   │     │  State  │
-    │Instance │ │Instance │     │  File   │
-    │  :8080  │ │  :8081  │     │  .toml  │
-    └─────────┘ └─────────┘     └─────────┘
-```
-
-### Key Design Decisions
-
-- **Thread-Safe Registry** - `Arc<RwLock<HashMap>>` for concurrent access
-- **Atomic State Writes** - Write to temp file, then rename (POSIX atomic operation)
-- **Process Ownership** - Child processes killed on drop with graceful shutdown
-- **No PID Persistence** - PIDs are runtime-only (invalid after restart)
-- **Immutable Instances** - No PATCH endpoint; delete and recreate for changes
-- **Health Check Delays** - Initial delay before monitoring to allow startup
-- **Auto-Recovery** - Configurable auto-restart on health check failures
-
----
-
-## 🤝 Contributing
-
-We love contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
-
-**Quick Links:**
-- 🐛 [Report a Bug](https://github.com/nazq/tei-manager/issues/new?labels=bug)
-- ✨ [Request a Feature](https://github.com/nazq/tei-manager/issues/new?labels=enhancement)
-- 📖 [Improve Documentation](https://github.com/nazq/tei-manager/issues/new?labels=documentation)
-
----
-
-## 📄 License
-
-This project is licensed under the **Apache License 2.0** - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- [HuggingFace Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) - The underlying TEI engine
-- [Axum](https://github.com/tokio-rs/axum) - Ergonomic web framework
-- [Tokio](https://tokio.rs/) - Async runtime for Rust
-
----
-
-## 📞 Support
-
-- 💬 [GitHub Discussions](https://github.com/nazq/tei-manager/discussions)
-- 🐛 [Issue Tracker](https://github.com/nazq/tei-manager/issues)
-- 📧 Email: [your-email@example.com](mailto:your-email@example.com)
-
----
-
-<div align="center">
-
-[![GitHub stars](https://img.shields.io/github/stars/nazq/tei-manager?style=social)](https://github.com/nazq/tei-manager)
-[![GitHub forks](https://img.shields.io/github/forks/nazq/tei-manager?style=social)](https://github.com/nazq/tei-manager/fork)
-
-</div>
+Apache License 2.0 - see [LICENSE](LICENSE) for details.

@@ -1,7 +1,7 @@
 /target
 /coverage
 tests/text-embeddings-router
-docs/refactorlcov.info
+docs/refactor
 /private
 lcov.info
 scripts/runpod/

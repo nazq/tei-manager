@@ -269,6 +269,25 @@ impl Registry {
 mod tests {
     use super::*;
 
+    /// Find N consecutive free ports starting from a base port.
+    /// Returns the start of the range if found.
+    fn find_consecutive_free_ports(start: u16, count: u16) -> Option<u16> {
+        for base in start..60000 {
+            let mut all_free = true;
+            for offset in 0..count {
+                // Use 0.0.0.0 to match production code in find_free_port_in_range
+                if TcpListener::bind(("0.0.0.0", base + offset)).is_err() {
+                    all_free = false;
+                    break;
+                }
+            }
+            if all_free {
+                return Some(base);
+            }
+        }
+        None
+    }
+
     #[tokio::test]
     async fn test_registry_add_and_get() {
         let registry = Registry::new(None, "text-embeddings-router".to_string(), 8080, 8180);
@@ -457,14 +476,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_port_auto_allocation_create_delete_create() {
-        // Dynamically find a free base port to avoid CI conflicts
-        let base_port = Registry::find_free_port(50000).expect("Should find free port");
-        let range_end = base_port + 5;
+        // Use a wide range so we can always find 5 free ports
+        let registry = Registry::new(None, "text-embeddings-router".to_string(), 18080, 18180);
 
-        let registry =
-            Registry::new(None, "text-embeddings-router".to_string(), base_port, range_end);
-
-        // Create 5 instances (filling small range)
+        // Create 5 instances
         for i in 0..5 {
             let config = InstanceConfig {
                 name: format!("test{}", i),
@@ -503,18 +518,22 @@ mod tests {
         assert_eq!(ports.len(), 5);
 
         for port in ports {
-            assert!((base_port..range_end).contains(&port));
+            assert!((18080..18180).contains(&port));
         }
     }
 
     #[tokio::test]
     async fn test_port_auto_allocation_exhausted() {
-        // Dynamically find a free base port to avoid CI conflicts
-        let base_port = Registry::find_free_port(51000).expect("Should find free port");
-        let range_end = base_port + 2; // Small range of just 2 ports
+        // Find 2 consecutive free ports dynamically
+        let base_port = find_consecutive_free_ports(19000, 2).expect("Should find 2 free ports");
+        let range_end = base_port + 2;
 
-        let registry =
-            Registry::new(None, "text-embeddings-router".to_string(), base_port, range_end);
+        let registry = Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            base_port,
+            range_end,
+        );
 
         // Create 2 instances
         for i in 0..2 {

@@ -457,8 +457,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_port_auto_allocation_create_delete_create() {
-        // Use high ports less likely to conflict with running services
-        let registry = Registry::new(None, "text-embeddings-router".to_string(), 59980, 59985);
+        // Dynamically find a free base port to avoid CI conflicts
+        let base_port = Registry::find_free_port(50000).expect("Should find free port");
+        let range_end = base_port + 5;
+
+        let registry =
+            Registry::new(None, "text-embeddings-router".to_string(), base_port, range_end);
 
         // Create 5 instances (filling small range)
         for i in 0..5 {
@@ -499,14 +503,18 @@ mod tests {
         assert_eq!(ports.len(), 5);
 
         for port in ports {
-            assert!((59980..59985).contains(&port));
+            assert!((base_port..range_end).contains(&port));
         }
     }
 
     #[tokio::test]
     async fn test_port_auto_allocation_exhausted() {
-        // Small range of just 2 ports (use high ports less likely to conflict)
-        let registry = Registry::new(None, "text-embeddings-router".to_string(), 59990, 59992);
+        // Dynamically find a free base port to avoid CI conflicts
+        let base_port = Registry::find_free_port(51000).expect("Should find free port");
+        let range_end = base_port + 2; // Small range of just 2 ports
+
+        let registry =
+            Registry::new(None, "text-embeddings-router".to_string(), base_port, range_end);
 
         // Create 2 instances
         for i in 0..2 {

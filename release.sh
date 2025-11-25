@@ -188,8 +188,13 @@ echo ""
 if [ "$DRY_RUN" = true ]; then
     log_success "Dry run complete - images built locally"
     echo ""
-    echo "To perform a full release (push images + create git tag), run:"
+    echo "To perform a full release, run:"
     echo "  $0 $MANAGER_VERSION $TEI_VERSION --release"
+    echo ""
+    echo "This will:"
+    echo "  - Push images to ghcr.io"
+    echo "  - Create git tag v${MANAGER_VERSION}"
+    echo "  - Create GitHub release with changelog notes"
     echo ""
     exit 0
 fi

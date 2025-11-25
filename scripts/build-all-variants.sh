@@ -151,7 +151,7 @@ echo
 
 if [ "$PUSH" != "--push" ]; then
     echo -e "${YELLOW}Note:${NC} Images built locally only (not pushed)"
-    echo "To push to Docker Hub, run:"
+    echo "To push to GitHub Container Registry, run:"
     echo "  $0 $MANAGER_VERSION $TEI_VERSION --push"
     echo
 fi

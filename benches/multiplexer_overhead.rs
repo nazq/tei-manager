@@ -321,8 +321,9 @@ fn bench_arrow_batch(c: &mut Criterion) {
             BenchmarkId::new("multiplexer", batch_size),
             &arrow_ipc,
             |b, arrow_ipc| {
-                b.to_async(&rt)
-                    .iter(|| benchmark_multiplexer_embed_arrow(black_box(arrow_ipc), "bench-instance"));
+                b.to_async(&rt).iter(|| {
+                    benchmark_multiplexer_embed_arrow(black_box(arrow_ipc), "bench-instance")
+                });
             },
         );
 
@@ -332,7 +333,11 @@ fn bench_arrow_batch(c: &mut Criterion) {
             &batch_size,
             |b, &batch_size| {
                 b.to_async(&rt).iter(|| {
-                    benchmark_multiplexer_embed_stream(black_box(text), "bench-instance", batch_size)
+                    benchmark_multiplexer_embed_stream(
+                        black_box(text),
+                        "bench-instance",
+                        batch_size,
+                    )
                 });
             },
         );

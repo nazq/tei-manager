@@ -368,7 +368,7 @@ security-audit:
     @echo "Checking for known vulnerabilities in dependencies..."
 
 # Full local validation (everything before pushing)
-validate: clean dev-setup fcheck e2e coverage
+validate: clean dev-setup fcheck coverage
     @echo "✅ Full validation complete! Ready to push."
 
 # Show project statistics

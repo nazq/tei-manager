@@ -25,7 +25,7 @@ MANAGER_VERSION="${1:?Missing tei-manager version (e.g., 0.3.0)}"
 TEI_VERSION="${2:?Missing TEI version (e.g., 1.8.3)}"
 PUSH="${3:-}"
 
-REPO="nazq/tei-manager"
+REPO="ghcr.io/nazq/tei-manager"
 
 # Colors
 GREEN='\033[0;32m'

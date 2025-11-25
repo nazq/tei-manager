@@ -215,14 +215,52 @@ else
     log_success "Created git tag $GIT_TAG"
 fi
 
-read -p "Push git tag to origin? (y/N) " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    if git push origin "$GIT_TAG" --force; then
-        log_success "Pushed git tag to origin"
-    else
-        log_warn "Failed to push git tag (you may need to push manually)"
-    fi
+# Push git tag
+log_info "Pushing git tag to origin..."
+if git push origin "$GIT_TAG" --force; then
+    log_success "Pushed git tag to origin"
+else
+    log_error "Failed to push git tag"
+    exit 1
+fi
+
+# Create GitHub release
+log_info "Creating GitHub release..."
+
+# Extract release notes from CHANGELOG.md for this version
+RELEASE_NOTES=$(awk "/^## \[${MANAGER_VERSION}\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)
+
+if [ -z "$RELEASE_NOTES" ]; then
+    log_warn "Could not extract release notes from CHANGELOG.md"
+    RELEASE_NOTES="Release ${MANAGER_VERSION} with TEI ${TEI_VERSION}"
+fi
+
+# Create release body
+RELEASE_BODY="$(cat <<EOF
+${RELEASE_NOTES}
+
+## Docker Images
+
+\`\`\`bash
+# Multi-arch (default)
+docker pull ghcr.io/nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}
+
+# Ada Lovelace (RTX 4090/4080)
+docker pull ghcr.io/nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-ada
+
+# Hopper (H100/H200)
+docker pull ghcr.io/nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-hopper
+\`\`\`
+EOF
+)"
+
+if gh release create "$GIT_TAG" \
+    --title "v${MANAGER_VERSION}" \
+    --notes "$RELEASE_BODY"; then
+    log_success "Created GitHub release"
+else
+    log_error "Failed to create GitHub release"
+    exit 1
 fi
 
 # Summary
@@ -236,17 +274,9 @@ echo "  TEI Manager: ${MANAGER_VERSION}"
 echo "  TEI:         ${TEI_VERSION}"
 echo ""
 echo "Published images:"
-echo "  nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}        (multi-arch)"
-echo "  nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-ada    (RTX 4090/4080)"
-echo "  nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-hopper (H100/H200)"
+echo "  ghcr.io/nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}        (multi-arch)"
+echo "  ghcr.io/nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-ada    (RTX 4090/4080)"
+echo "  ghcr.io/nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-hopper (H100/H200)"
 echo ""
-echo "Next steps:"
-echo "  1. Create GitHub release at https://github.com/nazq/tei-manager/releases/new"
-echo "  2. Tag: v${MANAGER_VERSION}"
-echo "  3. Copy release notes from CHANGELOG.md"
-echo ""
-log_info "Pull images with:"
-echo "  docker pull nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}"
-echo "  docker pull nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-ada"
-echo "  docker pull nazq/tei-manager:${MANAGER_VERSION}-tei-${TEI_VERSION}-hopper"
+echo "GitHub release: https://github.com/nazq/tei-manager/releases/tag/${GIT_TAG}"
 echo ""

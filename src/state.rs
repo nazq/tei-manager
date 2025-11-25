@@ -204,6 +204,28 @@ impl StateManager {
                         );
                         failed += 1;
                     } else {
+                        // Spawn background task to wait for readiness
+                        let instance_clone = instance.clone();
+                        tokio::spawn(async move {
+                            use crate::health::GrpcHealthChecker;
+                            use std::time::Duration;
+
+                            if let Err(e) = GrpcHealthChecker::wait_for_ready(
+                                &instance_clone,
+                                Duration::from_secs(300),
+                                Duration::from_millis(500),
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    instance = %instance_clone.config.name,
+                                    error = %e,
+                                    "Restored instance failed to become ready"
+                                );
+                                *instance_clone.status.write().await =
+                                    crate::instance::InstanceStatus::Failed;
+                            }
+                        });
                         restored += 1;
                     }
                 }
@@ -353,7 +375,12 @@ mod tests {
     async fn test_save_and_load_with_mock() {
         let state_file = PathBuf::from("/test/state.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file.clone(),
@@ -367,13 +394,9 @@ mod tests {
             name: "test".to_string(),
             model_id: "model".to_string(),
             port: 8080,
-            max_batch_tokens: 1024,
-            max_concurrent_requests: 10,
-            pooling: None,
             gpu_id: Some(1),
-            prometheus_port: None,
-            extra_args: vec![],
             created_at: Some(chrono::Utc::now()),
+            ..Default::default()
         };
 
         registry.add(config.clone()).await.unwrap();
@@ -396,7 +419,12 @@ mod tests {
     async fn test_load_nonexistent_file() {
         let state_file = PathBuf::from("/test/nonexistent.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file,
@@ -414,7 +442,12 @@ mod tests {
     async fn test_corrupted_state_fails() {
         let state_file = PathBuf::from("/test/corrupted.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         // Manually insert corrupted TOML
         storage
@@ -437,7 +470,12 @@ mod tests {
     async fn test_save_multiple_instances() {
         let state_file = PathBuf::from("/test/multi.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file.clone(),
@@ -452,13 +490,9 @@ mod tests {
                 name: format!("inst{}", i),
                 model_id: format!("model{}", i),
                 port: 8080 + i as u16,
-                max_batch_tokens: 1024,
-                max_concurrent_requests: 10,
-                pooling: None,
                 gpu_id: Some(i),
-                prometheus_port: None,
-                extra_args: vec![],
                 created_at: Some(chrono::Utc::now()),
+                ..Default::default()
             };
             registry.add(config).await.unwrap();
         }
@@ -473,7 +507,12 @@ mod tests {
     async fn test_save_error_handling() {
         let state_file = PathBuf::from("/test/error.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file,
@@ -487,13 +526,8 @@ mod tests {
             name: "test".to_string(),
             model_id: "model".to_string(),
             port: 8080,
-            max_batch_tokens: 1024,
-            max_concurrent_requests: 10,
-            pooling: None,
-            gpu_id: None,
-            prometheus_port: None,
-            extra_args: vec![],
             created_at: Some(chrono::Utc::now()),
+            ..Default::default()
         };
         registry.add(config).await.unwrap();
 
@@ -508,7 +542,12 @@ mod tests {
     async fn test_load_error_handling() {
         let state_file = PathBuf::from("/test/load_error.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file,
@@ -530,7 +569,12 @@ mod tests {
     async fn test_atomic_write_no_temp_files() {
         let state_file = PathBuf::from("/test/atomic.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file.clone(),
@@ -544,13 +588,8 @@ mod tests {
             name: "test".to_string(),
             model_id: "model".to_string(),
             port: 8080,
-            max_batch_tokens: 1024,
-            max_concurrent_requests: 10,
-            pooling: None,
-            gpu_id: None,
-            prometheus_port: None,
-            extra_args: vec![],
             created_at: Some(chrono::Utc::now()),
+            ..Default::default()
         };
         registry.add(config).await.unwrap();
         state_manager.save().await.unwrap();
@@ -563,7 +602,12 @@ mod tests {
     async fn test_save_empty_registry() {
         let state_file = PathBuf::from("/test/empty.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file.clone(),
@@ -584,7 +628,12 @@ mod tests {
     async fn test_toml_serialization_format() {
         let state_file = PathBuf::from("/test/format.toml");
         let storage = Arc::new(MockStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file.clone(),
@@ -605,6 +654,7 @@ mod tests {
             prometheus_port: Some(9091),
             extra_args: vec!["--arg1".to_string()],
             created_at: Some(chrono::Utc::now()),
+            ..Default::default()
         };
         registry.add(config).await.unwrap();
 
@@ -624,7 +674,12 @@ mod tests {
         let state_file = temp_dir.path().join("state.toml");
 
         let storage = Arc::new(FileSystemStorage::new());
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
 
         let state_manager = StateManager::new_with_storage(
             state_file.clone(),
@@ -638,13 +693,8 @@ mod tests {
             name: "fs-test".to_string(),
             model_id: "model".to_string(),
             port: 8080,
-            max_batch_tokens: 1024,
-            max_concurrent_requests: 10,
-            pooling: None,
-            gpu_id: None,
-            prometheus_port: None,
-            extra_args: vec![],
             created_at: Some(chrono::Utc::now()),
+            ..Default::default()
         };
         registry.add(config).await.unwrap();
 

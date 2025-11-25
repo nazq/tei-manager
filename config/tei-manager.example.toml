@@ -1,47 +1,140 @@
 # TEI Manager Example Configuration
+#
+# All options with defaults shown. Environment variable overrides noted where applicable.
+# Configuration is loaded from TOML file first, then env vars override.
 
-# API server port
+# =============================================================================
+# API Server Configuration
+# =============================================================================
+
+# HTTP API server port (default: 9000)
+# Override via: TEI_MANAGER_API_PORT
 api_port = 9000
 
-# State file location for persisting instance configurations
+# State file location for persisting instance configurations (default: /data/tei-manager-state.toml)
+# Override via: TEI_MANAGER_STATE_FILE
 state_file = "/data/tei-manager-state.toml"
 
-# Health check interval in seconds
-health_check_interval_secs = 30
+# =============================================================================
+# Health Monitoring Configuration
+# =============================================================================
 
-# Initial delay before starting health checks (gives instances time to start)
-health_check_initial_delay_secs = 60
+# Health check interval in seconds (how often to poll instances) (default: 10)
+# Override via: TEI_MANAGER_HEALTH_CHECK_INTERVAL
+health_check_interval_secs = 10
 
-# Number of consecutive health check failures before auto-restart
+# Maximum time for an instance to transition from Starting to Running (default: 300 = 5 min)
+# If exceeded, instance is marked as hung/failed
+# Set high enough for large models to download and load into VRAM
+startup_timeout_secs = 300
+
+# Number of consecutive health check failures before auto-restart (default: 3)
+# Only applies to instances that have successfully started (status = Running)
 max_failures_before_restart = 3
 
-# Graceful shutdown timeout in seconds
+# =============================================================================
+# Lifecycle Configuration
+# =============================================================================
+
+# Graceful shutdown timeout in seconds (default: 30)
+# Time to wait for instances to stop cleanly before force-killing
 graceful_shutdown_timeout_secs = 30
 
-# Auto-restore instances from state file on manager restart
+# Auto-restore instances from state file on manager restart (default: false)
+# When true, instances are automatically recreated from saved state
 auto_restore_on_restart = true
 
-# Maximum number of instances (optional, omit for unlimited)
-max_instances = 5
+# Maximum number of instances (default: no limit)
+# Set to limit resource usage on shared systems
+max_instances = 10
 
-# Path to text-embeddings-router binary
-# Default: "text-embeddings-router" (searches PATH)
-# Override via environment variable: TEI_BINARY_PATH=/path/to/binary
-# Docker users: Real binary is at /usr/local/bin/text-embeddings-router (default)
-#               Mock binary for testing is at /usr/local/bin/text-embeddings-router-mock
+# =============================================================================
+# Port Range Configuration
+# =============================================================================
+
+# Port range for auto-allocation [start, end)
+# When creating instances without specifying a port, one will be auto-assigned from this range
+# If start == end, auto-allocation is disabled and port must be specified in requests
+# The range must have at least max_instances ports available
+instance_port_start = 8080
+instance_port_end = 8180
+
+# =============================================================================
+# TEI Binary Configuration
+# =============================================================================
+
+# Path to text-embeddings-router binary (default: "text-embeddings-router")
+# Override via: TEI_BINARY_PATH
+# The default searches PATH; use absolute path for custom installations
+# Docker users: Real binary is at /usr/local/bin/text-embeddings-router
 # tei_binary_path = "text-embeddings-router"
 
-# Optional: Seed instances on first boot
+# =============================================================================
+# gRPC Multiplexer Configuration
+# =============================================================================
+
+# gRPC multiplexer port (default: 9001)
+# Override via: TEI_MANAGER_GRPC_PORT
+grpc_port = 9001
+
+# Enable gRPC multiplexer server (default: true)
+# Override via: TEI_MANAGER_GRPC_ENABLED
+# When disabled, only HTTP API is available
+grpc_enabled = true
+
+# gRPC max message size in MB (default: 40)
+# Applies to both request and response messages
+# Increase for large batch embedding requests
+grpc_max_message_size_mb = 40
+
+# Maximum parallel streaming requests per connection (default: 1024)
+# Controls the channel buffer size for concurrent stream processing
+# Higher values allow more parallelism but use more memory
+grpc_max_parallel_streams = 1024
+
+# =============================================================================
+# Authentication Configuration (Optional)
+# =============================================================================
+
+[auth]
+# Enable authentication (default: false)
+# When disabled, all endpoints are publicly accessible
+enabled = false
+
+# List of enabled auth providers (default: empty)
+# Supported: ["mtls"]
+providers = []
+
+# mTLS configuration (required if "mtls" is in providers)
+# [auth.mtls]
+# ca_cert = "/path/to/ca.crt"           # CA certificate for verifying client certs
+# server_cert = "/path/to/server.crt"   # Server certificate
+# server_key = "/path/to/server.key"    # Server private key
+# allow_self_signed = false             # WARNING: Only for development
+# verify_subject = true                 # Verify client CN/O/OU against allowed list
+# allowed_subjects = []                 # Allowed CN values, e.g., ["CN=client1"]
+# verify_san = false                    # Verify Subject Alternative Names
+# allowed_sans = []                     # Allowed SANs, e.g., ["DNS:client.example.com"]
+
+# =============================================================================
+# Seed Instances (Optional)
+# =============================================================================
+
+# Seed instances to create on first boot
 # These will be created and started automatically when the manager starts
+# Useful for pre-configuring production deployments
 
 [[instances]]
 name = "bge-small"
 model_id = "BAAI/bge-small-en-v1.5"
 port = 8080
-max_batch_tokens = 16384
-max_concurrent_requests = 512
-# gpu_id = 0  # Optional: pin to specific GPU (omit to use all GPUs)
-# prometheus_port = 9100  # Optional: Prometheus port (auto-assigned if omitted, 0 to disable)
+max_batch_tokens = 16384       # Controls memory usage and throughput
+max_concurrent_requests = 512  # Higher values use more memory
+# pooling = "splade"           # Optional: for SPLADE models
+# gpu_id = 0                   # Optional: pin to specific GPU (omit to use all GPUs)
+# prometheus_port = 9100       # Optional: Prometheus port (auto-assigned if omitted, 0 to disable)
+# startup_timeout_secs = 600   # Optional: override global startup timeout for large models
+# extra_args = ["--dtype", "float16", "--revision", "main"]  # Optional: extra CLI args
 
 [[instances]]
 name = "all-mpnet"
@@ -49,10 +142,21 @@ model_id = "sentence-transformers/all-mpnet-base-v2"
 port = 8081
 max_batch_tokens = 16384
 max_concurrent_requests = 512
-gpu_id = 1  # Example: pin to GPU 1
-# prometheus_port = 9101  # Auto-assigned starting from 9100
+gpu_id = 1  # Pin to GPU 1
 
-# Multi-GPU Configuration Notes:
+# =============================================================================
+# Multi-GPU Configuration Notes
+# =============================================================================
+#
 # - If gpu_id is omitted, the instance can access all GPUs
 # - User is responsible for VRAM management to avoid OOM errors
 # - Example: 2x 24GB GPUs can typically run 3-4 large embedding models
+# - Monitor with: curl http://localhost:9000/metrics | grep tei_manager
+#
+# Environment Variables Reference:
+# - TEI_MANAGER_API_PORT: Override api_port
+# - TEI_MANAGER_STATE_FILE: Override state_file
+# - TEI_MANAGER_HEALTH_CHECK_INTERVAL: Override health_check_interval_secs
+# - TEI_BINARY_PATH: Override tei_binary_path
+# - TEI_MANAGER_GRPC_PORT: Override grpc_port
+# - TEI_MANAGER_GRPC_ENABLED: Override grpc_enabled

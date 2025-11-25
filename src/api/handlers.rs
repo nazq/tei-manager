@@ -1,14 +1,15 @@
 //! API request handlers
 
-use super::models::{CreateInstanceRequest, HealthResponse, InstanceInfo};
+use super::models::{CreateInstanceRequest, HealthResponse, InstanceInfo, LogsResponse};
 use super::routes::AppState;
 use crate::config::InstanceConfig;
 use crate::error::ApiError;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
+use serde::Deserialize;
 
 /// GET /health - Manager health check
 pub async fn health() -> (StatusCode, Json<HealthResponse>) {
@@ -48,15 +49,27 @@ pub async fn create_instance(
     State(state): State<AppState>,
     Json(req): Json<CreateInstanceRequest>,
 ) -> Result<(StatusCode, Json<InstanceInfo>), ApiError> {
+    // Validate gpu_id if provided
+    if let Some(gpu_id) = req.gpu_id {
+        let gpu_info = crate::gpu::get_or_init();
+        if !gpu_info.is_valid_gpu_id(gpu_id) {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid gpu_id: {}. Available GPUs: {:?}",
+                gpu_id, gpu_info.indices
+            )));
+        }
+    }
+
     let config = InstanceConfig {
         name: req.name,
         model_id: req.model_id.clone(),
-        port: req.port,
+        port: req.port.unwrap_or(0), // 0 signals auto-allocation to registry
         max_batch_tokens: req.max_batch_tokens.unwrap_or(16384),
         max_concurrent_requests: req.max_concurrent_requests.unwrap_or(512),
         pooling: req.pooling,
         gpu_id: req.gpu_id,
         prometheus_port: req.prometheus_port,
+        startup_timeout_secs: req.startup_timeout_secs,
         extra_args: req.extra_args.unwrap_or_default(),
         created_at: Some(chrono::Utc::now()),
     };
@@ -71,6 +84,29 @@ pub async fn create_instance(
         .start(state.registry.tei_binary_path())
         .await
         .map_err(ApiError::Internal)?;
+
+    // Wait for instance to be ready (poll every 500ms, timeout after 5 minutes)
+    // This runs in background so API returns immediately with "starting" status
+    let instance_clone = instance.clone();
+    tokio::spawn(async move {
+        use crate::health::GrpcHealthChecker;
+        use std::time::Duration;
+
+        if let Err(e) = GrpcHealthChecker::wait_for_ready(
+            &instance_clone,
+            Duration::from_secs(300), // 5 minute timeout for model download
+            Duration::from_millis(500),
+        )
+        .await
+        {
+            tracing::error!(
+                instance = %instance_clone.config.name,
+                error = %e,
+                "Instance failed to become ready"
+            );
+            *instance_clone.status.write().await = crate::instance::InstanceStatus::Failed;
+        }
+    });
 
     // Save state asynchronously
     let state_manager = state.state_manager.clone();
@@ -145,6 +181,28 @@ pub async fn start_instance(
         .await
         .map_err(ApiError::Internal)?;
 
+    // Wait for instance to be ready in background
+    let instance_clone = instance.clone();
+    tokio::spawn(async move {
+        use crate::health::GrpcHealthChecker;
+        use std::time::Duration;
+
+        if let Err(e) = GrpcHealthChecker::wait_for_ready(
+            &instance_clone,
+            Duration::from_secs(300),
+            Duration::from_millis(500),
+        )
+        .await
+        {
+            tracing::error!(
+                instance = %instance_clone.config.name,
+                error = %e,
+                "Instance failed to become ready"
+            );
+            *instance_clone.status.write().await = crate::instance::InstanceStatus::Failed;
+        }
+    });
+
     let info = InstanceInfo::from_instance(&instance).await;
 
     Ok(Json(info))
@@ -187,4 +245,79 @@ pub async fn restart_instance(
     let info = InstanceInfo::from_instance(&instance).await;
 
     Ok(Json(info))
+}
+
+/// Query parameters for log slicing
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    pub start: Option<i32>,
+    pub end: Option<i32>,
+}
+
+/// GET /instances/{name}/logs - Get instance logs with Python-style slicing
+pub async fn get_logs(
+    Path(name): Path<String>,
+    Query(params): Query<LogsQuery>,
+) -> Result<Json<LogsResponse>, ApiError> {
+    // Use same log directory resolution as spawn
+    let log_dir_path =
+        std::env::var("TEI_MANAGER_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string());
+
+    let log_dir = std::path::Path::new(&log_dir_path);
+
+    // Check fallback location if primary doesn't exist
+    let log_path = if !log_dir.exists() {
+        std::path::Path::new("/tmp/tei-manager/logs").join(format!("{}.log", name))
+    } else {
+        log_dir.join(format!("{}.log", name))
+    };
+
+    if !log_path.exists() {
+        return Err(ApiError::NotFound(format!(
+            "Log file for instance '{}' not found",
+            name
+        )));
+    }
+
+    let content = std::fs::read_to_string(&log_path)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("Failed to read log file: {}", e)))?;
+
+    let all_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let total_lines = all_lines.len();
+
+    // Python-style slicing [start, end) with negative index support
+    let start_idx = params
+        .start
+        .map(|s| {
+            if s < 0 {
+                (total_lines as i32 + s).max(0) as usize
+            } else {
+                (s as usize).min(total_lines)
+            }
+        })
+        .unwrap_or(0);
+
+    let end_idx = params
+        .end
+        .map(|e| {
+            if e < 0 {
+                (total_lines as i32 + e).max(0) as usize
+            } else {
+                (e as usize).min(total_lines)
+            }
+        })
+        .unwrap_or(total_lines);
+
+    let lines = if start_idx < end_idx {
+        all_lines[start_idx..end_idx].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(LogsResponse {
+        lines,
+        start: start_idx,
+        end: end_idx,
+        total_lines,
+    }))
 }

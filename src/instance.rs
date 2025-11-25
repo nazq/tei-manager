@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 /// Configuration for spawning a TEI process
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
+    pub instance_name: String,
     pub binary_path: String,
     pub model_id: String,
     pub port: u16,
@@ -111,8 +112,45 @@ impl ProcessManager for SystemProcessManager {
             cmd.arg(arg);
         }
 
+        // Setup log file redirection
+        // Use env var if set, otherwise try /data/logs, fallback to /tmp/tei-manager/logs
+        let log_dir_path =
+            std::env::var("TEI_MANAGER_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string());
+
+        let log_dir = std::path::Path::new(&log_dir_path);
+
+        // Try to create the directory, fall back to /tmp if it fails
+        let log_dir = if let Err(e) = std::fs::create_dir_all(log_dir) {
+            tracing::warn!(
+                error = %e,
+                attempted_dir = %log_dir_path,
+                "Failed to create log directory, falling back to /tmp/tei-manager/logs"
+            );
+            let fallback = std::path::Path::new("/tmp/tei-manager/logs");
+            std::fs::create_dir_all(fallback).context("Failed to create fallback log directory")?;
+            fallback
+        } else {
+            log_dir
+        };
+
+        let log_path = log_dir.join(format!("{}.log", config.instance_name));
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("Failed to open log file: {:?}", log_path))?;
+
+        let stdout_file = log_file
+            .try_clone()
+            .context("Failed to clone log file for stdout")?;
+        let stderr_file = log_file
+            .try_clone()
+            .context("Failed to clone log file for stderr")?;
+
         // Spawn process
         let child = cmd
+            .stdout(stdout_file)
+            .stderr(stderr_file)
             .kill_on_drop(true)
             .spawn()
             .context("Failed to spawn TEI process")?;
@@ -239,6 +277,7 @@ impl TeiInstance {
     /// Start the TEI process
     pub async fn start(&self, tei_binary_path: &str) -> Result<()> {
         let spawn_config = SpawnConfig {
+            instance_name: self.config.name.clone(),
             binary_path: tei_binary_path.to_string(),
             model_id: self.config.model_id.clone(),
             port: self.config.port,
@@ -441,8 +480,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -463,7 +501,7 @@ mod tests {
             gpu_id: Some(0),
             prometheus_port: Some(9090),
             extra_args: vec!["--trust-remote-code".to_string()],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -490,8 +528,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -517,8 +554,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -545,8 +581,7 @@ mod tests {
             pooling: None,
             gpu_id: Some(1),
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -567,8 +602,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -597,8 +631,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -632,7 +665,7 @@ mod tests {
             gpu_id: Some(2),
             prometheus_port: Some(9999),
             extra_args: vec!["--arg1".to_string(), "--arg2".to_string()],
-            created_at: None,
+            ..Default::default()
         };
 
         let manager = Arc::new(MockProcessManager::new());
@@ -668,8 +701,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let config2 = InstanceConfig {
@@ -681,8 +713,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let inst1 = TeiInstance::new_with_manager(config1, manager.clone());

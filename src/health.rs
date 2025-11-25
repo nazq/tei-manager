@@ -87,8 +87,52 @@ pub trait HealthEventHandler: Send + Sync {
 // Production Implementations
 // ============================================================================
 
-/// gRPC-based health checker
+/// gRPC-based health checker that calls TEI's Info service
 pub struct GrpcHealthChecker;
+
+impl GrpcHealthChecker {
+    /// Poll for instance readiness with retries after startup
+    /// Returns Ok(()) when ready, Err if timeout reached
+    pub async fn wait_for_ready(
+        instance: &TeiInstance,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> anyhow::Result<()> {
+        let checker = GrpcHealthChecker;
+        let start = std::time::Instant::now();
+
+        loop {
+            if start.elapsed() > timeout {
+                anyhow::bail!(
+                    "Instance '{}' did not become ready within {:?}",
+                    instance.config.name,
+                    timeout
+                );
+            }
+
+            let result = checker.check(instance).await;
+            if result.healthy {
+                // Update status to Running
+                *instance.status.write().await = InstanceStatus::Running;
+                tracing::info!(
+                    instance = %instance.config.name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Instance is ready"
+                );
+                return Ok(());
+            }
+
+            tracing::debug!(
+                instance = %instance.config.name,
+                reason = ?result.reason,
+                elapsed_ms = start.elapsed().as_millis(),
+                "Waiting for instance to be ready"
+            );
+
+            sleep(poll_interval).await;
+        }
+    }
+}
 
 #[async_trait]
 impl HealthChecker for GrpcHealthChecker {
@@ -98,19 +142,34 @@ impl HealthChecker for GrpcHealthChecker {
             return HealthCheckResult::unhealthy("Process not running".to_string());
         }
 
-        // gRPC health check - establish connection to verify service is available
+        // gRPC health check - call Info RPC to verify TEI is ready
         let addr = format!("http://localhost:{}", instance.config.port);
 
         // Create gRPC channel with timeout
-        match tonic::transport::Channel::from_shared(addr).ok().map(|c| {
-            c.timeout(Duration::from_secs(5))
-                .connect_timeout(Duration::from_secs(5))
-        }) {
-            Some(channel) => match channel.connect().await {
-                Ok(_) => HealthCheckResult::healthy(),
-                Err(e) => HealthCheckResult::unhealthy(format!("gRPC health check failed: {}", e)),
-            },
-            None => HealthCheckResult::unhealthy("Invalid gRPC address".to_string()),
+        let channel = match tonic::transport::Channel::from_shared(addr) {
+            Ok(endpoint) => {
+                match endpoint
+                    .timeout(Duration::from_secs(5))
+                    .connect_timeout(Duration::from_secs(5))
+                    .connect()
+                    .await
+                {
+                    Ok(ch) => ch,
+                    Err(e) => {
+                        return HealthCheckResult::unhealthy(format!("gRPC connect failed: {}", e));
+                    }
+                }
+            }
+            Err(_) => return HealthCheckResult::unhealthy("Invalid gRPC address".to_string()),
+        };
+
+        // Call Info RPC - this only succeeds if TEI is fully ready
+        use crate::grpc::proto::tei::v1::{InfoRequest, info_client::InfoClient};
+        let mut client = InfoClient::new(channel);
+
+        match client.info(InfoRequest {}).await {
+            Ok(_response) => HealthCheckResult::healthy(),
+            Err(e) => HealthCheckResult::unhealthy(format!("Info RPC failed: {}", e)),
         }
     }
 }
@@ -665,7 +724,12 @@ mod tests {
 
     #[test]
     fn test_health_monitor_creation() {
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
         let monitor = HealthMonitor::new(
             registry,
             30,
@@ -683,7 +747,12 @@ mod tests {
 
     #[test]
     fn test_health_monitor_builder() {
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
         let config = HealthMonitorConfig::builder()
             .check_interval(Duration::from_secs(45))
             .initial_delay(Duration::from_secs(90))
@@ -705,7 +774,12 @@ mod tests {
     async fn test_mock_health_checker() {
         use mocks::MockHealthChecker;
 
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
         let config = InstanceConfig {
             name: "test".to_string(),
             model_id: "model".to_string(),
@@ -715,8 +789,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let instance = registry.add(config).await.unwrap();
@@ -746,7 +819,12 @@ mod tests {
     async fn test_mock_restart_strategy() {
         use mocks::MockRestartStrategy;
 
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
         let config = InstanceConfig {
             name: "test-restart".to_string(),
             model_id: "model".to_string(),
@@ -756,8 +834,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let instance = registry.add(config).await.unwrap();
@@ -815,7 +892,12 @@ mod tests {
     async fn test_health_monitor_with_mocks() {
         use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
 
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
         let config = InstanceConfig {
             name: "test-monitor".to_string(),
             model_id: "model".to_string(),
@@ -825,8 +907,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let instance = registry.add(config).await.unwrap();
@@ -882,7 +963,12 @@ mod tests {
     async fn test_auto_restart_disabled() {
         use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
 
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
         let config = InstanceConfig {
             name: "no-restart".to_string(),
             model_id: "model".to_string(),
@@ -892,8 +978,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let instance = registry.add(config).await.unwrap();
@@ -934,7 +1019,12 @@ mod tests {
     async fn test_recovery_after_failure() {
         use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
 
-        let registry = Arc::new(Registry::new(None, "text-embeddings-router".to_string()));
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
         let config = InstanceConfig {
             name: "recovery-test".to_string(),
             model_id: "model".to_string(),
@@ -944,8 +1034,7 @@ mod tests {
             pooling: None,
             gpu_id: None,
             prometheus_port: None,
-            extra_args: vec![],
-            created_at: None,
+            ..Default::default()
         };
 
         let instance = registry.add(config).await.unwrap();

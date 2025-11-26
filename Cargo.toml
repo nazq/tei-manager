@@ -1,6 +1,6 @@
 [package]
 name = "tei-manager"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -50,9 +50,9 @@ prost = "0.14"
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Apache Arrow for efficient batching
-arrow = "56"
-arrow-ipc = { version = "56", features = ["lz4"] }
-arrow-schema = "56"
+arrow = "57"
+arrow-ipc = { version = "57", features = ["lz4"] }
+arrow-schema = "57"
 async-stream = "0.3"
 hyper-rustls = "0.27" # For tonic TLS support
 
@@ -79,7 +79,7 @@ prost-build = "0.14"
 tonic-build = "0.14"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.7", features = ["async_tokio"] }
 tempfile = "3"
 tokio-test = "0.4"
 axum-test = "18.3"

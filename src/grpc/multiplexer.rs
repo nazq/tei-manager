@@ -29,7 +29,7 @@ macro_rules! impl_stream_rpc {
             .ok_or_else(|| Status::invalid_argument("Empty stream"))?
             .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
 
-        let instance_name = Self::extract_target(first_req.target.clone())?;
+        let instance_name = Self::extract_target(first_req.target)?;
         Span::current().record("instance", instance_name.as_str());
 
         // Get backend client
@@ -552,39 +552,33 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .ok_or_else(|| Status::invalid_argument("First column must be StringArray"))?;
 
         // Check if noop mode (for round-trip testing)
-        let embedding_len: i32;
-        let all_embeddings: Vec<Vec<f32>>;
-
-        if req.noop {
+        let num_rows = text_array.len();
+        let (embedding_len, flat_embeddings): (i32, Vec<f32>) = if req.noop {
             // Noop mode: return dummy embeddings instantly
-            embedding_len = 384; // Standard BGE-small embedding size
-            all_embeddings = (0..text_array.len()).map(|_| vec![0.0f32; 384]).collect();
+            let emb_len = 384i32; // Standard BGE-small embedding size
+            let flat = vec![0.0f32; num_rows * emb_len as usize];
+            (emb_len, flat)
         } else {
             // Normal mode: use gRPC streaming for efficiency
             let clients = self.pool.get_clients(&instance_name).await?;
 
-            // Extract texts into Vec (avoiding repeated string allocations)
-            let texts: Vec<String> = (0..text_array.len())
-                .filter(|&i| !text_array.is_null(i))
-                .map(|i| text_array.value(i).to_string())
-                .collect();
-
-            // Create stream of EmbedRequest messages
+            // Build requests directly from Arrow array - single allocation per row
             let truncate = req.truncate;
             let normalize = req.normalize;
 
-            let request_stream = async_stream::stream! {
-                for text in texts.iter() {
-                    yield tei::EmbedRequest {
-                        inputs: text.clone(),
-                        truncate,
-                        normalize,
-                        truncation_direction: 0,
-                        prompt_name: None,
-                        dimensions: None,
-                    };
-                }
-            };
+            let requests: Vec<tei::EmbedRequest> = (0..num_rows)
+                .filter(|&i| !text_array.is_null(i))
+                .map(|i| tei::EmbedRequest {
+                    inputs: text_array.value(i).to_string(),
+                    truncate,
+                    normalize,
+                    truncation_direction: 0,
+                    prompt_name: None,
+                    dimensions: None,
+                })
+                .collect();
+
+            let request_stream = tokio_stream::iter(requests);
 
             // Call TEI's embed_stream (batched streaming)
             let mut response_stream = clients
@@ -595,27 +589,26 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
                 .map_err(|e| Status::internal(format!("embed_stream failed: {}", e)))?
                 .into_inner();
 
-            // Collect responses in order
-            let mut embeddings_vec = Vec::new();
-            let mut emb_len = None;
+            // Collect responses directly into flat buffer - avoid intermediate Vec<Vec<f32>>
+            let mut flat_embeddings: Vec<f32> = Vec::new();
+            let mut emb_len: Option<i32> = None;
 
             while let Some(result) = response_stream.next().await {
                 let response = result
                     .map_err(|e| Status::internal(format!("Stream response error: {}", e)))?;
 
                 if emb_len.is_none() {
-                    emb_len = Some(response.embeddings.len() as i32);
+                    let len = response.embeddings.len() as i32;
+                    emb_len = Some(len);
+                    // Pre-allocate for expected total size
+                    flat_embeddings.reserve(num_rows * len as usize);
                 }
 
-                embeddings_vec.push(response.embeddings);
+                flat_embeddings.extend(response.embeddings);
             }
 
-            embedding_len = emb_len.unwrap_or(384);
-            all_embeddings = embeddings_vec;
-        }
-
-        // Build Arrow RecordBatch with embeddings
-        let flat_embeddings: Vec<f32> = all_embeddings.into_iter().flatten().collect();
+            (emb_len.unwrap_or(384), flat_embeddings)
+        };
         let values = Arc::new(Float32Array::from(flat_embeddings)) as ArrayRef;
 
         let field = Arc::new(Field::new("item", DataType::Float32, false));

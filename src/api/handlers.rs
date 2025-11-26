@@ -292,8 +292,8 @@ pub async fn get_logs(
             message: format!("Failed to read log file: {}", e),
         })?;
 
-    let all_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let total_lines = all_lines.len();
+    // Count lines first without allocating
+    let total_lines = content.lines().count();
 
     // Python-style slicing [start, end) with negative index support
     let start_idx = params
@@ -318,8 +318,14 @@ pub async fn get_logs(
         })
         .unwrap_or(total_lines);
 
-    let lines = if start_idx < end_idx {
-        all_lines[start_idx..end_idx].to_vec()
+    // Only allocate strings for the requested slice
+    let lines: Vec<String> = if start_idx < end_idx {
+        content
+            .lines()
+            .skip(start_idx)
+            .take(end_idx - start_idx)
+            .map(String::from)
+            .collect()
     } else {
         Vec::new()
     };

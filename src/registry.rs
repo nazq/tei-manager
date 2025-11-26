@@ -155,14 +155,15 @@ impl Registry {
 
         let instance = Arc::new(TeiInstance::new(config));
         let instance_name = instance.config.name.clone();
-        instances.insert(instance_name.clone(), instance.clone());
 
         tracing::info!(
             instance = %instance_name,
-            total_instances = instances.len(),
+            total_instances = instances.len() + 1,
             prometheus_port = ?instance.config.prometheus_port,
             "Instance added to registry"
         );
+
+        instances.insert(instance_name.clone(), instance.clone());
 
         // Notify listeners of the add event
         let _ = self.event_tx.send(InstanceEvent::Added(instance_name));

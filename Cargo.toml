@@ -51,7 +51,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 # Apache Arrow for efficient batching
 arrow = "56"
-arrow-ipc = { version = "56", features = ["lz4"] }
+arrow-ipc = { version = "57", features = ["lz4"] }
 arrow-schema = "56"
 async-stream = "0.3"
 hyper-rustls = "0.27" # For tonic TLS support

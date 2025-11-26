@@ -2,16 +2,24 @@
 # TEI Manager - Parameterized Public Image
 # ============================================================================
 #
-# Build arguments for GPU variant selection:
-#   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-")
+# Build arguments for variant selection:
+#   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"cpu-")
 #   TEI_VERSION       - TEI version (default: 1.8.3)
-#   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper")
+#   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"cpu")
 #   VARIANT_NAME      - Human-readable variant name for labels
 #   VARIANT_DESC      - Additional description for labels
 #
 # Usage:
-#   # Standard (multi-arch, default)
+#   # Standard GPU (multi-arch, default)
 #   docker build -t tei-manager:latest .
+#
+#   # CPU (for CI/testing, no GPU required)
+#   docker build \
+#     --build-arg TEI_VARIANT=cpu- \
+#     --build-arg VARIANT_SUFFIX=cpu \
+#     --build-arg VARIANT_NAME="CPU" \
+#     --build-arg VARIANT_DESC=" - CPU-only, no GPU required" \
+#     -t tei-manager:latest-cpu .
 #
 #   # Ada Lovelace (RTX 4090/4080)
 #   docker build \

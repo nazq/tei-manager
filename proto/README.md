@@ -36,7 +36,8 @@ We vendor the upstream TEI proto to:
 
 Key additions:
 - `Target` message: Specifies which instance to route to (by name, model, or index)
-- `EmbedArrow` RPC: High-performance Arrow batch embedding
+- `EmbedArrow` RPC: High-performance Arrow batch dense embedding
+- `EmbedSparseArrow` RPC: High-performance Arrow batch sparse embedding
 - Wrapper request/response types that add routing to all TEI RPCs
 
 ## Updating TEI Version

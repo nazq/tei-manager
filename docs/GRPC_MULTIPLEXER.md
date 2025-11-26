@@ -37,6 +37,8 @@ The gRPC multiplexer provides a unified endpoint for routing embedding requests 
 - `Embed` - Generate dense embeddings
 - `EmbedSparse` - Generate sparse embeddings (SPLADE)
 - `EmbedAll` - Generate all embedding types
+- `EmbedArrow` - Batch dense embeddings via Arrow IPC
+- `EmbedSparseArrow` - Batch sparse embeddings via Arrow IPC
 - `Predict` - Single sequence classification
 - `PredictPair` - Sequence pair classification
 - `Rerank` - Document reranking
@@ -95,13 +97,20 @@ grpcurl -plaintext -d '{
   "request": {"inputs": "Information retrieval"}
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparse
 
-# Batch embeddings via Arrow IPC
+# Batch dense embeddings via Arrow IPC
 grpcurl -plaintext -d '{
   "target": {"instance_name": "bge-small"},
   "arrow_ipc": "<base64-encoded-arrow-ipc>",
   "truncate": true,
   "normalize": true
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedArrow
+
+# Batch sparse embeddings via Arrow IPC (SPLADE models)
+grpcurl -plaintext -d '{
+  "target": {"instance_name": "splade"},
+  "arrow_ipc": "<base64-encoded-arrow-ipc>",
+  "truncate": true
+}' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparseArrow
 
 # List available services
 grpcurl -plaintext localhost:9001 list
@@ -311,7 +320,7 @@ The multiplexer validates instance health before routing:
 
 ### Batch Processing
 
-For high-throughput scenarios, use the `EmbedArrow` endpoint:
+For high-throughput scenarios, use the `EmbedArrow` or `EmbedSparseArrow` endpoints:
 
 ```bash
 # Arrow mode: batch thousands of texts in a single request
@@ -323,7 +332,8 @@ bench-client -e http://localhost:9001 -i bge-small \
 - Process thousands of texts in a single request
 - LZ4 compression reduces network overhead
 - Efficient memory layout for batch processing
-- Returns embeddings as Arrow FixedSizeList for zero-copy access
+- Dense (`EmbedArrow`): Returns `FixedSizeList<Float32>` for zero-copy access
+- Sparse (`EmbedSparseArrow`): Returns `List<Struct<index:u32, value:f32>>` for variable-length sparse vectors
 
 ## Troubleshooting
 

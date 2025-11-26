@@ -3,8 +3,7 @@
 //! These tests exercise the API handlers directly using axum-test,
 //! which runs in-process and contributes to code coverage metrics.
 //!
-//! **Setup Required**: Run `./scripts/setup-test-binary.sh` to extract the
-//! real TEI binary from the official Docker image before running tests.
+//! Uses `tests/mock-tei-router` for simulating TEI backend behavior.
 
 use axum_test::TestServer;
 use serde_json::json;
@@ -32,10 +31,10 @@ async fn create_test_server() -> (TestServer, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("state.toml");
 
-    // Use the real TEI binary extracted from official image
+    // Use the mock TEI binary for integration tests
     let tei_binary = std::env::current_dir()
         .expect("Failed to get current dir")
-        .join("tests/text-embeddings-router");
+        .join("tests/mock-tei-router");
 
     let config = ManagerConfig {
         state_file: state_file.clone(),
@@ -375,10 +374,10 @@ async fn test_max_instances_limit() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("state.toml");
 
-    // Use the real TEI binary extracted from official image
+    // Use the mock TEI binary for integration tests
     let tei_binary = std::env::current_dir()
         .expect("Failed to get current dir")
-        .join("tests/text-embeddings-router");
+        .join("tests/mock-tei-router");
 
     // Create server with max_instances = 2
     let config = ManagerConfig {
@@ -470,7 +469,7 @@ async fn test_state_persistence() {
 
     let tei_binary = std::env::current_dir()
         .expect("Failed to get current dir")
-        .join("tests/text-embeddings-router");
+        .join("tests/mock-tei-router");
 
     let registry = Arc::new(Registry::new(
         None,
@@ -531,7 +530,7 @@ async fn test_state_load_missing_file() {
 
     let tei_binary = std::env::current_dir()
         .expect("Failed to get current dir")
-        .join("tests/text-embeddings-router");
+        .join("tests/mock-tei-router");
 
     let registry = Arc::new(Registry::new(
         None,
@@ -812,7 +811,7 @@ async fn test_state_restore_multiple_instances() {
 
     let tei_binary = std::env::current_dir()
         .expect("Failed to get current dir")
-        .join("tests/text-embeddings-router");
+        .join("tests/mock-tei-router");
 
     // Create state file with multiple instances
     let state_content = r#"
@@ -870,7 +869,7 @@ async fn test_state_restore_with_invalid_instance() {
 
     let tei_binary = std::env::current_dir()
         .expect("Failed to get current dir")
-        .join("tests/text-embeddings-router");
+        .join("tests/mock-tei-router");
 
     // Create state file with an instance that will fail (invalid model path)
     let state_content = r#"
@@ -912,7 +911,7 @@ async fn test_state_restore_empty_state() {
 
     let tei_binary = std::env::current_dir()
         .expect("Failed to get current dir")
-        .join("tests/text-embeddings-router");
+        .join("tests/mock-tei-router");
 
     // Create empty state file
     let state_content = r#"
@@ -1159,4 +1158,188 @@ async fn test_port_auto_allocation_create_delete_create_api() {
         .map(|i| i["port"].as_u64().expect("port"))
         .collect();
     assert_eq!(ports.len(), 3, "All ports should be unique");
+}
+
+// ========================================
+// Logs endpoint tests
+// ========================================
+
+#[tokio::test]
+async fn test_get_logs_instance_not_found() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Try to get logs for non-existent instance
+    let response = server.get("/instances/nonexistent/logs").await;
+    assert_eq!(response.status_code(), 404);
+}
+
+#[tokio::test]
+async fn test_get_logs_with_log_file() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Use the fallback log directory that the handler checks
+    let log_dir = std::path::Path::new("/tmp/tei-manager/logs");
+    std::fs::create_dir_all(log_dir).unwrap();
+
+    let log_content = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+    std::fs::write(log_dir.join("test-logs.log"), log_content).unwrap();
+
+    // Get all logs
+    let response = server.get("/instances/test-logs/logs").await;
+    assert_eq!(response.status_code(), 200);
+
+    let logs: serde_json::Value = response.json();
+    assert_eq!(logs["total_lines"], 5);
+    assert_eq!(logs["start"], 0);
+    assert_eq!(logs["end"], 5);
+
+    // Clean up
+    let _ = std::fs::remove_file(log_dir.join("test-logs.log"));
+}
+
+#[tokio::test]
+async fn test_get_logs_with_slicing() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Use the fallback log directory
+    let log_dir = std::path::Path::new("/tmp/tei-manager/logs");
+    std::fs::create_dir_all(log_dir).unwrap();
+
+    let log_content = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+    std::fs::write(log_dir.join("sliced-logs.log"), log_content).unwrap();
+
+    // Get first 2 lines
+    let response = server
+        .get("/instances/sliced-logs/logs?start=0&end=2")
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let logs: serde_json::Value = response.json();
+    assert_eq!(logs["lines"].as_array().unwrap().len(), 2);
+    assert_eq!(logs["start"], 0);
+    assert_eq!(logs["end"], 2);
+
+    // Get last 2 lines using negative indices
+    let response = server.get("/instances/sliced-logs/logs?start=-2").await;
+    assert_eq!(response.status_code(), 200);
+
+    let logs: serde_json::Value = response.json();
+    assert_eq!(logs["lines"].as_array().unwrap().len(), 2);
+    assert_eq!(logs["start"], 3);
+    assert_eq!(logs["end"], 5);
+
+    // Clean up
+    let _ = std::fs::remove_file(log_dir.join("sliced-logs.log"));
+}
+
+#[tokio::test]
+async fn test_get_logs_empty_slice() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Use the fallback log directory
+    let log_dir = std::path::Path::new("/tmp/tei-manager/logs");
+    std::fs::create_dir_all(log_dir).unwrap();
+
+    let log_content = "line 1\nline 2\nline 3\n";
+    std::fs::write(log_dir.join("empty-slice.log"), log_content).unwrap();
+
+    // Invalid range (start > end) should return empty
+    let response = server
+        .get("/instances/empty-slice/logs?start=5&end=2")
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let logs: serde_json::Value = response.json();
+    assert_eq!(logs["lines"].as_array().unwrap().len(), 0);
+
+    // Clean up
+    let _ = std::fs::remove_file(log_dir.join("empty-slice.log"));
+}
+
+// ========================================
+// Additional error path tests
+// ========================================
+
+// Note: Instance name validation for special characters (/, \) is only done
+// when loading from config file, not via API. This is intentional to allow
+// flexibility in naming. The log file path sanitization handles special chars.
+
+#[tokio::test]
+async fn test_start_already_running_instance() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Create and start an instance
+    let create_req = json!({
+        "name": "running-instance",
+        "model_id": "BAAI/bge-small-en-v1.5",
+        "port": 8099
+    });
+
+    let response = server.post("/instances").json(&create_req).await;
+    assert_eq!(response.status_code(), 201);
+
+    // Try to start it again - should handle gracefully
+    let response = server.post("/instances/running-instance/start").await;
+    // Could be 200 (idempotent) or error depending on implementation
+    assert!(response.status_code() == 200 || response.status_code() == 409);
+}
+
+#[tokio::test]
+async fn test_stop_already_stopped_instance() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Create instance
+    let create_req = json!({
+        "name": "to-stop",
+        "model_id": "BAAI/bge-small-en-v1.5",
+        "port": 8098
+    });
+
+    let response = server.post("/instances").json(&create_req).await;
+    assert_eq!(response.status_code(), 201);
+
+    // Stop it
+    let response = server.post("/instances/to-stop/stop").await;
+    assert_eq!(response.status_code(), 200);
+
+    // Stop again - should handle gracefully
+    let response = server.post("/instances/to-stop/stop").await;
+    assert!(response.status_code() == 200 || response.status_code() == 409);
+}
+
+#[tokio::test]
+async fn test_list_instances_after_operations() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Start with empty list
+    let response = server.get("/instances").await;
+    assert_eq!(response.status_code(), 200);
+    let instances: Vec<serde_json::Value> = response.json();
+    assert_eq!(instances.len(), 0);
+
+    // Create two instances
+    for i in 0..2 {
+        let create_req = json!({
+            "name": format!("list-test-{}", i),
+            "model_id": "BAAI/bge-small-en-v1.5",
+            "port": 8070 + i
+        });
+        server.post("/instances").json(&create_req).await;
+    }
+
+    // List should show 2
+    let response = server.get("/instances").await;
+    assert_eq!(response.status_code(), 200);
+    let instances: Vec<serde_json::Value> = response.json();
+    assert_eq!(instances.len(), 2);
+
+    // Delete one
+    server.delete("/instances/list-test-0").await;
+
+    // List should show 1
+    let response = server.get("/instances").await;
+    assert_eq!(response.status_code(), 200);
+    let instances: Vec<serde_json::Value> = response.json();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0]["name"], "list-test-1");
 }

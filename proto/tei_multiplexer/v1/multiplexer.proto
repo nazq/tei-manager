@@ -23,6 +23,7 @@ service TeiMultiplexer {
 
     // Arrow batch embedding - High-performance batch processing
     rpc EmbedArrow (EmbedArrowRequest) returns (EmbedArrowResponse);
+    rpc EmbedSparseArrow (EmbedSparseArrowRequest) returns (EmbedSparseArrowResponse);
 
     // Predict service - Classification/prediction
     rpc Predict (PredictRequest) returns (tei.v1.PredictResponse);
@@ -115,4 +116,16 @@ message EmbedArrowRequest {
 
 message EmbedArrowResponse {
     bytes arrow_ipc = 1;  // Arrow IPC RecordBatch with "embeddings" FixedSizeList column
+}
+
+// Arrow sparse batch embedding - variable-length sparse vectors
+message EmbedSparseArrowRequest {
+    Target target = 1;
+    bytes arrow_ipc = 2;  // Arrow IPC RecordBatch with "text" column
+    bool truncate = 3;
+    bool noop = 4;  // If true, return dummy sparse embeddings for round-trip testing
+}
+
+message EmbedSparseArrowResponse {
+    bytes arrow_ipc = 1;  // Arrow IPC RecordBatch with "sparse_embeddings" List<Struct<index:u32, value:f32>> column
 }

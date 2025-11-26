@@ -24,13 +24,8 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Setup test environment
-        run: ./scripts/setup-test-binary.sh
-        env:
-          CI: true
-
       - name: Generate coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info --ignore-filename-regex='tests/.*'
+        run: cargo llvm-cov --lib --test integration --lcov --output-path lcov.info --ignore-filename-regex='tests/.*'
         env:
           CI: true
           RUSTC_WRAPPER: sccache

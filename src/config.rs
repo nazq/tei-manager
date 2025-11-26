@@ -90,6 +90,12 @@ pub struct ManagerConfig {
     #[serde(default = "default_grpc_max_parallel_streams")]
     pub grpc_max_parallel_streams: usize,
 
+    /// gRPC request timeout in seconds (default: 30)
+    /// Applies to forwarded requests from multiplexer to TEI backends
+    /// Set to 0 to disable timeouts (not recommended for production)
+    #[serde(default = "default_grpc_request_timeout_secs")]
+    pub grpc_request_timeout_secs: u64,
+
     /// Authentication configuration
     /// See [auth] section in config file
     #[serde(default)]
@@ -115,6 +121,7 @@ impl Default for ManagerConfig {
             grpc_enabled: default_grpc_enabled(),
             grpc_max_message_size_mb: default_grpc_max_message_size_mb(),
             grpc_max_parallel_streams: default_grpc_max_parallel_streams(),
+            grpc_request_timeout_secs: default_grpc_request_timeout_secs(),
             auth: AuthConfig::default(),
         }
     }
@@ -458,6 +465,9 @@ fn default_grpc_max_message_size_mb() -> usize {
 fn default_grpc_max_parallel_streams() -> usize {
     1024
 }
+fn default_grpc_request_timeout_secs() -> u64 {
+    30
+}
 fn default_verify_subject() -> bool {
     true
 }
@@ -484,10 +494,10 @@ mod tests {
     #[serial]
     fn test_load_from_file() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        let config_content = r#"
+        let config_content = r"
 api_port = 9090
 health_check_interval_secs = 60
-"#;
+";
         temp_file.write_all(config_content.as_bytes()).unwrap();
         temp_file.flush().unwrap();
 

@@ -93,9 +93,11 @@ This document describes the internal architecture and design decisions of TEI Ma
 
 #### gRPC Multiplexer (`src/grpc/`)
 - Unified gRPC endpoint for routing requests to TEI instances
-- Connection pooling with lazy connection creation
+- Connection pooling with lazy connection creation and idle pruning
 - Support for all TEI RPC methods (embed, rerank, tokenize, etc.)
 - Bidirectional streaming support
+- Configurable request timeouts (default 30s)
+- Graceful shutdown support
 - Minimal overhead: 1-22% depending on workload
 
 ## Key Design Decisions
@@ -350,20 +352,24 @@ tei-manager/
 
 ### API Errors
 
-All errors implement the `ApiError` trait for consistent HTTP responses:
+All errors use the unified `TeiError` enum with structured error responses:
 
-```rust
-pub trait ApiError: std::error::Error {
-    fn status_code(&self) -> StatusCode;
-    fn error_response(&self) -> Response;
+```json
+{
+  "error": "Instance 'my-instance' not found",
+  "code": "INSTANCE_NOT_FOUND",
+  "timestamp": "2025-01-15T10:30:00Z"
 }
 ```
 
-**Error Categories:**
-- `400 Bad Request` - Validation errors, invalid input
-- `404 Not Found` - Instance not found
-- `409 Conflict` - Port/name conflicts
-- `500 Internal Server Error` - Unexpected failures
+**Error Codes:**
+- `INSTANCE_NOT_FOUND` - 404
+- `INSTANCE_EXISTS`, `PORT_CONFLICT` - 409
+- `INVALID_CONFIG`, `INVALID_PORT`, `INVALID_GPU_ID`, `VALIDATION_ERROR` - 400
+- `MAX_INSTANCES_REACHED`, `PORT_ALLOCATION_FAILED` - 422
+- `BACKEND_UNAVAILABLE` - 503
+- `TIMEOUT` - 504
+- `INTERNAL_ERROR`, `IO_ERROR` - 500
 
 ### Graceful Degradation
 

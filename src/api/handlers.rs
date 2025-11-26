@@ -3,7 +3,7 @@
 use super::models::{CreateInstanceRequest, HealthResponse, InstanceInfo, LogsResponse};
 use super::routes::AppState;
 use crate::config::InstanceConfig;
-use crate::error::ApiError;
+use crate::error::TeiError;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -30,7 +30,7 @@ pub async fn metrics(State(state): State<AppState>) -> String {
 /// GET /instances - List all instances
 pub async fn list_instances(
     State(state): State<AppState>,
-) -> Result<Json<Vec<InstanceInfo>>, ApiError> {
+) -> Result<Json<Vec<InstanceInfo>>, TeiError> {
     let instances = state.registry.list().await;
 
     let mut info_list = Vec::new();
@@ -48,15 +48,15 @@ pub async fn list_instances(
 pub async fn create_instance(
     State(state): State<AppState>,
     Json(req): Json<CreateInstanceRequest>,
-) -> Result<(StatusCode, Json<InstanceInfo>), ApiError> {
+) -> Result<(StatusCode, Json<InstanceInfo>), TeiError> {
     // Validate gpu_id if provided
     if let Some(gpu_id) = req.gpu_id {
         let gpu_info = crate::gpu::get_or_init();
         if !gpu_info.is_valid_gpu_id(gpu_id) {
-            return Err(ApiError::BadRequest(format!(
-                "Invalid gpu_id: {}. Available GPUs: {:?}",
-                gpu_id, gpu_info.indices
-            )));
+            return Err(TeiError::InvalidGpuId {
+                id: gpu_id,
+                reason: format!("Available GPUs: {:?}", gpu_info.indices),
+            });
         }
     }
 
@@ -78,12 +78,16 @@ pub async fn create_instance(
         .registry
         .add(config)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| TeiError::ValidationError {
+            message: e.to_string(),
+        })?;
 
     instance
         .start(state.registry.tei_binary_path())
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| TeiError::Internal {
+            message: e.to_string(),
+        })?;
 
     // Wait for instance to be ready (poll every 500ms, timeout after 5 minutes)
     // This runs in background so API returns immediately with "starting" status
@@ -129,12 +133,12 @@ pub async fn create_instance(
 pub async fn get_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<InstanceInfo>, ApiError> {
+) -> Result<Json<InstanceInfo>, TeiError> {
     let instance = state
         .registry
         .get(&name)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+        .ok_or_else(|| TeiError::InstanceNotFound { name: name.clone() })?;
 
     let info = InstanceInfo::from_instance(&instance).await;
 
@@ -145,12 +149,12 @@ pub async fn get_instance(
 pub async fn delete_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, TeiError> {
     state
         .registry
         .remove(&name)
         .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
+        .map_err(|_| TeiError::InstanceNotFound { name: name.clone() })?;
 
     // Save state asynchronously
     let state_manager = state.state_manager.clone();
@@ -169,17 +173,19 @@ pub async fn delete_instance(
 pub async fn start_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<InstanceInfo>, ApiError> {
+) -> Result<Json<InstanceInfo>, TeiError> {
     let instance = state
         .registry
         .get(&name)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+        .ok_or_else(|| TeiError::InstanceNotFound { name: name.clone() })?;
 
     instance
         .start(state.registry.tei_binary_path())
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| TeiError::Internal {
+            message: e.to_string(),
+        })?;
 
     // Wait for instance to be ready in background
     let instance_clone = instance.clone();
@@ -212,14 +218,16 @@ pub async fn start_instance(
 pub async fn stop_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<InstanceInfo>, ApiError> {
+) -> Result<Json<InstanceInfo>, TeiError> {
     let instance = state
         .registry
         .get(&name)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+        .ok_or_else(|| TeiError::InstanceNotFound { name: name.clone() })?;
 
-    instance.stop().await.map_err(ApiError::Internal)?;
+    instance.stop().await.map_err(|e| TeiError::Internal {
+        message: e.to_string(),
+    })?;
 
     let info = InstanceInfo::from_instance(&instance).await;
 
@@ -230,17 +238,19 @@ pub async fn stop_instance(
 pub async fn restart_instance(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<InstanceInfo>, ApiError> {
+) -> Result<Json<InstanceInfo>, TeiError> {
     let instance = state
         .registry
         .get(&name)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Instance '{}' not found", name)))?;
+        .ok_or_else(|| TeiError::InstanceNotFound { name: name.clone() })?;
 
     instance
         .restart(state.registry.tei_binary_path())
         .await
-        .map_err(ApiError::Internal)?;
+        .map_err(|e| TeiError::Internal {
+            message: e.to_string(),
+        })?;
 
     let info = InstanceInfo::from_instance(&instance).await;
 
@@ -258,7 +268,7 @@ pub struct LogsQuery {
 pub async fn get_logs(
     Path(name): Path<String>,
     Query(params): Query<LogsQuery>,
-) -> Result<Json<LogsResponse>, ApiError> {
+) -> Result<Json<LogsResponse>, TeiError> {
     // Use same log directory resolution as spawn
     let log_dir_path =
         std::env::var("TEI_MANAGER_LOG_DIR").unwrap_or_else(|_| "/data/logs".to_string());
@@ -273,14 +283,14 @@ pub async fn get_logs(
     };
 
     if !log_path.exists() {
-        return Err(ApiError::NotFound(format!(
-            "Log file for instance '{}' not found",
-            name
-        )));
+        return Err(TeiError::InstanceNotFound { name });
     }
 
-    let content = std::fs::read_to_string(&log_path)
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("Failed to read log file: {}", e)))?;
+    let content = tokio::fs::read_to_string(&log_path)
+        .await
+        .map_err(|e| TeiError::IoError {
+            message: format!("Failed to read log file: {}", e),
+        })?;
 
     let all_lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     let total_lines = all_lines.len();

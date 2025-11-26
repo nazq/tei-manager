@@ -7,6 +7,8 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{Span, instrument};
@@ -90,13 +92,37 @@ macro_rules! impl_stream_rpc {
 pub struct TeiMultiplexerService {
     pool: BackendPool,
     max_parallel_stream_requests: usize,
+    request_timeout: Option<Duration>,
 }
 
 impl TeiMultiplexerService {
-    pub fn new(pool: BackendPool, max_parallel_stream_requests: usize) -> Self {
+    pub fn new(
+        pool: BackendPool,
+        max_parallel_stream_requests: usize,
+        request_timeout_secs: u64,
+    ) -> Self {
         Self {
             pool,
             max_parallel_stream_requests,
+            // 0 means no timeout
+            request_timeout: if request_timeout_secs > 0 {
+                Some(Duration::from_secs(request_timeout_secs))
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Wrap a future with an optional timeout
+    async fn with_timeout<T, F: std::future::Future<Output = Result<T, Status>>>(
+        &self,
+        fut: F,
+    ) -> Result<T, Status> {
+        match self.request_timeout {
+            Some(duration) => timeout(duration, fut)
+                .await
+                .map_err(|_| Status::deadline_exceeded("Request timeout"))?,
+            None => fut.await,
         }
     }
 
@@ -148,8 +174,10 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         // Get backend client (lock-free lookup)
         let clients = self.pool.get_clients(&instance_name).await?;
 
-        // Forward request to backend (zero-copy - just passes through)
-        let response = clients.info.clone().info(tei::InfoRequest {}).await?;
+        // Forward request to backend with timeout
+        let response = self
+            .with_timeout(async { clients.info.clone().info(tei::InfoRequest {}).await })
+            .await?;
 
         Ok(response)
     }
@@ -179,8 +207,10 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         // Get backend client
         let clients = self.pool.get_clients(&instance_name).await?;
 
-        // Forward to backend
-        let response = clients.embed.clone().embed(embed_req).await?;
+        // Forward to backend with timeout
+        let response = self
+            .with_timeout(async { clients.embed.clone().embed(embed_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -200,7 +230,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Span::current().record("instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
-        let response = clients.embed.clone().embed_sparse(inner_req).await?;
+        let response = self
+            .with_timeout(async { clients.embed.clone().embed_sparse(inner_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -220,7 +252,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Span::current().record("instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
-        let response = clients.embed.clone().embed_all(inner_req).await?;
+        let response = self
+            .with_timeout(async { clients.embed.clone().embed_all(inner_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -287,7 +321,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Span::current().record("instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
-        let response = clients.predict.clone().predict(inner_req).await?;
+        let response = self
+            .with_timeout(async { clients.predict.clone().predict(inner_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -307,7 +343,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Span::current().record("instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
-        let response = clients.predict.clone().predict_pair(inner_req).await?;
+        let response = self
+            .with_timeout(async { clients.predict.clone().predict_pair(inner_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -359,7 +397,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Span::current().record("instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
-        let response = clients.rerank.clone().rerank(inner_req).await?;
+        let response = self
+            .with_timeout(async { clients.rerank.clone().rerank(inner_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -427,7 +467,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Span::current().record("instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
-        let response = clients.tokenize.clone().tokenize(inner_req).await?;
+        let response = self
+            .with_timeout(async { clients.tokenize.clone().tokenize(inner_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -458,7 +500,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Span::current().record("instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
-        let response = clients.tokenize.clone().decode(inner_req).await?;
+        let response = self
+            .with_timeout(async { clients.tokenize.clone().decode(inner_req).await })
+            .await?;
 
         Ok(response)
     }
@@ -639,7 +683,7 @@ mod tests {
             8180,
         ));
         let pool = BackendPool::new(registry);
-        TeiMultiplexerService::new(pool, 1024)
+        TeiMultiplexerService::new(pool, 1024, 30)
     }
 
     async fn add_test_instance(registry: &Arc<Registry>, name: &str, port: u16) {
@@ -771,7 +815,7 @@ mod tests {
             8180,
         ));
         let pool = BackendPool::new(registry.clone());
-        let service = TeiMultiplexerService::new(pool, 1024);
+        let service = TeiMultiplexerService::new(pool, 1024, 30);
 
         add_test_instance(&registry, "stopped-instance", 59999).await;
 
@@ -1093,7 +1137,7 @@ mod tests {
             8180,
         ));
         let pool = BackendPool::new(registry);
-        let service = TeiMultiplexerService::new(pool, 2048);
+        let service = TeiMultiplexerService::new(pool, 2048, 30);
         assert_eq!(service.max_parallel_stream_requests, 2048);
     }
 
@@ -1501,5 +1545,117 @@ mod tests {
         for i in 0..values.len() {
             assert_eq!(values.value(i), 0.0);
         }
+    }
+
+    // ========================================================================
+    // Request Timeout Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_timeout_configuration_enabled() {
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        let pool = BackendPool::new(registry);
+        let service = TeiMultiplexerService::new(pool, 1024, 30);
+        assert!(service.request_timeout.is_some());
+        assert_eq!(service.request_timeout.unwrap(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_configuration_disabled() {
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        let pool = BackendPool::new(registry);
+        let service = TeiMultiplexerService::new(pool, 1024, 0);
+        assert!(service.request_timeout.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_timeout_configuration_various_values() {
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        for timeout_secs in [1, 5, 10, 60, 300] {
+            let pool = BackendPool::new(registry.clone());
+            let service = TeiMultiplexerService::new(pool, 1024, timeout_secs);
+            assert_eq!(
+                service.request_timeout.unwrap(),
+                Duration::from_secs(timeout_secs)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_with_timeout_wrapper_success() {
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        let pool = BackendPool::new(registry);
+        let service = TeiMultiplexerService::new(pool, 1024, 30);
+
+        // Simulate a fast operation that completes within timeout
+        let result = service
+            .with_timeout(async { Ok::<_, Status>("success") })
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "success");
+    }
+
+    #[tokio::test]
+    async fn test_with_timeout_wrapper_no_timeout_configured() {
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        let pool = BackendPool::new(registry);
+        let service = TeiMultiplexerService::new(pool, 1024, 0);
+
+        // With no timeout, operations should complete without deadline
+        let result = service
+            .with_timeout(async { Ok::<_, Status>("success") })
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_with_timeout_wrapper_timeout_exceeded() {
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        let pool = BackendPool::new(registry);
+        // Very short timeout for testing
+        let service = TeiMultiplexerService::new(pool, 1024, 1);
+
+        // Simulate a slow operation that exceeds timeout
+        let result: Result<(), Status> = service
+            .with_timeout(async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(())
+            })
+            .await;
+
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        assert!(status.message().contains("timeout"));
     }
 }

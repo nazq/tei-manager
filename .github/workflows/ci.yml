@@ -59,11 +59,6 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Setup test environment
-        run: ./scripts/setup-test-binary.sh
-        env:
-          CI: true
-
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
         env:
@@ -103,11 +98,6 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Setup test environment
-        run: ./scripts/setup-test-binary.sh
-        env:
-          CI: true
-
       - name: Run library tests
         run: cargo test --lib
         env:
@@ -135,9 +125,6 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install just
-        uses: taiki-e/install-action@just
-
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -155,6 +142,41 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-hf-models-v1
+          restore-keys: |
+            ${{ runner.os }}-hf-models-
+
+      - name: Pull TEI Docker image
+        run: docker pull ghcr.io/huggingface/text-embeddings-inference:cpu-1.8.3-grpc
+
+      - name: Run E2E dense tests
+        run: cargo test --test e2e_dense -- --nocapture
+        env:
+          CI: true
+          RUSTC_WRAPPER: sccache
+
+      - name: Run E2E sparse tests
+        run: cargo test --test e2e_sparse -- --nocapture
+        env:
+          CI: true
+          RUSTC_WRAPPER: sccache
+
+      - name: Run E2E multiplexer tests
+        run: cargo test --test e2e_multiplexer -- --nocapture
+        env:
+          CI: true
+          RUSTC_WRAPPER: sccache
+
+      - name: Run smoke tests
+        run: cargo test --test e2e_smoke
+        env:
+          CI: true
+          RUSTC_WRAPPER: sccache
 
   coverage:
     name: Code Coverage
@@ -176,13 +198,8 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Setup test environment
-        run: ./scripts/setup-test-binary.sh
-        env:
-          CI: true
-
       - name: Generate coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info --ignore-filename-regex='tests/.*'
+        run: cargo llvm-cov --lib --test integration --lcov --output-path lcov.info --ignore-filename-regex='tests/.*'
         env:
           CI: true
           RUSTC_WRAPPER: sccache

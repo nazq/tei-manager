@@ -1,6 +1,6 @@
 [package]
 name = "tei-manager"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -86,6 +86,7 @@ axum-test = "18.3"
 http-body-util = "0.1"
 serial_test = "3.2"
 futures = "0.3"
+testcontainers = "0.25"
 
 [lib]
 name = "tei_manager"

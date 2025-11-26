@@ -10,6 +10,61 @@ Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https
 
 ---
 
+## Who Is This For?
+
+TEI Manager is designed for teams running **multiple embedding models on a single GPU host** who want:
+
+- **Unified API** - One gRPC endpoint to route requests to any model
+- **Simple operations** - REST API for instance lifecycle, no orchestrator required
+- **Production basics** - Health checks, auto-restart, metrics, state persistence
+
+**Not a fit if you need:** Multi-node clustering, request queuing, per-tenant quotas, or Kubernetes-native autoscaling. For those, consider [Ray Serve](https://docs.ray.io/en/latest/serve/), [vLLM](https://vllm.ai), or [KServe](https://kserve.github.io/).
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Clients
+        C1[REST Client]
+        C2[gRPC Client]
+    end
+
+    subgraph TEI Manager
+        API[REST API<br/>:9000]
+        MUX[gRPC Multiplexer<br/>:9001]
+        HM[Health Monitor]
+        ST[State Persistence]
+    end
+
+    subgraph TEI Instances
+        T1[bge-small<br/>GPU 0 · :8080]
+        T2[bge-large<br/>GPU 1 · :8081]
+        T3[splade<br/>GPU 0 · :8082]
+    end
+
+    C1 --> API
+    C2 --> MUX
+    API --> T1 & T2 & T3
+    MUX --> T1 & T2 & T3
+    HM --> T1 & T2 & T3
+    ST -.-> API
+```
+
+**Request flow:**
+1. Clients send embedding requests to the gRPC Multiplexer (port 9001)
+2. Multiplexer routes to the target instance based on `instance_name`
+3. TEI instance processes the request on its assigned GPU
+4. Response returns through the multiplexer to the client
+
+**Management flow:**
+- REST API (port 9000) handles instance lifecycle (create/start/stop/delete)
+- Health Monitor checks each instance periodically, auto-restarts on failure
+- State Persistence saves instance configs to disk for crash recovery
+
+---
+
 ## Features
 
 - **Dynamic Instance Management** - Create, start, stop, restart, and delete TEI instances via REST API
@@ -103,30 +158,39 @@ The gRPC multiplexer provides a unified endpoint for routing embedding requests 
 | `Embed` | Generate dense embeddings for a single text |
 | `EmbedStream` | Streaming dense embeddings |
 | `EmbedSparse` | Generate sparse embeddings (SPLADE) |
-| `EmbedArrow` | **High-throughput batch embedding via Arrow IPC** |
+| `EmbedArrow` | **High-throughput batch dense embedding via Arrow IPC** |
+| `EmbedSparseArrow` | **High-throughput batch sparse embedding via Arrow IPC** |
 | `Rerank` | Rerank documents by relevance |
 | `Tokenize` | Tokenize text |
 | `Info` | Get model information |
 
 ### Arrow Batch Embeddings
 
-The `EmbedArrow` endpoint enables high-throughput batch processing using Apache Arrow IPC format with LZ4 compression:
+The `EmbedArrow` and `EmbedSparseArrow` endpoints enable high-throughput batch processing using Apache Arrow IPC format with LZ4 compression:
 
 ```bash
-# Using grpcurl with base64-encoded Arrow IPC
+# Dense embeddings via Arrow IPC
 grpcurl -plaintext -d '{
   "target": {"instance_name": "bge-small"},
   "arrow_ipc": "<base64-encoded-arrow-ipc>",
   "truncate": true,
   "normalize": true
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedArrow
+
+# Sparse embeddings via Arrow IPC (SPLADE models)
+grpcurl -plaintext -d '{
+  "target": {"instance_name": "splade"},
+  "arrow_ipc": "<base64-encoded-arrow-ipc>",
+  "truncate": true
+}' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparseArrow
 ```
 
 **Benefits:**
 - Process thousands of texts in a single request
 - LZ4 compression reduces network overhead
 - Efficient memory layout for batch processing
-- Returns embeddings as Arrow FixedSizeList for zero-copy access
+- Dense: Returns embeddings as Arrow `FixedSizeList<Float32>` for zero-copy access
+- Sparse: Returns embeddings as Arrow `List<Struct<index:u32, value:f32>>` for variable-length sparse vectors
 
 ---
 
@@ -191,17 +255,23 @@ The bench-client source (`src/bin/bench-client.rs`) demonstrates:
 
 ### Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Health check |
-| `GET` | `/metrics` | Prometheus metrics |
-| `GET` | `/instances` | List all instances |
-| `GET` | `/instances/{name}` | Get instance details |
-| `POST` | `/instances` | Create new instance |
-| `DELETE` | `/instances/{name}` | Delete instance |
-| `POST` | `/instances/{name}/start` | Start instance |
-| `POST` | `/instances/{name}/stop` | Stop instance |
-| `POST` | `/instances/{name}/restart` | Restart instance |
+| Method | Endpoint | Description | Success | Error Codes |
+|--------|----------|-------------|---------|-------------|
+| `GET` | `/health` | Health check | 200 | - |
+| `GET` | `/metrics` | Prometheus metrics | 200 | - |
+| `GET` | `/instances` | List all instances | 200 | - |
+| `GET` | `/instances/{name}` | Get instance details | 200 | 404 `INSTANCE_NOT_FOUND` |
+| `POST` | `/instances` | Create new instance | 201 | 409 `INSTANCE_EXISTS`, 422 `PORT_CONFLICT` |
+| `DELETE` | `/instances/{name}` | Delete instance | 200 | 404 `INSTANCE_NOT_FOUND` |
+| `POST` | `/instances/{name}/start` | Start instance | 200 | 404, 409 `ALREADY_RUNNING` |
+| `POST` | `/instances/{name}/stop` | Stop instance | 200 | 404, 409 `NOT_RUNNING` |
+| `POST` | `/instances/{name}/restart` | Restart instance | 200 | 404 |
+| `GET` | `/instances/{name}/logs` | Get instance logs | 200 | 404 |
+
+Error responses include a machine-readable `code` field:
+```json
+{"error": "Instance not found", "code": "INSTANCE_NOT_FOUND", "timestamp": "..."}
+```
 
 ### Create Instance
 
@@ -322,6 +392,42 @@ just pre-commit          # Run before committing
 
 - **[DESIGN.md](DESIGN.md)** - Architecture and design decisions
 - **[docs/GRPC_MULTIPLEXER.md](docs/GRPC_MULTIPLEXER.md)** - Full gRPC API reference
+- **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** - Production deployment guide
+- **[docs/MTLS.md](docs/MTLS.md)** - mTLS configuration
+
+---
+
+## Known Limitations
+
+- **Single host only** - No clustering or multi-node coordination
+- **No request queuing** - Requests exceeding TEI's `max_concurrent_requests` return errors immediately
+- **No per-tenant auth** - mTLS authenticates connections, not individual requests
+- **Port range required** - Each instance needs an HTTP port; plan your port range accordingly
+
+### Future Directions
+
+- Model-based routing (route by `model_id` instead of `instance_name`)
+- HTTP embedding endpoint on manager (avoid direct TEI access)
+- Metrics-based instance recommendations
+
+---
+
+## Versioning
+
+TEI Manager follows [Semantic Versioning](https://semver.org/):
+
+- **MAJOR** - Breaking changes to REST/gRPC APIs or config format
+- **MINOR** - New features, backward-compatible
+- **PATCH** - Bug fixes only
+
+**Docker tag format:** `{manager_version}-tei-{tei_version}[-{arch}]`
+
+The manager version tracks our API stability. The TEI version tracks the embedded TEI binary. We test against TEI's gRPC interface and will bump MINOR if TEI changes require manager updates.
+
+**Current stability:**
+- REST API: Stable since v0.4.0
+- gRPC API: Stable since v0.3.0
+- Config format: Stable since v0.1.0
 
 ---
 

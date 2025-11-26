@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2025-11-26
+
+### Added
+- `EmbedSparseArrow` gRPC endpoint for high-performance sparse embedding batch processing
+  - Variable-length `List<Struct<index:u32, value:f32>>` output schema
+  - LZ4 compression for Arrow IPC responses
+  - Noop mode for round-trip testing
+- Deployment guide (`docs/DEPLOYMENT.md`) with Docker and Kubernetes examples
+- mTLS authentication guide (`docs/MTLS.md`)
+- GitHub issue templates for bug reports and feature requests
+
+### Changed
+- Updated benchmark README with v0.6.0 results and improved commands
+
 ## [0.6.0] - 2025-11-26
 
 ### Changed
@@ -96,7 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for both CPU and GPU inference
 - Integration with HuggingFace Text Embeddings Inference
 
-[Unreleased]: https://github.com/nazq/tei-manager/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/nazq/tei-manager/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/nazq/tei-manager/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/nazq/tei-manager/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/nazq/tei-manager/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/nazq/tei-manager/compare/v0.3.0...v0.4.0

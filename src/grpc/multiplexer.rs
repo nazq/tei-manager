@@ -1,7 +1,11 @@
 //! TeiMultiplexer service implementation - routes requests to backend TEI instances
 
-use arrow::array::{Array, ArrayRef, FixedSizeListArray, Float32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, StringArray, StructArray,
+    UInt32Array,
+};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -654,6 +658,173 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         }
 
         Ok(Response::new(mux::EmbedArrowResponse { arrow_ipc: buffer }))
+    }
+
+    #[instrument(skip(self, request), fields(instance, num_rows))]
+    async fn embed_sparse_arrow(
+        &self,
+        request: Request<mux::EmbedSparseArrowRequest>,
+    ) -> Result<Response<mux::EmbedSparseArrowResponse>, Status> {
+        let req = request.into_inner();
+        let instance_name = Self::extract_target(req.target)?;
+
+        Span::current().record("instance", instance_name.as_str());
+
+        // Deserialize Arrow RecordBatch
+        let cursor = Cursor::new(&req.arrow_ipc);
+        let mut reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| Status::invalid_argument(format!("Invalid Arrow IPC: {}", e)))?;
+
+        let batch = reader
+            .next()
+            .ok_or_else(|| Status::invalid_argument("No RecordBatch in stream"))?
+            .map_err(|e| Status::invalid_argument(format!("Failed to read RecordBatch: {}", e)))?;
+
+        Span::current().record("num_rows", batch.num_rows());
+
+        // Extract text column
+        let text_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Status::invalid_argument("First column must be StringArray"))?;
+
+        let num_rows = text_array.len();
+
+        // Collect sparse embeddings: Vec<Vec<(index, value)>>
+        let sparse_embeddings: Vec<Vec<(u32, f32)>> = if req.noop {
+            // Noop mode: return dummy sparse embeddings (3 non-zero values per row)
+            (0..num_rows)
+                .map(|i| {
+                    vec![
+                        (i as u32, 1.0),
+                        (i as u32 + 100, 0.5),
+                        (i as u32 + 200, 0.25),
+                    ]
+                })
+                .collect()
+        } else {
+            let clients = self.pool.get_clients(&instance_name).await?;
+
+            let truncate = req.truncate;
+            let requests: Vec<tei::EmbedSparseRequest> = (0..num_rows)
+                .filter(|&i| !text_array.is_null(i))
+                .map(|i| tei::EmbedSparseRequest {
+                    inputs: text_array.value(i).to_string(),
+                    truncate,
+                    truncation_direction: 0,
+                    prompt_name: None,
+                })
+                .collect();
+
+            let request_stream = tokio_stream::iter(requests);
+
+            let mut response_stream = clients
+                .embed
+                .clone()
+                .embed_sparse_stream(request_stream)
+                .await
+                .map_err(|e| Status::internal(format!("embed_sparse_stream failed: {}", e)))?
+                .into_inner();
+
+            let mut results = Vec::with_capacity(num_rows);
+            while let Some(result) = response_stream.next().await {
+                let response = result
+                    .map_err(|e| Status::internal(format!("Stream response error: {}", e)))?;
+
+                let sparse: Vec<(u32, f32)> = response
+                    .sparse_embeddings
+                    .into_iter()
+                    .map(|sv| (sv.index, sv.value))
+                    .collect();
+                results.push(sparse);
+            }
+            results
+        };
+
+        // Build Arrow List<Struct<index: u32, value: f32>> array
+        let struct_fields = Fields::from(vec![
+            Field::new("index", DataType::UInt32, false),
+            Field::new("value", DataType::Float32, false),
+        ]);
+
+        // Flatten all sparse values and track offsets
+        let mut all_indices: Vec<u32> = Vec::new();
+        let mut all_values: Vec<f32> = Vec::new();
+        let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+        offsets.push(0);
+
+        for sparse in &sparse_embeddings {
+            for (idx, val) in sparse {
+                all_indices.push(*idx);
+                all_values.push(*val);
+            }
+            offsets.push(all_indices.len() as i32);
+        }
+
+        let indices_array = Arc::new(UInt32Array::from(all_indices)) as ArrayRef;
+        let values_array = Arc::new(Float32Array::from(all_values)) as ArrayRef;
+
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![indices_array, values_array],
+            None,
+        );
+
+        let list_field = Arc::new(Field::new(
+            "item",
+            DataType::Struct(struct_fields.clone()),
+            false,
+        ));
+        let list_array = ListArray::new(
+            list_field,
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(struct_array),
+            None,
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sparse_embeddings",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(struct_fields),
+                false,
+            ))),
+            false,
+        )]));
+
+        let result_batch = RecordBatch::try_new(schema, vec![Arc::new(list_array) as ArrayRef])
+            .map_err(|e| Status::internal(format!("Failed to create RecordBatch: {}", e)))?;
+
+        // Serialize to Arrow IPC with LZ4 compression
+        let mut buffer = Vec::new();
+        {
+            use arrow::ipc::CompressionType;
+            use arrow::ipc::writer::IpcWriteOptions;
+
+            let write_options = IpcWriteOptions::default()
+                .try_with_compression(Some(CompressionType::LZ4_FRAME))
+                .map_err(|e| Status::internal(format!("Failed to set compression: {}", e)))?;
+
+            let mut writer = StreamWriter::try_new_with_options(
+                &mut buffer,
+                &result_batch.schema(),
+                write_options,
+            )
+            .map_err(|e| Status::internal(format!("Failed to create IPC writer: {}", e)))?;
+
+            writer
+                .write(&result_batch)
+                .map_err(|e| Status::internal(format!("Failed to write RecordBatch: {}", e)))?;
+
+            writer
+                .finish()
+                .map_err(|e| Status::internal(format!("Failed to finish IPC writer: {}", e)))?;
+        }
+
+        Ok(Response::new(mux::EmbedSparseArrowResponse {
+            arrow_ipc: buffer,
+        }))
     }
 }
 
@@ -1538,6 +1709,313 @@ mod tests {
         for i in 0..values.len() {
             assert_eq!(values.value(i), 0.0);
         }
+    }
+
+    // ========================================================================
+    // EmbedSparseArrow RPC Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_missing_target() {
+        let service = create_test_service();
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: None,
+            arrow_ipc: vec![],
+            truncate: true,
+            noop: false,
+        });
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_invalid_ipc() {
+        let service = create_test_service();
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc: vec![1, 2, 3, 4], // Invalid Arrow IPC bytes
+            truncate: true,
+            noop: false,
+        });
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Invalid Arrow IPC"));
+    }
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_empty_ipc() {
+        let service = create_test_service();
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc: vec![], // Empty Arrow IPC
+            truncate: true,
+            noop: false,
+        });
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_noop_mode() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let service = create_test_service();
+
+        // Create valid Arrow IPC with text column
+        let text_array = StringArray::from(vec!["Hello", "World"]);
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(text_array) as ArrayRef]).unwrap();
+
+        let mut arrow_ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut arrow_ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc,
+            truncate: true,
+            noop: true, // Noop mode - returns dummy sparse embeddings
+        });
+
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_ok());
+
+        // Verify response has sparse embeddings
+        let response = result.unwrap().into_inner();
+        assert!(!response.arrow_ipc.is_empty());
+
+        // Decode and verify
+        let cursor = std::io::Cursor::new(response.arrow_ipc);
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let result_batch = reader.next().unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 2); // 2 texts -> 2 sparse embeddings
+    }
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_wrong_column_type() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let service = create_test_service();
+
+        // Create Arrow IPC with wrong column type (Int32 instead of String)
+        let int_array = Int32Array::from(vec![1, 2, 3]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::Int32,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(int_array) as ArrayRef]).unwrap();
+
+        let mut arrow_ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut arrow_ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc,
+            truncate: true,
+            noop: true,
+        });
+
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("StringArray"));
+    }
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_instance_not_found() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let service = create_test_service();
+
+        // Create valid Arrow IPC
+        let text_array = StringArray::from(vec!["Hello"]);
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(text_array) as ArrayRef]).unwrap();
+
+        let mut arrow_ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut arrow_ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName(
+                    "nonexistent".to_string(),
+                )),
+            }),
+            arrow_ipc,
+            truncate: true,
+            noop: false, // Not noop, so it will try to find instance
+        });
+
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_noop_empty_batch() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let service = create_test_service();
+
+        // Create valid Arrow IPC with empty batch
+        let text_array = StringArray::from(Vec::<&str>::new());
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(text_array) as ArrayRef]).unwrap();
+
+        let mut arrow_ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut arrow_ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc,
+            truncate: true,
+            noop: true,
+        });
+
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_ok());
+
+        // Verify empty response
+        let response = result.unwrap().into_inner();
+        let cursor = std::io::Cursor::new(response.arrow_ipc);
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let result_batch = reader.next().unwrap().unwrap();
+        assert_eq!(result_batch.num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_embed_sparse_arrow_noop_verify_structure() {
+        use arrow::array::{ListArray, StringArray, StructArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let service = create_test_service();
+
+        // Create valid Arrow IPC
+        let text_array = StringArray::from(vec!["Test"]);
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(text_array) as ArrayRef]).unwrap();
+
+        let mut arrow_ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut arrow_ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let request = Request::new(mux::EmbedSparseArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc,
+            truncate: true,
+            noop: true,
+        });
+
+        let result = service.embed_sparse_arrow(request).await;
+        assert!(result.is_ok());
+
+        // Verify sparse embedding structure
+        let response = result.unwrap().into_inner();
+        let cursor = std::io::Cursor::new(response.arrow_ipc);
+        let mut reader = StreamReader::try_new(cursor, None).unwrap();
+        let result_batch = reader.next().unwrap().unwrap();
+
+        // Get sparse_embeddings column and verify it's a ListArray
+        let sparse_col = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("Should be ListArray");
+
+        assert_eq!(sparse_col.len(), 1); // 1 row
+
+        // Get the struct values
+        let struct_values = sparse_col
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("Should be StructArray");
+
+        // Verify struct has index and value fields
+        assert_eq!(struct_values.num_columns(), 2);
+
+        // Noop mode returns 3 values per row
+        let first_row_len = sparse_col.value_length(0);
+        assert_eq!(first_row_len, 3);
+
+        // Verify index and value arrays exist and have correct types
+        let indices = struct_values
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("Index should be UInt32Array");
+        let values = struct_values
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("Value should be Float32Array");
+
+        assert_eq!(indices.len(), 3);
+        assert_eq!(values.len(), 3);
+
+        // Verify noop values: [(0, 1.0), (100, 0.5), (200, 0.25)]
+        assert_eq!(indices.value(0), 0);
+        assert_eq!(values.value(0), 1.0);
+        assert_eq!(indices.value(1), 100);
+        assert_eq!(values.value(1), 0.5);
+        assert_eq!(indices.value(2), 200);
+        assert_eq!(values.value(2), 0.25);
     }
 
     // ========================================================================

@@ -130,13 +130,44 @@ impl TeiContainer {
 
     /// Start a TEI container with custom image configuration
     pub async fn start(image: TeiImage) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use tokio::time::{Duration, sleep};
+        use tonic::transport::Channel;
+
         println!("Starting TEI container with model {}...", image.model_id);
 
         let container = image.start().await?;
         let grpc_port = container.get_host_port_ipv4(GRPC_PORT).await?;
 
-        println!("TEI container ready on port {}", grpc_port);
+        // Wait for gRPC to be actually accepting connections
+        // The "Ready" log message appears slightly before the server accepts connections
+        let endpoint = format!("http://127.0.0.1:{}", grpc_port);
+        for i in 0..30 {
+            match Channel::from_shared(endpoint.clone())
+                .unwrap()
+                .connect()
+                .await
+            {
+                Ok(_) => {
+                    println!(
+                        "TEI container ready on port {} (connected after {}ms)",
+                        grpc_port,
+                        i * 100
+                    );
+                    return Ok(Self {
+                        container,
+                        grpc_port,
+                    });
+                }
+                Err(_) => {
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
 
+        println!(
+            "TEI container ready on port {} (connection check timed out, proceeding anyway)",
+            grpc_port
+        );
         Ok(Self {
             container,
             grpc_port,

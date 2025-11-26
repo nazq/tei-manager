@@ -11,13 +11,13 @@ use std::sync::{Arc, OnceLock};
 /// Trait for recording metrics
 pub trait MetricsRecorder: Send + Sync {
     /// Record a counter increment
-    fn record_counter(&self, name: String, labels: &[(String, String)], value: u64);
+    fn record_counter(&self, name: &'static str, labels: &[(&'static str, &str)], value: u64);
 
     /// Record a gauge value
-    fn record_gauge(&self, name: String, value: f64);
+    fn record_gauge(&self, name: &'static str, value: f64);
 
     /// Record a histogram value
-    fn record_histogram(&self, name: String, labels: &[(String, String)], value: f64);
+    fn record_histogram(&self, name: &'static str, labels: &[(&'static str, &str)], value: f64);
 }
 
 // ============================================================================
@@ -28,58 +28,28 @@ pub trait MetricsRecorder: Send + Sync {
 pub struct PrometheusRecorder;
 
 impl MetricsRecorder for PrometheusRecorder {
-    fn record_counter(&self, name: String, labels: &[(String, String)], value: u64) {
+    fn record_counter(&self, name: &'static str, labels: &[(&'static str, &str)], value: u64) {
         match labels.len() {
             0 => metrics::counter!(name).increment(value),
-            1 => {
-                let k1 = labels[0].0.clone();
-                let v1 = labels[0].1.clone();
-                metrics::counter!(name, k1 => v1).increment(value)
-            }
-            2 => {
-                let k1 = labels[0].0.clone();
-                let v1 = labels[0].1.clone();
-                let k2 = labels[1].0.clone();
-                let v2 = labels[1].1.clone();
-                metrics::counter!(name, k1 => v1, k2 => v2).increment(value)
-            }
+            1 => metrics::counter!(name, labels[0].0 => labels[0].1.to_string()).increment(value),
             _ => {
-                // For more labels, just use first 2
-                let k1 = labels[0].0.clone();
-                let v1 = labels[0].1.clone();
-                let k2 = labels[1].0.clone();
-                let v2 = labels[1].1.clone();
-                metrics::counter!(name, k1 => v1, k2 => v2).increment(value)
+                // For 2+ labels, use first 2
+                metrics::counter!(name, labels[0].0 => labels[0].1.to_string(), labels[1].0 => labels[1].1.to_string()).increment(value)
             }
         }
     }
 
-    fn record_gauge(&self, name: String, value: f64) {
+    fn record_gauge(&self, name: &'static str, value: f64) {
         metrics::gauge!(name).set(value);
     }
 
-    fn record_histogram(&self, name: String, labels: &[(String, String)], value: f64) {
+    fn record_histogram(&self, name: &'static str, labels: &[(&'static str, &str)], value: f64) {
         match labels.len() {
             0 => metrics::histogram!(name).record(value),
-            1 => {
-                let k1 = labels[0].0.clone();
-                let v1 = labels[0].1.clone();
-                metrics::histogram!(name, k1 => v1).record(value)
-            }
-            2 => {
-                let k1 = labels[0].0.clone();
-                let v1 = labels[0].1.clone();
-                let k2 = labels[1].0.clone();
-                let v2 = labels[1].1.clone();
-                metrics::histogram!(name, k1 => v1, k2 => v2).record(value)
-            }
+            1 => metrics::histogram!(name, labels[0].0 => labels[0].1.to_string()).record(value),
             _ => {
-                // For more labels, just use first 2
-                let k1 = labels[0].0.clone();
-                let v1 = labels[0].1.clone();
-                let k2 = labels[1].0.clone();
-                let v2 = labels[1].1.clone();
-                metrics::histogram!(name, k1 => v1, k2 => v2).record(value)
+                // For 2+ labels, use first 2
+                metrics::histogram!(name, labels[0].0 => labels[0].1.to_string(), labels[1].0 => labels[1].1.to_string()).record(value)
             }
         }
     }
@@ -103,11 +73,8 @@ impl MetricsService {
     /// Record instance creation
     pub fn record_instance_created(&self, name: &str, model_id: &str) {
         self.recorder.record_counter(
-            "tei_manager_instances_created_total".to_string(),
-            &[
-                ("instance".to_string(), name.to_string()),
-                ("model".to_string(), model_id.to_string()),
-            ],
+            "tei_manager_instances_created_total",
+            &[("instance", name), ("model", model_id)],
             1,
         );
     }
@@ -115,8 +82,8 @@ impl MetricsService {
     /// Record instance deletion
     pub fn record_instance_deleted(&self, name: &str) {
         self.recorder.record_counter(
-            "tei_manager_instances_deleted_total".to_string(),
-            &[("instance".to_string(), name.to_string())],
+            "tei_manager_instances_deleted_total",
+            &[("instance", name)],
             1,
         );
     }
@@ -124,8 +91,8 @@ impl MetricsService {
     /// Record health check failure
     pub fn record_health_check_failure(&self, name: &str) {
         self.recorder.record_counter(
-            "tei_manager_health_check_failures_total".to_string(),
-            &[("instance".to_string(), name.to_string())],
+            "tei_manager_health_check_failures_total",
+            &[("instance", name)],
             1,
         );
     }
@@ -133,8 +100,8 @@ impl MetricsService {
     /// Record instance restart
     pub fn record_instance_restart(&self, name: &str) {
         self.recorder.record_counter(
-            "tei_manager_instance_restarts_total".to_string(),
-            &[("instance".to_string(), name.to_string())],
+            "tei_manager_instance_restarts_total",
+            &[("instance", name)],
             1,
         );
     }
@@ -142,7 +109,7 @@ impl MetricsService {
     /// Update total instance count gauge
     pub fn update_instance_count(&self, count: usize) {
         self.recorder
-            .record_gauge("tei_manager_instances_count".to_string(), count as f64);
+            .record_gauge("tei_manager_instances_count", count as f64);
     }
 }
 
@@ -290,26 +257,35 @@ pub mod mocks {
     }
 
     impl MetricsRecorder for MockMetricsRecorder {
-        fn record_counter(&self, name: String, labels: &[(String, String)], value: u64) {
+        fn record_counter(&self, name: &'static str, labels: &[(&'static str, &str)], value: u64) {
             let mut counters = self.counters.write().unwrap();
-            *counters.entry(name.clone()).or_insert(0) += value;
+            *counters.entry(name.to_string()).or_insert(0) += value;
 
             // Store labels
             let mut counter_labels = self.counter_labels.write().unwrap();
-            let label_vec = counter_labels.entry(name).or_default();
+            let label_vec = counter_labels.entry(name.to_string()).or_default();
             for (key, val) in labels {
-                label_vec.push((key.clone(), val.clone()));
+                label_vec.push(((*key).to_string(), (*val).to_string()));
             }
         }
 
-        fn record_gauge(&self, name: String, value: f64) {
+        fn record_gauge(&self, name: &'static str, value: f64) {
             let mut gauges = self.gauges.write().unwrap();
-            gauges.insert(name, value);
+            gauges.insert(name.to_string(), value);
         }
 
-        fn record_histogram(&self, name: String, labels: &[(String, String)], value: f64) {
+        fn record_histogram(
+            &self,
+            name: &'static str,
+            labels: &[(&'static str, &str)],
+            value: f64,
+        ) {
             let mut histograms = self.histograms.write().unwrap();
-            histograms.push((name, value, labels.to_vec()));
+            let owned_labels: Vec<(String, String)> = labels
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            histograms.push((name.to_string(), value, owned_labels));
         }
     }
 }
@@ -457,11 +433,8 @@ mod tests {
         let mock = Arc::new(MockMetricsRecorder::new());
 
         mock.record_histogram(
-            "test_histogram".to_string(),
-            &[
-                ("label1".to_string(), "value1".to_string()),
-                ("label2".to_string(), "value2".to_string()),
-            ],
+            "test_histogram",
+            &[("label1", "value1"), ("label2", "value2")],
             42.5,
         );
 

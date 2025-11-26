@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2025-11-26
+
+### Changed
+- Updated Apache Arrow from 56 to 57 (IPC wire format remains compatible with v56 clients)
+- Updated criterion from 0.5 to 0.7
+- Benchmark code now uses `std::hint::black_box` instead of deprecated `criterion::black_box`
+
 ## [0.4.0] - 2025-11-26
 
 ### Added
@@ -81,6 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for both CPU and GPU inference
 - Integration with HuggingFace Text Embeddings Inference
 
-[Unreleased]: https://github.com/nazq/tei-manager/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/nazq/tei-manager/compare/v0.1.0...v0.2.0
+[Unreleased]: https://github.com/nazq/tei-manager/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/nazq/tei-manager/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/nazq/tei-manager/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/nazq/tei-manager/compare/v0.1.0...v0.3.0
 [0.1.0]: https://github.com/nazq/tei-manager/releases/tag/v0.1.0

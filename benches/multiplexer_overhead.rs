@@ -2,8 +2,9 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use futures::future::join_all;
+use std::hint::black_box;
 use std::sync::Arc;
 use tei_manager::grpc::proto::multiplexer::v1::{
     EmbedArrowRequest, EmbedRequest as MuxEmbedRequest, Target, target::Routing,

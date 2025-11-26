@@ -1,0 +1,20 @@
+# Codecov configuration
+# https://docs.codecov.com/docs/codecovyml-reference
+
+coverage:
+  status:
+    project:
+      default:
+        # Don't fail if coverage drops slightly
+        threshold: 2%
+    patch:
+      default:
+        # New code should have at least 50% coverage
+        target: 50%
+        threshold: 5%
+
+# Ignore generated and test files
+ignore:
+  - "tests/**/*"
+  - "benches/**/*"
+  - "src/grpc/proto/**/*"

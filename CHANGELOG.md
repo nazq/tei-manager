@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-11-26
+
+### Added
+- gRPC request timeouts (configurable via `grpc_request_timeout_secs`, default 30s)
+- Graceful shutdown for gRPC server
+- Connection pool pruning for idle/orphaned connections
+- Security scanning in CI (cargo-audit, cargo-deny)
+- Dependabot for automated dependency updates
+
+### Changed
+- **Breaking**: Error responses now include `code` field: `{"error": "...", "code": "INSTANCE_NOT_FOUND", "timestamp": "..."}`
+- Unified error handling with structured error types and codes
+- Some HTTP status codes refined (e.g., port allocation failures return 422)
+
 ## [0.3.0] - 2025-11-25
 
 ### Added

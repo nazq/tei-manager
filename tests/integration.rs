@@ -149,7 +149,7 @@ async fn test_create_instance_with_invalid_gpu() {
     assert_eq!(response.status_code(), 400);
 
     let body: serde_json::Value = response.json();
-    assert!(body["error"].as_str().unwrap().contains("Invalid gpu_id"));
+    assert!(body["error"].as_str().unwrap().contains("Invalid GPU ID"));
 }
 
 #[tokio::test]
@@ -754,9 +754,11 @@ async fn test_config_validation_backslash_in_name() {
 #[tokio::test]
 async fn test_error_conflict_response() {
     use axum::response::IntoResponse;
-    use tei_manager::error::ApiError;
+    use tei_manager::error::TeiError;
 
-    let error = ApiError::Conflict("Resource already exists".to_string());
+    let error = TeiError::InstanceExists {
+        name: "test-instance".to_string(),
+    };
     let response = error.into_response();
 
     assert_eq!(response.status(), 409); // HTTP 409 Conflict
@@ -766,9 +768,11 @@ async fn test_error_conflict_response() {
 async fn test_error_internal_response() {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use tei_manager::error::ApiError;
+    use tei_manager::error::TeiError;
 
-    let error = ApiError::Internal(anyhow::anyhow!("Database connection failed"));
+    let error = TeiError::Internal {
+        message: "Database connection failed".to_string(),
+    };
     let response = error.into_response();
 
     assert_eq!(response.status(), 500); // HTTP 500 Internal Server Error
@@ -778,19 +782,19 @@ async fn test_error_internal_response() {
     let bytes = body.collect().await.unwrap().to_bytes();
     let body_str = String::from_utf8(bytes.to_vec()).unwrap();
 
-    assert!(body_str.contains("Internal server error"));
+    assert!(body_str.contains("Database connection failed"));
     assert!(body_str.contains("timestamp"));
 }
 
 #[tokio::test]
 async fn test_error_from_anyhow() {
-    use tei_manager::error::ApiError;
+    use tei_manager::error::TeiError;
 
     let anyhow_error = anyhow::anyhow!("Something went wrong");
-    let api_error: ApiError = anyhow_error.into();
+    let tei_error: TeiError = anyhow_error.into();
 
-    match api_error {
-        ApiError::Internal(_) => {} // Expected
+    match tei_error {
+        TeiError::Internal { .. } => {} // Expected
         _ => panic!("Expected Internal error"),
     }
 }

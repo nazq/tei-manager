@@ -16,7 +16,7 @@ pub mod registry;
 pub mod state;
 
 pub use config::{InstanceConfig, ManagerConfig};
-pub use error::ApiError;
+pub use error::{TeiError, TeiResult};
 pub use health::HealthMonitor;
 pub use instance::{InstanceStats, InstanceStatus, TeiInstance};
 pub use registry::{InstanceEvent, Registry};

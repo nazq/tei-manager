@@ -173,12 +173,17 @@ async fn main() -> Result<()> {
     // Build TLS configuration if mTLS is enabled
     let tls_config = build_tls_config(&config)?;
 
+    // Create shutdown signal channel for coordinated shutdown
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
     // Start gRPC server in background if enabled
     let grpc_handle = if config.grpc_enabled {
         let grpc_addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.grpc_port));
         let grpc_registry = registry.clone();
         let grpc_max_message_size_mb = config.grpc_max_message_size_mb;
         let grpc_max_parallel_streams = config.grpc_max_parallel_streams;
+        let grpc_request_timeout_secs = config.grpc_request_timeout_secs;
+        let mut grpc_shutdown_rx = shutdown_tx.subscribe();
 
         // Build gRPC TLS config if mTLS is enabled
         let grpc_tls_config =
@@ -200,12 +205,17 @@ async fn main() -> Result<()> {
 
         Some(tokio::spawn(async move {
             tracing::info!(addr = %grpc_addr, "Starting gRPC multiplexer server");
-            if let Err(e) = tei_manager::grpc::server::start_grpc_server(
+            if let Err(e) = tei_manager::grpc::server::start_grpc_server_with_shutdown(
                 grpc_addr,
                 grpc_registry,
                 grpc_tls_config,
                 grpc_max_message_size_mb,
                 grpc_max_parallel_streams,
+                grpc_request_timeout_secs,
+                async move {
+                    let _ = grpc_shutdown_rx.recv().await;
+                    tracing::info!("gRPC server received shutdown signal");
+                },
             )
             .await
             {
@@ -230,10 +240,14 @@ async fn main() -> Result<()> {
                 result.context("HTTPS API server error")?;
             }
             _ = async {
-                if let Some(handle) = grpc_handle {
-                    let _ = handle.await;
-                } else {
-                    std::future::pending::<()>().await;
+                match &grpc_handle {
+                    Some(handle) => {
+                        // Wait for the gRPC handle to complete (which means it exited unexpectedly)
+                        while !handle.is_finished() {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
                 }
             } => {
                 tracing::error!("gRPC server exited unexpectedly");
@@ -253,10 +267,14 @@ async fn main() -> Result<()> {
                 result.context("HTTP API server error")?;
             }
             _ = async {
-                if let Some(handle) = grpc_handle {
-                    let _ = handle.await;
-                } else {
-                    std::future::pending::<()>().await;
+                match &grpc_handle {
+                    Some(handle) => {
+                        // Wait for the gRPC handle to complete (which means it exited unexpectedly)
+                        while !handle.is_finished() {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
                 }
             } => {
                 tracing::error!("gRPC server exited unexpectedly");
@@ -265,6 +283,22 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!("Shutting down...");
+
+    // Signal gRPC server to shut down gracefully
+    if grpc_handle.is_some() {
+        tracing::info!("Signaling gRPC server to shut down");
+        let _ = shutdown_tx.send(());
+    }
+
+    // Wait for gRPC server to complete graceful shutdown
+    if let Some(handle) = grpc_handle {
+        tracing::info!("Waiting for gRPC server to complete shutdown");
+        match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+            Ok(Ok(())) => tracing::info!("gRPC server shut down successfully"),
+            Ok(Err(e)) => tracing::error!(error = %e, "gRPC server task error"),
+            Err(_) => tracing::warn!("gRPC server shutdown timed out after 30s"),
+        }
+    }
 
     // Stop all instances
     tracing::info!("Stopping all instances");

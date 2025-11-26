@@ -391,3 +391,126 @@ test-nextest:
 # Install nextest
 install-nextest:
     cargo install cargo-nextest
+
+# Save benchmark baseline (run on main branch before changes)
+bench-baseline:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "Saving benchmark baseline..."
+    BASELINE_DIR=".bench-baseline"
+    mkdir -p "$BASELINE_DIR"
+
+    # Get current commit hash
+    COMMIT=$(git rev-parse --short HEAD)
+    echo "$COMMIT" > "$BASELINE_DIR/commit"
+
+    # Run benchmarks and save results
+    cargo bench -- --save-baseline main
+    echo "Baseline saved for commit $COMMIT"
+    echo "Run 'just bench-compare' after making changes to compare"
+
+# Compare benchmarks against baseline
+bench-compare:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    BASELINE_DIR=".bench-baseline"
+
+    if [ ! -f "$BASELINE_DIR/commit" ]; then
+        echo "No baseline found. Run 'just bench-baseline' first on main branch."
+        exit 1
+    fi
+
+    BASELINE_COMMIT=$(cat "$BASELINE_DIR/commit")
+    echo "Comparing against baseline from commit $BASELINE_COMMIT"
+    echo ""
+
+    # Run benchmarks and compare
+    cargo bench -- --baseline main
+
+    echo ""
+    echo "If you see significant regressions (>10%), investigate before merging."
+
+# Full benchmark regression check (saves baseline, makes comparison)
+bench-regression:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "=== Benchmark Regression Detection ==="
+    echo ""
+
+    # Check if we have uncommitted changes
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "Warning: You have uncommitted changes"
+        echo ""
+    fi
+
+    # Get current branch
+    CURRENT_BRANCH=$(git branch --show-current)
+    BASELINE_DIR=".bench-baseline"
+
+    # If baseline doesn't exist or is old, create it from main
+    if [ ! -f "$BASELINE_DIR/commit" ]; then
+        echo "No baseline found. Creating baseline from main branch..."
+        echo ""
+
+        # Stash current changes if any
+        STASHED=false
+        if [ -n "$(git status --porcelain)" ]; then
+            git stash push -m "bench-regression temp stash"
+            STASHED=true
+        fi
+
+        # Switch to main, build, and run baseline
+        git checkout main
+        cargo build --release
+        cargo bench -- --save-baseline main
+        git rev-parse --short HEAD > "$BASELINE_DIR/commit"
+
+        # Switch back
+        git checkout "$CURRENT_BRANCH"
+        if [ "$STASHED" = true ]; then
+            git stash pop
+        fi
+
+        echo ""
+        echo "Baseline created. Now running comparison..."
+        echo ""
+    fi
+
+    # Build current branch
+    cargo build --release
+
+    # Run comparison
+    cargo bench -- --baseline main
+
+    echo ""
+    echo "=== Summary ==="
+    echo "Baseline commit: $(cat $BASELINE_DIR/commit)"
+    echo "Current branch: $CURRENT_BRANCH"
+    echo ""
+    echo "Look for 'Performance has regressed' warnings above."
+    echo "Regressions >10% should be investigated."
+
+# Quick benchmark (run without saving)
+bench-quick:
+    cargo bench -- --warm-up-time 1 --measurement-time 3
+
+# List benchmark targets
+bench-list:
+    cargo bench -- --list
+
+# Clean benchmark data
+bench-clean:
+    rm -rf target/criterion
+    rm -rf .bench-baseline
+    echo "Benchmark data cleaned"
+
+# Install cargo-deny for dependency checks
+install-deny:
+    cargo install cargo-deny
+
+# Run cargo-deny checks
+deny:
+    cargo deny check

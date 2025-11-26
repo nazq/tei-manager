@@ -1,133 +1,167 @@
-# Multiplexer Overhead Benchmark
+# Multiplexer Benchmarks
 
-This benchmark measures the overhead introduced by the gRPC multiplexer layer by comparing:
-- **Direct**: Direct gRPC calls to a TEI instance
-- **Multiplexer**: gRPC calls routed through the tei-manager multiplexer
+Benchmarks measuring gRPC multiplexer overhead by comparing direct TEI instance calls vs routed calls through tei-manager.
 
-## Prerequisites
+## Benchmark Groups
 
-- NVIDIA GPU with CUDA support
-- `text-embeddings-router` binary in PATH
-- `nvidia-smi` available
-- Model downloaded (default: `BAAI/bge-small-en-v1.5`)
+| Group | Description |
+|-------|-------------|
+| `embedding_overhead` | Single embedding requests at various input lengths |
+| `concurrent_requests` | Parallel requests (5, 10, 20 concurrent) |
+| `streaming_requests` | Streaming RPC batches (5, 10, 20 items) |
+| `arrow_batch` | Arrow IPC batch embedding (1, 10, 50, 100 rows) |
 
-## Running the Benchmark
-
-### Automatic (Recommended)
-
-The script handles all setup and teardown:
+## Quick Start
 
 ```bash
-./bench-multiplexer.sh
+# Start benchmark environment (tei-manager + TEI instance)
+just bench-start
+
+# Run benchmarks
+just bench
+
+# Stop environment
+just bench-stop
 ```
 
-This will:
-1. Start a direct TEI instance on port 8080
-2. Start tei-manager with multiplexer on port 9090
-3. Create and start a benchmark instance
-4. Run criterion benchmarks comparing direct vs multiplexer
-5. Clean up all processes
-
-### Custom Model
+## Available Commands
 
 ```bash
-MODEL_ID="sentence-transformers/all-MiniLM-L6-v2" ./bench-multiplexer.sh
+just bench-start      # Start tei-manager + bench-instance on ports 9000/9001/8081
+just bench            # Run full benchmark suite
+just bench-quick      # Quick run without saving
+just bench-baseline   # Save baseline for comparison
+just bench-compare    # Compare against saved baseline
+just bench-open       # Run and open HTML report
+just bench-stop       # Stop benchmark environment
+just bench-status     # Check if environment is running
 ```
 
-### Manual Setup
+## Endpoints
 
-If you want to run the benchmark manually:
+When `bench-start` is running:
 
-1. **Start direct TEI instance:**
-   ```bash
-   text-embeddings-router --model-id BAAI/bge-small-en-v1.5 --port 8080
-   ```
+| Service | Endpoint |
+|---------|----------|
+| tei-manager API | http://localhost:9000 |
+| gRPC Multiplexer | http://localhost:9001 |
+| TEI Instance (direct) | http://localhost:8081 |
 
-2. **Start tei-manager:**
-   ```bash
-   cargo run --release -- --port 3000 --grpc-port 9090
-   ```
+## Results (v0.6.0)
 
-3. **Create benchmark instance:**
-   ```bash
-   curl -X POST http://localhost:3000/instances \
-     -H "Content-Type: application/json" \
-     -d '{
-       "name": "bench-instance",
-       "model_id": "BAAI/bge-small-en-v1.5",
-       "port": 8081,
-       "gpu_id": 0
-     }'
+Measured on NVIDIA RTX GPU with `BAAI/bge-small-en-v1.5` model.
 
-   curl -X POST http://localhost:3000/instances/bench-instance/start
-   ```
+### Single Request Latency
 
-4. **Run benchmark:**
-   ```bash
-   cargo bench --bench multiplexer_overhead
-   ```
+| Input Size | Direct | Multiplexer | Overhead |
+|------------|--------|-------------|----------|
+| short (~2 tokens) | 1.12 ms | 1.26 ms | +12.5% |
+| medium (~20 tokens) | 1.11 ms | 1.33 ms | +20% |
+| long (~100 tokens) | 1.39 ms | 1.59 ms | +14% |
+| extra-long (~500 tokens) | 1.97 ms | 2.22 ms | +13% |
 
-## Understanding the Results
+### Concurrent Requests (medium text)
 
-The benchmark tests three input sizes:
-- **short**: "Hello world" (~2 tokens)
-- **medium**: ~20 tokens
-- **long**: ~100 tokens (repeated Lorem ipsum)
+| Concurrency | Direct | Multiplexer | Overhead |
+|-------------|--------|-------------|----------|
+| 5 | 1.72 ms | 1.85 ms | +7.5% |
+| 10 | 1.92 ms | 2.08 ms | +8% |
+| 20 | 2.31 ms | 2.73 ms | +18% |
 
-### Output
+### Streaming Batches
 
-Criterion will show:
-- Mean latency for each case
-- Standard deviation
-- Comparison between direct and multiplexer
+| Batch Size | Direct | Multiplexer | Overhead |
+|------------|--------|-------------|----------|
+| 5 | 1.80 ms | 2.04 ms | +13% |
+| 10 | 1.93 ms | 2.22 ms | +15% |
+| 20 | 2.14 ms | 2.39 ms | +12% |
 
-Example output:
-```
-embedding_overhead/direct/short   time: [1.23 ms 1.25 ms 1.27 ms]
-embedding_overhead/multiplexer/short   time: [1.45 ms 1.47 ms 1.49 ms]
-                                   change: [+17.2% +17.6% +18.0%]
-```
+### Arrow IPC Batch Embedding
+
+| Batch Size | Arrow IPC | Streaming | Arrow Advantage |
+|------------|-----------|-----------|-----------------|
+| 1 | 1.28 ms | 1.18 ms | −8% (overhead) |
+| 10 | 2.26 ms | 2.21 ms | −2% |
+| 50 | 3.08 ms | 2.97 ms | −4% |
+| 100 | 3.76 ms | 3.80 ms | ~0% |
+
+Arrow IPC shows similar performance to streaming at batch sizes up to 100. The benefit of Arrow comes from reduced serialization overhead at very large batch sizes (1000+) and columnar data interoperability.
+
+## Interpreting Results
 
 ### Expected Overhead
 
-The multiplexer adds:
-- 1 additional gRPC hop (client → multiplexer → TEI)
-- Request routing logic
-- Stream forwarding
+The multiplexer adds one gRPC hop (client → multiplexer → TEI), which introduces:
+- Connection routing (~50-100μs)
+- Request/response forwarding
+- Target extraction from metadata
 
-Typical overhead: **5-20%** depending on:
-- Input size (smaller inputs see higher % overhead)
-- Network conditions
+**Typical overhead: 7-20%** depending on:
+- Input size (smaller inputs = higher % overhead)
+- Concurrency (batching amortizes overhead)
 - GPU inference time (longer inference = lower % overhead)
 
-## Analyzing Results
+### Variance
 
-Results are saved to `target/criterion/embedding_overhead/`:
-- HTML reports with graphs
-- Raw data in JSON format
-- Comparison data for trend analysis
+Benchmarks may show ±5% variance between runs due to:
+- GPU thermal throttling
+- System load
+- Network jitter (even on localhost)
 
-View the HTML report:
+For reliable comparisons, use `just bench-baseline` and `just bench-compare`.
+
+## Manual Setup
+
+If you need custom configuration:
+
 ```bash
-open target/criterion/embedding_overhead/report/index.html
+# 1. Start tei-manager
+cargo run --release -- -c config/tei-manager.toml
+
+# 2. Create benchmark instance
+curl -X POST http://localhost:9000/instances \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "bench-instance",
+    "model_id": "BAAI/bge-small-en-v1.5",
+    "port": 8081
+  }'
+
+# 3. Wait for instance to be ready
+curl http://localhost:9000/instances/bench-instance
+
+# 4. Run benchmarks
+cargo bench --bench multiplexer_overhead
 ```
+
+## HTML Reports
+
+Criterion generates detailed HTML reports:
+
+```bash
+# After running benchmarks
+open target/criterion/report/index.html
+```
+
+Reports include:
+- Latency distributions
+- Throughput graphs
+- Historical comparisons
+- Statistical analysis
 
 ## Troubleshooting
 
-**GPU not found:**
-- Ensure `nvidia-smi` works
-- Check CUDA drivers are installed
+**"Connection refused" errors:**
+```bash
+just bench-status  # Check if environment is running
+just bench-start   # Start it if not
+```
 
-**Ports in use:**
-- Change ports in script or kill existing processes
-- Check with: `lsof -i :8080,9090,3000`
+**High variance in results:**
+- Close other applications
+- Ensure GPU isn't thermal throttling: `nvidia-smi -q -d TEMPERATURE`
+- Increase sample size in benchmark code
 
-**Benchmark fails to connect:**
-- Ensure all services are running and healthy
-- Check logs with `journalctl` or process output
-- Verify with: `curl http://localhost:8080/health`
-
-**High variance:**
-- Run on idle machine (close other applications)
-- Increase sample size in `bench_embedding_overhead`
-- Disable GPU boost: `sudo nvidia-smi -pm 1`
+**Benchmarks timeout:**
+- Check TEI instance health: `curl http://localhost:8081/health`
+- Check logs: `cat /tmp/tei-manager-bench.log`

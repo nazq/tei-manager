@@ -375,11 +375,13 @@ We use [Semantic Versioning](https://semver.org/):
 
 1. **Update version** in `Cargo.toml`
 2. **Update CHANGELOG.md**
-3. **Run release script:**
+3. **Update version references** in `README.md` (Docker tags, examples)
+4. **Run release script:**
    ```bash
-   ./release.sh 1.8.3
+   ./release.sh <NEW_VERSION> <TEI_VERSION>
+   # Example: ./release.sh 0.8.0 1.8.3
    ```
-4. **Create GitHub release** with changelog
+5. **Create GitHub release** with changelog
 
 ---
 

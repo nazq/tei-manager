@@ -7,6 +7,23 @@
 mod e2e;
 
 use e2e::common::{DENSE_MODEL, TeiContainer};
+use tokio::sync::OnceCell;
+
+/// Shared container for all dense embedding tests
+///
+/// Using OnceCell ensures the container is started exactly once and shared
+/// across all tests, avoiding parallel container startup races.
+static CONTAINER: OnceCell<TeiContainer> = OnceCell::const_new();
+
+async fn get_container() -> &'static TeiContainer {
+    CONTAINER
+        .get_or_init(|| async {
+            TeiContainer::start_dense(DENSE_MODEL)
+                .await
+                .expect("Failed to start dense TEI container")
+        })
+        .await
+}
 
 /// Connect to TEI gRPC
 async fn create_tei_client(
@@ -23,9 +40,7 @@ async fn create_tei_client(
 
 #[tokio::test]
 async fn test_embed_single_text() {
-    let tei = TeiContainer::start_dense(DENSE_MODEL)
-        .await
-        .expect("Failed to start dense TEI container");
+    let tei = get_container().await;
     let mut client = create_tei_client(&tei.grpc_endpoint()).await;
 
     let requests = vec![tei_manager::grpc::proto::tei::v1::EmbedRequest {
@@ -57,9 +72,7 @@ async fn test_embed_single_text() {
 
 #[tokio::test]
 async fn test_embed_batch() {
-    let tei = TeiContainer::start_dense(DENSE_MODEL)
-        .await
-        .expect("Failed to start dense TEI container");
+    let tei = get_container().await;
     let mut client = create_tei_client(&tei.grpc_endpoint()).await;
 
     let texts = [
@@ -116,9 +129,7 @@ async fn test_embed_batch() {
 
 #[tokio::test]
 async fn test_embed_similarity() {
-    let tei = TeiContainer::start_dense(DENSE_MODEL)
-        .await
-        .expect("Failed to start dense TEI container");
+    let tei = get_container().await;
     let mut client = create_tei_client(&tei.grpc_endpoint()).await;
 
     let texts = [

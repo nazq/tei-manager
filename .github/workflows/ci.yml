@@ -161,13 +161,13 @@ jobs:
           RUSTC_WRAPPER: sccache
 
       - name: Run E2E sparse tests
-        run: cargo test --test e2e_sparse -- --nocapture
+        run: cargo test --test e2e_sparse -- --nocapture --test-threads=1
         env:
           CI: true
           RUSTC_WRAPPER: sccache
 
       - name: Run E2E multiplexer tests
-        run: cargo test --test e2e_multiplexer -- --nocapture
+        run: cargo test --test e2e_multiplexer -- --nocapture --test-threads=1
         env:
           CI: true
           RUSTC_WRAPPER: sccache

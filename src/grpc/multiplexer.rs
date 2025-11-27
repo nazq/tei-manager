@@ -748,19 +748,26 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             Field::new("value", DataType::Float32, false),
         ]);
 
-        // Flatten all sparse values and track offsets
-        let mut all_indices: Vec<u32> = Vec::new();
-        let mut all_values: Vec<f32> = Vec::new();
-        let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
-        offsets.push(0);
+        // Given `sparse_embeddings: Vec<Vec<(u32, f32)>>`, where each inner vector
+        // contains `(index, value)` pairs, this computes a cumulative offset list
+        // indicating where each embedding would start if all of them were flattened
+        // into one contiguous buffer.
+        //
+        // The code starts with 0, then uses `scan` to accumulate each vector’s length
+        // into a running total. The result is suitable for prefix-indexing into a
+        // flattened sparse buffer.
+        let offsets: Vec<i32> = std::iter::once(0)
+            .chain(sparse_embeddings.iter().scan(0i32, |acc, sparse| {
+                *acc += sparse.len() as i32;
+                Some(*acc)
+            }))
+            .collect();
 
-        for sparse in &sparse_embeddings {
-            for (idx, val) in sparse {
-                all_indices.push(*idx);
-                all_values.push(*val);
-            }
-            offsets.push(all_indices.len() as i32);
-        }
+        // Flatten indices and values in parallel using unzip
+        let (all_indices, all_values): (Vec<u32>, Vec<f32>) = sparse_embeddings
+            .iter()
+            .flat_map(|sparse| sparse.iter().copied())
+            .unzip();
 
         let indices_array = Arc::new(UInt32Array::from(all_indices)) as ArrayRef;
         let values_array = Arc::new(Float32Array::from(all_values)) as ArrayRef;

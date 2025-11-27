@@ -6,34 +6,9 @@
 mod e2e;
 
 use e2e::common::{DENSE_MODEL, SPARSE_MODEL, TeiContainer, create_arrow_batch};
-use tokio::sync::OnceCell;
 use tonic::transport::Channel;
 
 use tei_manager::grpc::proto::tei::v1::embed_client::EmbedClient;
-
-/// Shared TEI containers
-static DENSE_TEI: OnceCell<TeiContainer> = OnceCell::const_new();
-static SPARSE_TEI: OnceCell<TeiContainer> = OnceCell::const_new();
-
-async fn get_dense_tei() -> &'static TeiContainer {
-    DENSE_TEI
-        .get_or_init(|| async {
-            TeiContainer::start_dense(DENSE_MODEL)
-                .await
-                .expect("Failed to start dense TEI container")
-        })
-        .await
-}
-
-async fn get_sparse_tei() -> &'static TeiContainer {
-    SPARSE_TEI
-        .get_or_init(|| async {
-            TeiContainer::start_sparse(SPARSE_MODEL)
-                .await
-                .expect("Failed to start sparse TEI container")
-        })
-        .await
-}
 
 // ============================================================================
 // EmbedArrow E2E Tests
@@ -41,7 +16,9 @@ async fn get_sparse_tei() -> &'static TeiContainer {
 
 #[tokio::test]
 async fn test_embed_arrow_with_real_backend() {
-    let tei = get_dense_tei().await;
+    let tei = TeiContainer::start_dense(DENSE_MODEL)
+        .await
+        .expect("Failed to start dense TEI container");
 
     // Test texts
     let texts = &["Hello world", "Testing embeddings", "Rust is great"];
@@ -89,7 +66,9 @@ async fn test_embed_arrow_with_real_backend() {
 
 #[tokio::test]
 async fn test_embed_sparse_with_real_backend() {
-    let tei = get_sparse_tei().await;
+    let tei = TeiContainer::start_sparse(SPARSE_MODEL)
+        .await
+        .expect("Failed to start sparse TEI container");
 
     let channel = Channel::from_shared(tei.grpc_endpoint())
         .unwrap()

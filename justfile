@@ -68,6 +68,127 @@ coverage:
 coverage-ci:
     cargo llvm-cov --lcov --output-path coverage/lcov.info --ignore-filename-regex='tests/.*'
 
+# Generate main branch coverage baseline for patch comparison
+cov-main:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CURRENT_BRANCH=$(git branch --show-current)
+
+    # Get main branch commit hash
+    MAIN_HASH=$(git rev-parse origin/main)
+    LCOV_FILE="main_${MAIN_HASH:0:12}.lcov"
+
+    # Check if we already have coverage for this commit
+    if [ -f "$LCOV_FILE" ]; then
+        echo "Coverage for main ($MAIN_HASH) already exists: $LCOV_FILE"
+        ln -sf "$LCOV_FILE" main.lcov
+        echo "Symlinked main.lcov -> $LCOV_FILE"
+        exit 0
+    fi
+
+    # Clean up old main_*.lcov files
+    for old_lcov in main_*.lcov; do
+        if [ -f "$old_lcov" ] && [ "$old_lcov" != "$LCOV_FILE" ]; then
+            echo "Removing old coverage file: $old_lcov"
+            rm -f "$old_lcov"
+        fi
+    done
+
+    # Stash any uncommitted changes
+    STASHED=false
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "Stashing uncommitted changes..."
+        git stash push -m "cov-main temp stash"
+        STASHED=true
+    fi
+
+    # Switch to main and generate coverage
+    echo "Switching to main branch..."
+    git checkout main
+
+    echo "Generating main branch coverage for $MAIN_HASH..."
+    # Only run lib tests on main to avoid issues with tests that don't exist on main
+    cargo llvm-cov --lib --lcov --output-path "$LCOV_FILE"
+
+    # Switch back
+    echo "Switching back to $CURRENT_BRANCH..."
+    git checkout "$CURRENT_BRANCH"
+
+    if [ "$STASHED" = true ]; then
+        echo "Restoring stashed changes..."
+        git stash pop
+    fi
+
+    # Create symlink for convenience
+    ln -sf "$LCOV_FILE" main.lcov
+
+    echo ""
+    echo "Main branch coverage saved to $LCOV_FILE (symlinked as main.lcov)"
+    echo "Run 'just cov-patch' to compare patch coverage"
+
+# Generate patch coverage comparison against main.lcov
+cov-patch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if [ ! -f main.lcov ]; then
+        echo "main.lcov not found. Run 'just cov-main' first."
+        exit 1
+    fi
+
+    echo "Generating current branch coverage..."
+    # Run all tests but only measure library code coverage
+    cargo llvm-cov --ignore-filename-regex='tests/.*' --lcov --output-path current.lcov
+
+    echo ""
+    echo "Comparing coverage..."
+    echo ""
+
+    # Extract line coverage percentages
+    MAIN_LINES=$(grep -oP 'LF:\K\d+' main.lcov | paste -sd+ | bc)
+    MAIN_HIT=$(grep -oP 'LH:\K\d+' main.lcov | paste -sd+ | bc)
+    MAIN_PCT=$(echo "scale=2; $MAIN_HIT * 100 / $MAIN_LINES" | bc)
+
+    CURR_LINES=$(grep -oP 'LF:\K\d+' current.lcov | paste -sd+ | bc)
+    CURR_HIT=$(grep -oP 'LH:\K\d+' current.lcov | paste -sd+ | bc)
+    CURR_PCT=$(echo "scale=2; $CURR_HIT * 100 / $CURR_LINES" | bc)
+
+    DIFF=$(echo "scale=2; $CURR_PCT - $MAIN_PCT" | bc)
+
+    # Calculate new lines added
+    NEW_LINES=$((CURR_LINES - MAIN_LINES))
+    NEW_HIT=$((CURR_HIT - MAIN_HIT))
+    if [ "$NEW_LINES" -gt 0 ]; then
+        NEW_PCT=$(echo "scale=2; $NEW_HIT * 100 / $NEW_LINES" | bc)
+    else
+        NEW_PCT="N/A"
+    fi
+
+    echo "Main branch:    $MAIN_PCT% ($MAIN_HIT/$MAIN_LINES lines)"
+    echo "Current branch: $CURR_PCT% ($CURR_HIT/$CURR_LINES lines)"
+    echo "Difference:     $DIFF%"
+    echo ""
+    if [ "$NEW_LINES" -gt 0 ]; then
+        echo "New code:       $NEW_PCT% ($NEW_HIT/$NEW_LINES new lines covered)"
+    fi
+    echo ""
+
+    # Check if coverage dropped significantly
+    # Allow some drop when adding substantial new code (>5% of codebase)
+    NEW_CODE_RATIO=$(echo "scale=2; $NEW_LINES * 100 / $MAIN_LINES" | bc)
+    if (( $(echo "$DIFF < -5" | bc -l) )); then
+        echo "⚠️  Coverage dropped significantly (>5%)!"
+        exit 1
+    elif (( $(echo "$DIFF < -2" | bc -l) )) && (( $(echo "$NEW_CODE_RATIO < 10" | bc -l) )); then
+        echo "⚠️  Coverage dropped by more than 2% without adding much new code"
+        exit 1
+    elif (( $(echo "$DIFF < 0" | bc -l) )); then
+        echo "⚠️  Coverage slightly decreased (acceptable with new code)"
+    else
+        echo "✅ Coverage maintained or improved"
+    fi
+
 # Build release binary
 build:
     cargo build --release

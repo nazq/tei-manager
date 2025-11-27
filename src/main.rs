@@ -7,7 +7,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tei_manager::{
-    HealthMonitor, Registry, StateManager, api,
+    HealthMonitor, ModelLoader, ModelRegistry, Registry, StateManager, api,
     auth::{AuthManager, MtlsProvider},
     config::ManagerConfig,
     metrics,
@@ -110,6 +110,18 @@ async fn main() -> Result<()> {
         config.tei_binary_path.clone(),
     ));
 
+    // Initialize model registry and discover cached models
+    let configured_models = config.models.clone().unwrap_or_default();
+    let model_registry = Arc::new(ModelRegistry::init(configured_models).await);
+    tracing::info!(
+        total = model_registry.count().await,
+        downloaded = model_registry.downloaded_count().await,
+        "Model registry initialized"
+    );
+
+    // Initialize model loader for smoke tests
+    let model_loader = Arc::new(ModelLoader::from_tei_binary(config.tei_binary_path.clone()));
+
     // Restore instances or seed from config
     if config.auto_restore_on_restart {
         tracing::info!("Auto-restore enabled, restoring instances from state");
@@ -164,6 +176,8 @@ async fn main() -> Result<()> {
         state_manager: state_manager.clone(),
         prometheus_handle,
         auth_manager: auth_manager.clone(),
+        model_registry,
+        model_loader,
     };
 
     let app = api::create_router(app_state);

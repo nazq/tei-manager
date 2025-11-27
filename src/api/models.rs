@@ -100,3 +100,63 @@ pub struct LogsResponse {
     pub end: usize,
     pub total_lines: usize,
 }
+
+// ============================================================================
+// Model Management Types
+// ============================================================================
+
+use crate::models::{HfModelMetadata, ModelEntry, ModelStatus};
+
+/// Model information response
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// HuggingFace model ID
+    pub model_id: String,
+    /// Current status
+    pub status: ModelStatus,
+    /// Whether model is downloaded to cache
+    pub downloaded: bool,
+    /// Cache path if downloaded
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
+    /// Cache size in bytes if downloaded
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_size_bytes: Option<u64>,
+    /// When model was last verified
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_verified: Option<chrono::DateTime<chrono::Utc>>,
+    /// Error message if verification failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_error: Option<String>,
+    /// Model metadata from config.json
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HfModelMetadata>,
+    /// When this model was added to registry
+    pub added_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<ModelEntry> for ModelInfo {
+    fn from(entry: ModelEntry) -> Self {
+        Self {
+            model_id: entry.model_id,
+            status: entry.status,
+            downloaded: entry.cache_info.is_some(),
+            cache_path: entry
+                .cache_info
+                .as_ref()
+                .map(|c| c.path.to_string_lossy().to_string()),
+            cache_size_bytes: entry.cache_info.as_ref().map(|c| c.size_bytes),
+            last_verified: entry.last_verified,
+            verification_error: entry.verification_error,
+            metadata: entry.metadata,
+            added_at: entry.added_at,
+        }
+    }
+}
+
+/// Request to add a model to the registry
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddModelRequest {
+    /// HuggingFace model ID (e.g., "BAAI/bge-small-en-v1.5")
+    pub model_id: String,
+}

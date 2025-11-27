@@ -9,6 +9,7 @@ use axum_test::TestServer;
 use serde_json::json;
 use std::sync::{Arc, OnceLock};
 use tei_manager::{
+    ModelLoader, ModelRegistry,
     api::routes::{AppState, create_router},
     config::ManagerConfig,
     metrics,
@@ -56,11 +57,16 @@ async fn create_test_server() -> (TestServer, TempDir) {
         config.tei_binary_path.clone(),
     ));
 
+    let model_registry = Arc::new(ModelRegistry::new());
+    let model_loader = Arc::new(ModelLoader::new());
+
     let state = AppState {
         registry,
         state_manager,
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
+        model_registry,
+        model_loader,
     };
 
     let app = create_router(state);
@@ -400,11 +406,16 @@ async fn test_max_instances_limit() {
         config.tei_binary_path.clone(),
     ));
 
+    let model_registry = Arc::new(ModelRegistry::new());
+    let model_loader = Arc::new(ModelLoader::new());
+
     let state = AppState {
         registry,
         state_manager,
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
+        model_registry,
+        model_loader,
     };
 
     let app = create_router(state);
@@ -1342,4 +1353,120 @@ async fn test_list_instances_after_operations() {
     let instances: Vec<serde_json::Value> = response.json();
     assert_eq!(instances.len(), 1);
     assert_eq!(instances[0]["name"], "list-test-1");
+}
+
+// ========================================
+// Model Management API Tests
+// ========================================
+
+#[tokio::test]
+async fn test_list_models_empty() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    let response = server.get("/models").await;
+    assert_eq!(response.status_code(), 200);
+
+    let models: Vec<serde_json::Value> = response.json();
+    // May have discovered models from HF cache, but should be empty list if no cache
+    assert!(models.is_empty() || models.iter().all(|m| m.get("model_id").is_some()));
+}
+
+#[tokio::test]
+async fn test_add_model() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    let add_req = json!({
+        "model_id": "BAAI/bge-small-en-v1.5"
+    });
+
+    let response = server.post("/models").json(&add_req).await;
+    // Should return 201 Created or 200 OK if already exists
+    assert!(response.status_code() == 201 || response.status_code() == 200);
+
+    let model: serde_json::Value = response.json();
+    assert_eq!(model["model_id"], "BAAI/bge-small-en-v1.5");
+    // Should have status (available or downloaded depending on cache)
+    assert!(model.get("status").is_some());
+}
+
+#[tokio::test]
+async fn test_get_model_not_found() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // URL-encoded model ID: nonexistent/model -> nonexistent%2Fmodel
+    let response = server.get("/models/nonexistent%2Fmodel").await;
+    assert_eq!(response.status_code(), 404);
+}
+
+#[tokio::test]
+async fn test_add_and_get_model() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // First add a model
+    let add_req = json!({
+        "model_id": "sentence-transformers/all-MiniLM-L6-v2"
+    });
+    server.post("/models").json(&add_req).await;
+
+    // Then get it (URL-encoded)
+    let response = server
+        .get("/models/sentence-transformers%2Fall-MiniLM-L6-v2")
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let model: serde_json::Value = response.json();
+    assert_eq!(model["model_id"], "sentence-transformers/all-MiniLM-L6-v2");
+}
+
+#[tokio::test]
+async fn test_model_status_types() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Add a model
+    let add_req = json!({
+        "model_id": "BAAI/bge-small-en-v1.5"
+    });
+    let response = server.post("/models").json(&add_req).await;
+    let model: serde_json::Value = response.json();
+
+    // Status should be one of: available, downloading, downloaded, loading, verified, failed
+    let status = model["status"].as_str().unwrap();
+    assert!(
+        [
+            "available",
+            "downloading",
+            "downloaded",
+            "loading",
+            "verified",
+            "failed"
+        ]
+        .contains(&status)
+    );
+}
+
+#[tokio::test]
+async fn test_list_models_after_add() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    // Add two models
+    let add_req1 = json!({ "model_id": "BAAI/bge-small-en-v1.5" });
+    let add_req2 = json!({ "model_id": "sentence-transformers/all-MiniLM-L6-v2" });
+
+    server.post("/models").json(&add_req1).await;
+    server.post("/models").json(&add_req2).await;
+
+    // List should show at least these two (may have more from cache discovery)
+    let response = server.get("/models").await;
+    assert_eq!(response.status_code(), 200);
+
+    let models: Vec<serde_json::Value> = response.json();
+    assert!(models.len() >= 2);
+
+    // Check our models are present
+    let model_ids: Vec<&str> = models
+        .iter()
+        .filter_map(|m| m["model_id"].as_str())
+        .collect();
+    assert!(model_ids.contains(&"BAAI/bge-small-en-v1.5"));
+    assert!(model_ids.contains(&"sentence-transformers/all-MiniLM-L6-v2"));
 }

@@ -4,5 +4,8 @@ tests/text-embeddings-router
 docs/refactor
 /private
 lcov.info
+main.lcov
+main_*.lcov
+current.lcov
 scripts/runpod/
 scripts/vastai/

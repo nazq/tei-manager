@@ -5,7 +5,31 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2025-11-27
+
+### Added
+- **Model Registry API** - REST endpoints for managing HuggingFace models
+  - `GET /models` - List all known models with download/verification status
+  - `POST /models` - Register a model in the registry
+  - `GET /models/{id}` - Get model details (cache path, size, metadata)
+  - `POST /models/{id}/download` - Download model to HF cache
+  - `POST /models/{id}/load` - Smoke test model loading on GPU
+- Model status tracking: `available` → `downloading` → `downloaded` → `loading` → `verified`/`failed`
+- Auto-discovery of models already in HuggingFace cache on startup
+- Optional `models` config array to pre-register specific models
+- Native HuggingFace Hub integration via `hf-hub` crate (replaces CLI dependency)
+- HuggingFace embedding benchmark script (`benchmarks/hf_embedding_bench.py`)
+- Patch coverage comparison tools (`just cov-main`, `just cov-patch`)
+- Comprehensive model registry integration tests
+
+### Changed
+- Refactored to functional style with higher-order functions
+  - Replace mutable loops with iterators and fold/filter_map patterns
+  - Use `futures::join_all` for parallel async operations
+  - Use scan/flat_map/unzip for sparse embedding building
+- E2E tests now use per-test containers for proper cleanup (fixes container leaks)
+
+Happy Thanksgiving! 🦃
 
 ## [0.7.0] - 2025-11-26
 

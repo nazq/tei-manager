@@ -12,6 +12,7 @@ pub mod grpc;
 pub mod health;
 pub mod instance;
 pub mod metrics;
+pub mod models;
 pub mod registry;
 pub mod state;
 
@@ -19,5 +20,6 @@ pub use config::{InstanceConfig, ManagerConfig};
 pub use error::{TeiError, TeiResult};
 pub use health::HealthMonitor;
 pub use instance::{InstanceStats, InstanceStatus, TeiInstance};
+pub use models::{ModelEntry, ModelLoader, ModelRegistry, ModelStatus};
 pub use registry::{InstanceEvent, Registry};
 pub use state::StateManager;

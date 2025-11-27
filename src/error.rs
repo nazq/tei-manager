@@ -25,6 +25,25 @@ pub enum TeiError {
     #[error("Instance '{name}' not found")]
     InstanceNotFound { name: String },
 
+    // ========================================================================
+    // Model Errors (typically 4xx/5xx)
+    // ========================================================================
+    /// Model not found in registry
+    #[error("Model '{model_id}' not found")]
+    ModelNotFound { model_id: String },
+
+    /// Model download failed
+    #[error("Failed to download model '{model_id}': {reason}")]
+    ModelDownloadFailed { model_id: String, reason: String },
+
+    /// Model load/verification failed
+    #[error("Model '{model_id}' failed to load: {reason}")]
+    ModelLoadFailed { model_id: String, reason: String },
+
+    /// Model is already being processed
+    #[error("Model '{model_id}' is already {operation}")]
+    ModelBusy { model_id: String, operation: String },
+
     /// Instance with the given name already exists
     #[error("Instance '{name}' already exists")]
     InstanceExists { name: String },
@@ -119,10 +138,12 @@ impl TeiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             // 404 Not Found
-            Self::InstanceNotFound { .. } => StatusCode::NOT_FOUND,
+            Self::InstanceNotFound { .. } | Self::ModelNotFound { .. } => StatusCode::NOT_FOUND,
 
             // 409 Conflict
-            Self::InstanceExists { .. } | Self::PortConflict { .. } => StatusCode::CONFLICT,
+            Self::InstanceExists { .. } | Self::PortConflict { .. } | Self::ModelBusy { .. } => {
+                StatusCode::CONFLICT
+            }
 
             // 400 Bad Request
             Self::InvalidConfig { .. }
@@ -151,7 +172,10 @@ impl TeiError {
             Self::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
 
             // 500 Internal Server Error
-            Self::Internal { .. } | Self::IoError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal { .. }
+            | Self::IoError { .. }
+            | Self::ModelDownloadFailed { .. }
+            | Self::ModelLoadFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -160,6 +184,10 @@ impl TeiError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::InstanceNotFound { .. } => "INSTANCE_NOT_FOUND",
+            Self::ModelNotFound { .. } => "MODEL_NOT_FOUND",
+            Self::ModelDownloadFailed { .. } => "MODEL_DOWNLOAD_FAILED",
+            Self::ModelLoadFailed { .. } => "MODEL_LOAD_FAILED",
+            Self::ModelBusy { .. } => "MODEL_BUSY",
             Self::InstanceExists { .. } => "INSTANCE_EXISTS",
             Self::PortConflict { .. } => "PORT_CONFLICT",
             Self::MaxInstancesReached { .. } => "MAX_INSTANCES_REACHED",
@@ -259,9 +287,14 @@ impl From<TeiError> for tonic::Status {
     fn from(err: TeiError) -> Self {
         let message = err.to_string();
         match err {
-            TeiError::InstanceNotFound { .. } => tonic::Status::not_found(message),
-            TeiError::InstanceExists { .. } | TeiError::PortConflict { .. } => {
-                tonic::Status::already_exists(message)
+            TeiError::InstanceNotFound { .. } | TeiError::ModelNotFound { .. } => {
+                tonic::Status::not_found(message)
+            }
+            TeiError::InstanceExists { .. }
+            | TeiError::PortConflict { .. }
+            | TeiError::ModelBusy { .. } => tonic::Status::already_exists(message),
+            TeiError::ModelDownloadFailed { .. } | TeiError::ModelLoadFailed { .. } => {
+                tonic::Status::internal(message)
             }
             TeiError::InvalidConfig { .. }
             | TeiError::InvalidPort { .. }

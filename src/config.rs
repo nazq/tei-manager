@@ -61,6 +61,12 @@ pub struct ManagerConfig {
     /// These are created and started automatically when the manager boots
     pub instances: Vec<InstanceConfig>,
 
+    /// List of model IDs to pre-register in the model registry (default: empty)
+    /// These models will be checked against the HF cache on startup
+    /// Example: ["BAAI/bge-small-en-v1.5", "sentence-transformers/all-MiniLM-L6-v2"]
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
+
     /// Path to text-embeddings-router binary (default: "text-embeddings-router")
     /// Override via: TEI_BINARY_PATH
     /// The default searches PATH; use absolute path for custom installations
@@ -116,6 +122,7 @@ impl Default for ManagerConfig {
             instance_port_start: default_instance_port_start(),
             instance_port_end: default_instance_port_end(),
             instances: Vec::new(),
+            models: None,
             tei_binary_path: default_tei_binary_path(),
             grpc_port: default_grpc_port(),
             grpc_enabled: default_grpc_enabled(),

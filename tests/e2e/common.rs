@@ -108,6 +108,8 @@ impl Image for TeiImage {
 }
 
 /// A running TEI container
+///
+/// The container is automatically stopped when this struct is dropped.
 pub struct TeiContainer {
     container: ContainerAsync<TeiImage>,
     grpc_port: u16,

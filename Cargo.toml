@@ -1,6 +1,6 @@
 [package]
 name = "tei-manager"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -59,10 +59,15 @@ hyper-rustls = "0.27" # For tonic TLS support
 # Async trait support
 async-trait = "0.1"
 dashmap = "6"
+futures = "0.3"
 
 # Certificate parsing for mTLS
 x509-parser = "0.18"
 urlencoding = "2.1"
+dirs = "5.0"
+
+# HuggingFace Hub API
+hf-hub = { version = "0.4", features = ["tokio"] }
 
 # Native TLS support
 axum-server = { version = "0.7", features = ["tls-rustls"] }

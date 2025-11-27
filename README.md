@@ -68,6 +68,7 @@ flowchart LR
 ## Features
 
 - **Dynamic Instance Management** - Create, start, stop, restart, and delete TEI instances via REST API
+- **Model Registry** - Track, download, and verify HuggingFace models before deployment
 - **Multi-GPU Support** - Pin instances to specific GPUs or share across all available GPUs
 - **gRPC Multiplexer** - Unified streaming gRPC endpoint for routing requests to multiple instances
 - **Arrow Batch Embeddings** - High-throughput batch embedding via Arrow IPC with LZ4 compression
@@ -267,6 +268,11 @@ The bench-client source (`src/bin/bench-client.rs`) demonstrates:
 | `POST` | `/instances/{name}/stop` | Stop instance | 200 | 404, 409 `NOT_RUNNING` |
 | `POST` | `/instances/{name}/restart` | Restart instance | 200 | 404 |
 | `GET` | `/instances/{name}/logs` | Get instance logs | 200 | 404 |
+| `GET` | `/models` | List all known models | 200 | - |
+| `POST` | `/models` | Register a model | 201 | - |
+| `GET` | `/models/{id}` | Get model details | 200 | 404 `MODEL_NOT_FOUND` |
+| `POST` | `/models/{id}/download` | Download model to cache | 200 | 409 `MODEL_BUSY`, 500 |
+| `POST` | `/models/{id}/load` | Smoke test model loading | 200 | 409 `MODEL_BUSY`, 500 |
 
 Error responses include a machine-readable `code` field:
 ```json
@@ -298,6 +304,39 @@ curl -X POST http://localhost:9000/instances \
 - `max_concurrent_requests` - Max concurrent requests (default: 512)
 - `pooling` - Pooling method (e.g., "splade" for sparse models)
 
+### Model Registry
+
+The model registry tracks HuggingFace models and their status. Models are auto-discovered from the HF cache on startup.
+
+```bash
+# List all known models
+curl http://localhost:9000/models
+
+# Register a model (checks if already cached)
+curl -X POST http://localhost:9000/models \
+  -H "Content-Type: application/json" \
+  -d '{"model_id": "BAAI/bge-small-en-v1.5"}'
+
+# Download a model to cache
+curl -X POST "http://localhost:9000/models/BAAI%2Fbge-small-en-v1.5/download"
+
+# Smoke test model loading (loads on GPU 0, verifies, unloads)
+curl -X POST "http://localhost:9000/models/BAAI%2Fbge-small-en-v1.5/load"
+
+# Get model details (cache path, size, metadata, verification status)
+curl "http://localhost:9000/models/BAAI%2Fbge-small-en-v1.5"
+```
+
+**Model Status Flow:**
+- `available` - Model is registered but not downloaded
+- `downloading` - Download in progress
+- `downloaded` - Model is in HF cache
+- `loading` - Smoke test in progress
+- `verified` - Smoke test passed, ready to use
+- `failed` - Smoke test failed (check `verification_error`)
+
+> **Note:** Model IDs contain `/` which must be URL-encoded as `%2F` in paths.
+
 ---
 
 ## Configuration
@@ -320,7 +359,13 @@ state_file = "/data/state.toml"
 health_check_interval_secs = 30
 max_instances = 10
 
-# Seed instances
+# Pre-register models (checked against HF cache on startup)
+models = [
+  "BAAI/bge-small-en-v1.5",
+  "sentence-transformers/all-MiniLM-L6-v2"
+]
+
+# Seed instances (auto-started on boot)
 [[instances]]
 name = "bge-small"
 model_id = "BAAI/bge-small-en-v1.5"

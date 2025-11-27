@@ -3,7 +3,11 @@
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # number_prefix is unmaintained but still functional, pulled in by hf-hub -> indicatif
+    # Tracking: https://github.com/huggingface/hf-hub/issues - waiting for upstream fix
+    "RUSTSEC-2025-0119",
+]
 
 [licenses]
 version = 2
@@ -20,6 +24,8 @@ allow = [
     "Unicode-3.0",
     "OpenSSL",
     "CC0-1.0",
+    # hf-hub uses CDLA-Permissive-2.0 for its data-related components
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

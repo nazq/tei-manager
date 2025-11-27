@@ -189,9 +189,8 @@ impl BackendPool {
     pub fn prune_idle_connections(&self) -> usize {
         let now = Instant::now();
         let max_idle = self.max_idle_time;
-        let mut pruned = 0;
 
-        // Collect keys to remove (can't remove while iterating)
+        // Collect keys to remove (can't remove while iterating DashMap)
         let to_remove: Vec<String> = self
             .connections
             .iter()
@@ -199,15 +198,17 @@ impl BackendPool {
             .map(|entry| entry.key().clone())
             .collect();
 
-        for key in to_remove {
-            if self.connections.remove(&key).is_some() {
-                pruned += 1;
-                tracing::debug!(
-                    instance = %key,
-                    "Pruned idle connection (exceeded max idle time)"
-                );
-            }
-        }
+        let pruned = to_remove
+            .into_iter()
+            .filter_map(|key| {
+                self.connections.remove(&key).map(|_| {
+                    tracing::debug!(
+                        instance = %key,
+                        "Pruned idle connection (exceeded max idle time)"
+                    );
+                })
+            })
+            .count();
 
         if pruned > 0 {
             tracing::info!(
@@ -222,20 +223,35 @@ impl BackendPool {
 
     /// Prune connections for instances that are no longer in the registry
     pub async fn prune_orphaned_connections(&self) -> usize {
-        let mut pruned = 0;
-
         // Collect keys to check
         let keys: Vec<String> = self.connections.iter().map(|e| e.key().clone()).collect();
 
-        for key in keys {
-            if self.registry.get(&key).await.is_none() && self.connections.remove(&key).is_some() {
-                pruned += 1;
-                tracing::debug!(
-                    instance = %key,
-                    "Pruned orphaned connection (instance no longer exists)"
-                );
-            }
-        }
+        // Find orphaned keys (instances no longer in registry)
+        let orphaned_keys: Vec<String> =
+            futures::future::join_all(keys.into_iter().map(|key| async move {
+                if self.registry.get(&key).await.is_none() {
+                    Some(key)
+                } else {
+                    None
+                }
+            }))
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        // Remove orphaned connections and count successes
+        let pruned = orphaned_keys
+            .into_iter()
+            .filter_map(|key| {
+                self.connections.remove(&key).map(|_| {
+                    tracing::debug!(
+                        instance = %key,
+                        "Pruned orphaned connection (instance no longer exists)"
+                    );
+                })
+            })
+            .count();
 
         if pruned > 0 {
             tracing::info!(
@@ -305,20 +321,21 @@ impl BackendPool {
     /// Get connection statistics
     pub fn stats(&self) -> PoolStats {
         let now = Instant::now();
-        let mut oldest_connection_age_secs = None;
-        let mut max_idle_secs = 0u64;
 
-        for entry in self.connections.iter() {
-            let age = now.duration_since(entry.created_at).as_secs();
-            let idle = now.duration_since(entry.last_used).as_secs();
-
-            oldest_connection_age_secs = Some(
-                oldest_connection_age_secs
-                    .map(|old: u64| old.max(age))
-                    .unwrap_or(age),
-            );
-            max_idle_secs = max_idle_secs.max(idle);
-        }
+        let (oldest_connection_age_secs, max_idle_secs) = self
+            .connections
+            .iter()
+            .map(|entry| {
+                let age = now.duration_since(entry.created_at).as_secs();
+                let idle = now.duration_since(entry.last_used).as_secs();
+                (age, idle)
+            })
+            .fold((None, 0u64), |(oldest, max_idle), (age, idle)| {
+                (
+                    Some(oldest.map_or(age, |o: u64| o.max(age))),
+                    max_idle.max(idle),
+                )
+            });
 
         PoolStats {
             active_connections: self.connections.len(),

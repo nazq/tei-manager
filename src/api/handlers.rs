@@ -1,6 +1,8 @@
 //! API request handlers
 
-use super::models::{CreateInstanceRequest, HealthResponse, InstanceInfo, LogsResponse};
+use super::models::{
+    AddModelRequest, CreateInstanceRequest, HealthResponse, InstanceInfo, LogsResponse, ModelInfo,
+};
 use super::routes::AppState;
 use crate::config::InstanceConfig;
 use crate::error::TeiError;
@@ -33,10 +35,8 @@ pub async fn list_instances(
 ) -> Result<Json<Vec<InstanceInfo>>, TeiError> {
     let instances = state.registry.list().await;
 
-    let mut info_list = Vec::new();
-    for instance in instances {
-        info_list.push(InstanceInfo::from_instance(&instance).await);
-    }
+    let info_list: Vec<InstanceInfo> =
+        futures::future::join_all(instances.iter().map(|i| InstanceInfo::from_instance(i))).await;
 
     // Update metrics
     crate::metrics::update_instance_count(info_list.len());
@@ -336,4 +336,190 @@ pub async fn get_logs(
         end: end_idx,
         total_lines,
     }))
+}
+
+// ============================================================================
+// Model Management Handlers
+// ============================================================================
+
+/// GET /models - List all known models
+pub async fn list_models(State(state): State<AppState>) -> Result<Json<Vec<ModelInfo>>, TeiError> {
+    let entries = state.model_registry.list().await;
+    let models: Vec<ModelInfo> = entries.into_iter().map(ModelInfo::from).collect();
+    Ok(Json(models))
+}
+
+/// GET /models/{model_id} - Get model details
+///
+/// Note: model_id should be URL-encoded (e.g., "BAAI%2Fbge-small-en-v1.5")
+pub async fn get_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<ModelInfo>, TeiError> {
+    // URL decode the model_id
+    let model_id = urlencoding::decode(&model_id)
+        .map_err(|_| TeiError::ValidationError {
+            message: "Invalid model_id encoding".to_string(),
+        })?
+        .to_string();
+
+    let entry = state
+        .model_registry
+        .get_refreshed(&model_id)
+        .await
+        .ok_or_else(|| TeiError::ModelNotFound {
+            model_id: model_id.clone(),
+        })?;
+
+    Ok(Json(ModelInfo::from(entry)))
+}
+
+/// POST /models - Add a model to the registry
+pub async fn add_model(
+    State(state): State<AppState>,
+    Json(req): Json<AddModelRequest>,
+) -> Result<(StatusCode, Json<ModelInfo>), TeiError> {
+    // Check if already registered
+    if state.model_registry.contains(&req.model_id).await {
+        let entry = state.model_registry.get(&req.model_id).await.unwrap();
+        return Ok((StatusCode::OK, Json(ModelInfo::from(entry))));
+    }
+
+    let entry = state.model_registry.add_model(req.model_id).await;
+    Ok((StatusCode::CREATED, Json(ModelInfo::from(entry))))
+}
+
+/// POST /models/{model_id}/download - Download model to HF cache
+pub async fn download_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<ModelInfo>, TeiError> {
+    use crate::models::ModelStatus;
+
+    // URL decode the model_id
+    let model_id = urlencoding::decode(&model_id)
+        .map_err(|_| TeiError::ValidationError {
+            message: "Invalid model_id encoding".to_string(),
+        })?
+        .to_string();
+
+    // Add to registry if not present
+    if !state.model_registry.contains(&model_id).await {
+        state.model_registry.add_model(model_id.clone()).await;
+    }
+
+    // Check if already downloaded
+    if crate::models::is_model_cached(&model_id) {
+        let entry = state.model_registry.get_refreshed(&model_id).await.unwrap();
+        return Ok(Json(ModelInfo::from(entry)));
+    }
+
+    // Check if already downloading
+    if let Some(entry) = state.model_registry.get(&model_id).await
+        && entry.status == ModelStatus::Downloading
+    {
+        return Err(TeiError::ModelBusy {
+            model_id: model_id.clone(),
+            operation: "downloading".to_string(),
+        });
+    }
+
+    // Set status to downloading
+    state
+        .model_registry
+        .set_status(&model_id, ModelStatus::Downloading)
+        .await;
+
+    // Download using hf-hub crate
+    if let Err(e) = crate::models::download_model(&model_id).await {
+        // Reset status on failure
+        state
+            .model_registry
+            .set_status(&model_id, ModelStatus::Available)
+            .await;
+        return Err(TeiError::ModelDownloadFailed {
+            model_id: model_id.clone(),
+            reason: e,
+        });
+    }
+
+    // Refresh and return
+    let entry = state
+        .model_registry
+        .get_refreshed(&model_id)
+        .await
+        .ok_or_else(|| TeiError::ModelNotFound {
+            model_id: model_id.clone(),
+        })?;
+
+    Ok(Json(ModelInfo::from(entry)))
+}
+
+/// POST /models/{model_id}/load - Smoke test model loading
+pub async fn load_model(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<ModelInfo>, TeiError> {
+    use crate::models::ModelStatus;
+
+    // URL decode the model_id
+    let model_id = urlencoding::decode(&model_id)
+        .map_err(|_| TeiError::ValidationError {
+            message: "Invalid model_id encoding".to_string(),
+        })?
+        .to_string();
+
+    // Check if model exists
+    if !state.model_registry.contains(&model_id).await {
+        return Err(TeiError::ModelNotFound {
+            model_id: model_id.clone(),
+        });
+    }
+
+    // Check if already loading
+    if let Some(entry) = state.model_registry.get(&model_id).await
+        && entry.status == ModelStatus::Loading
+    {
+        return Err(TeiError::ModelBusy {
+            model_id: model_id.clone(),
+            operation: "loading".to_string(),
+        });
+    }
+
+    // Check if downloaded
+    if !crate::models::is_model_cached(&model_id) {
+        return Err(TeiError::ModelLoadFailed {
+            model_id: model_id.clone(),
+            reason: "Model not downloaded. Use POST /models/{model_id}/download first.".to_string(),
+        });
+    }
+
+    // Set status to loading
+    state
+        .model_registry
+        .set_status(&model_id, ModelStatus::Loading)
+        .await;
+
+    // Run smoke test
+    let result = state.model_loader.smoke_test(&model_id).await;
+
+    match result {
+        Ok(()) => {
+            state.model_registry.set_verified(&model_id).await;
+        }
+        Err(e) => {
+            state.model_registry.set_failed(&model_id, e).await;
+        }
+    }
+
+    let entry =
+        state
+            .model_registry
+            .get(&model_id)
+            .await
+            .ok_or_else(|| TeiError::ModelNotFound {
+                model_id: model_id.clone(),
+            })?;
+
+    Ok(Json(ModelInfo::from(entry)))
 }

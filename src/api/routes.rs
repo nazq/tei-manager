@@ -1,6 +1,7 @@
 //! API route definitions
 
 use crate::auth::AuthManager;
+use crate::models::{ModelLoader, ModelRegistry};
 use crate::registry::Registry;
 use crate::state::StateManager;
 use axum::{
@@ -20,6 +21,8 @@ pub struct AppState {
     pub state_manager: Arc<StateManager>,
     pub prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
     pub auth_manager: Option<Arc<AuthManager>>,
+    pub model_registry: Arc<ModelRegistry>,
+    pub model_loader: Arc<ModelLoader>,
 }
 
 /// Create the main API router
@@ -46,7 +49,16 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::restart_instance),
         )
         // Instance logs
-        .route("/instances/{name}/logs", get(handlers::get_logs));
+        .route("/instances/{name}/logs", get(handlers::get_logs))
+        // Model management
+        .route("/models", get(handlers::list_models))
+        .route("/models", post(handlers::add_model))
+        .route("/models/{model_id}", get(handlers::get_model))
+        .route(
+            "/models/{model_id}/download",
+            post(handlers::download_model),
+        )
+        .route("/models/{model_id}/load", post(handlers::load_model));
 
     // Add auth middleware to protected routes if auth is enabled
     let protected_routes = if let Some(auth) = auth_manager {
@@ -109,12 +121,16 @@ mod tests {
             "text-embeddings-router".to_string(),
         ));
         let prometheus_handle = get_prometheus_handle();
+        let model_registry = Arc::new(crate::models::ModelRegistry::new());
+        let model_loader = Arc::new(crate::models::ModelLoader::new());
 
         AppState {
             registry,
             state_manager,
             prometheus_handle,
             auth_manager: None,
+            model_registry,
+            model_loader,
         }
     }
 

@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Use `futures::join_all` for parallel async operations
   - Use scan/flat_map/unzip for sparse embedding building
 - E2E tests now use per-test containers for proper cleanup (fixes container leaks)
+- `hf-hub` now uses `rustls-tls` instead of `native-tls` for musl static builds
 
 Happy Thanksgiving! 🦃
 

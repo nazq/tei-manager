@@ -151,6 +151,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-hf-models-
 
+      # Create the HF cache directory so it can be mounted into containers
+      # (testcontainers only mounts if the directory exists)
+      - name: Create HuggingFace cache directory
+        run: mkdir -p ~/.cache/huggingface/hub
+
       - name: Pull TEI Docker image
         run: docker pull ghcr.io/huggingface/text-embeddings-inference:cpu-1.8.3-grpc
 

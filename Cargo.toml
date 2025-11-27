@@ -67,7 +67,8 @@ urlencoding = "2.1"
 dirs = "5.0"
 
 # HuggingFace Hub API
-hf-hub = { version = "0.4", features = ["tokio"] }
+# Use rustls-tls to avoid OpenSSL dependency for musl static builds
+hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
 
 # Native TLS support
 axum-server = { version = "0.7", features = ["tls-rustls"] }

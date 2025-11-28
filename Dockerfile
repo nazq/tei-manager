@@ -47,11 +47,30 @@ ARG VARIANT_NAME=
 ARG VARIANT_DESC=
 
 # ============================================================================
-# Builder stage - Compile tei-manager
+# Chef stage - Prepare recipe for caching dependencies
 # ============================================================================
-FROM rust:1.91-slim-bookworm AS builder
-
+FROM lukemathwalker/cargo-chef:latest-rust-1.91-slim-bookworm AS chef
 WORKDIR /build
+
+# ============================================================================
+# Planner stage - Generate dependency recipe
+# ============================================================================
+FROM chef AS planner
+
+# Copy manifests and source for dependency analysis
+COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY proto ./proto
+COPY src ./src
+COPY benches ./benches
+
+# Generate recipe.json (list of dependencies)
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ============================================================================
+# Builder stage - Compile tei-manager with cached dependencies
+# ============================================================================
+FROM chef AS builder
 
 # Install build dependencies (including musl-tools for static linking)
 RUN apt-get update && apt-get install -y \
@@ -64,25 +83,26 @@ RUN apt-get update && apt-get install -y \
 # Add musl target for static linking (works on any Linux distro)
 RUN rustup target add x86_64-unknown-linux-musl
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock ./
+# Copy recipe from planner stage
+COPY --from=planner /build/recipe.json recipe.json
+
+# Build dependencies only - this layer is cached unless Cargo.toml/Cargo.lock change
+# This is the key optimization: dependencies are built in a separate layer
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 
 # Copy build script and proto files for gRPC compilation
 COPY build.rs ./
 COPY proto ./proto
 
 # Copy source code
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # Copy benches for Cargo.toml references (not built, just needed for manifest parsing)
 COPY benches ./benches
 
-# Build static musl binaries (works on any Linux distro, no glibc dependency)
-# Uses BuildKit cache mounts to share cargo registry and build artifacts across builds
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    cargo build --release --target x86_64-unknown-linux-musl --locked && \
+# Build the actual binaries - only recompiles if source changed
+RUN cargo build --release --target x86_64-unknown-linux-musl --locked && \
     cargo build --release --target x86_64-unknown-linux-musl --bin bench-client --locked && \
     cp target/x86_64-unknown-linux-musl/release/tei-manager /tmp/tei-manager && \
     cp target/x86_64-unknown-linux-musl/release/bench-client /tmp/bench-client

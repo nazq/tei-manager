@@ -442,39 +442,20 @@ info:
     @echo "=== Binary Size ==="
     @ls -lh target/release/tei-manager 2>/dev/null || echo "Not built yet (run 'just build')"
 
-# Release checklist
-release VERSION:
-    #!/usr/bin/env bash
-    set -euxo pipefail
-
-    echo "🚀 Release {{VERSION}} checklist:"
-    echo ""
-
-    # Check if working tree is clean
-    if [ -n "$(git status --porcelain)" ]; then
-        echo "❌ Working directory is not clean"
-        exit 1
-    fi
-
-    # Update version in Cargo.toml
-    sed -i 's/^version = ".*"/version = "{{VERSION}}"/' Cargo.toml
-
-    # Run full checks
-    just ci
-
-    # Commit and tag
-    git add Cargo.toml Cargo.lock
-    git commit -m "chore: Release {{VERSION}}"
-    git tag -a "v{{VERSION}}" -m "Release version {{VERSION}}"
-
-    echo ""
-    echo "✅ Release {{VERSION}} prepared!"
-    echo ""
-    echo "Next steps:"
-    echo "  1. Review: git show HEAD"
-    echo "  2. Push: git push origin main"
-    echo "  3. Push tag: git push origin v{{VERSION}}"
-    echo "  4. Run: ./release.sh {{VERSION}}"
+# Release workflow info (releases are automated via release-please)
+release-info:
+    @echo "Releases are automated via release-please"
+    @echo ""
+    @echo "Workflow:"
+    @echo "  1. Merge PRs with conventional commits (feat:, fix:, etc.) to main"
+    @echo "  2. Release-please automatically creates/updates a Release PR"
+    @echo "  3. Review the Release PR, then update README versions:"
+    @echo "     gh pr checkout <release-pr-number>"
+    @echo "     ./scripts/update-readme-version.sh --commit"
+    @echo "     git push"
+    @echo "  4. Merge the Release PR to trigger Docker builds and GitHub release"
+    @echo ""
+    @echo "See CONTRIBUTING.md for details."
 
 # Quick fix - format and run clippy with auto-fix
 fix:

@@ -132,6 +132,7 @@ impl TeiContainer {
 
     /// Start a TEI container with custom image configuration
     pub async fn start(image: TeiImage) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        use tei_manager::grpc::proto::tei::v1::embed_client::EmbedClient;
         use tokio::time::{Duration, sleep};
         use tonic::transport::Channel;
 
@@ -140,36 +141,93 @@ impl TeiContainer {
         let container = image.start().await?;
         let grpc_port = container.get_host_port_ipv4(GRPC_PORT).await?;
 
-        // Wait for gRPC to be actually accepting connections
-        // The "Ready" log message appears slightly before the server accepts connections
+        // Wait for gRPC to be actually accepting connections AND model to be loaded
+        // The "Ready" log message appears when the server starts, but the model
+        // might still be loading. We need to send a warmup request to ensure
+        // the model is fully loaded and ready to process requests.
         let endpoint = format!("http://127.0.0.1:{}", grpc_port);
-        for i in 0..30 {
-            match Channel::from_shared(endpoint.clone())
-                .unwrap()
-                .connect()
-                .await
-            {
-                Ok(_) => {
-                    println!(
-                        "TEI container ready on port {} (connected after {}ms)",
-                        grpc_port,
-                        i * 100
-                    );
-                    return Ok(Self {
-                        container,
-                        grpc_port,
-                    });
+        let mut connected = false;
+
+        for i in 0..60 {
+            // First, try to connect
+            if !connected {
+                match Channel::from_shared(endpoint.clone())
+                    .unwrap()
+                    .connect()
+                    .await
+                {
+                    Ok(_) => {
+                        println!(
+                            "TEI container gRPC connected on port {} (after {}ms)",
+                            grpc_port,
+                            i * 100
+                        );
+                        connected = true;
+                    }
+                    Err(_) => {
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
                 }
-                Err(_) => {
-                    sleep(Duration::from_millis(100)).await;
+            }
+
+            // Then, send a warmup request to ensure model is loaded
+            if connected {
+                match Channel::from_shared(endpoint.clone())
+                    .unwrap()
+                    .connect()
+                    .await
+                {
+                    Ok(channel) => {
+                        let mut client = EmbedClient::new(channel);
+                        let warmup_req = tei_manager::grpc::proto::tei::v1::EmbedRequest {
+                            inputs: "warmup".to_string(),
+                            truncate: true,
+                            normalize: true,
+                            truncation_direction: 0,
+                            prompt_name: None,
+                            dimensions: None,
+                        };
+
+                        match client.embed(warmup_req).await {
+                            Ok(_) => {
+                                println!(
+                                    "TEI container ready on port {} (warmup complete after {}ms)",
+                                    grpc_port,
+                                    i * 100
+                                );
+                                return Ok(Self {
+                                    container,
+                                    grpc_port,
+                                });
+                            }
+                            Err(e) => {
+                                // Model might still be loading
+                                if i % 10 == 0 {
+                                    println!("Warmup attempt {} failed: {}", i, e);
+                                }
+                                sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }
 
-        println!(
-            "TEI container ready on port {} (connection check timed out, proceeding anyway)",
-            grpc_port
-        );
+        if connected {
+            println!(
+                "TEI container on port {} connected but warmup timed out, proceeding anyway",
+                grpc_port
+            );
+        } else {
+            println!(
+                "TEI container ready on port {} (connection check timed out, proceeding anyway)",
+                grpc_port
+            );
+        }
         Ok(Self {
             container,
             grpc_port,

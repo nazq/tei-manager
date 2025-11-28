@@ -12,5 +12,6 @@
         }
       ]
     }
-  }
+  },
+  "footer": "## Docker Images\n\n```bash\n# Multi-arch (default)\ndocker pull ghcr.io/nazq/tei-manager:${version}-tei-1.8.3\n\n# Ada Lovelace (RTX 4090/4080)\ndocker pull ghcr.io/nazq/tei-manager:${version}-tei-1.8.3-ada\n\n# Hopper (H100/H200)\ndocker pull ghcr.io/nazq/tei-manager:${version}-tei-1.8.3-hopper\n```"
 }

@@ -1,0 +1,36 @@
+# ============================================================================
+# Release Configuration for TEI Manager
+# ============================================================================
+#
+# This file defines the TEI versions and Docker variants to build during release.
+# The GitHub Actions release workflow reads this config to generate the build matrix.
+#
+# ============================================================================
+
+[tei]
+# TEI versions supported by this release
+# Build matrix will create images for each version × variant combination
+versions = ["1.8.3"]
+
+[variants]
+# Docker variants to build (maps to build-all-variants.sh)
+# Each variant produces a different Docker image optimized for specific hardware
+#
+# Format: variant_name = { tei_variant = "prefix", suffix = "tag-suffix" }
+#   - tei_variant: Prefix for TEI base image (empty = default multi-arch)
+#   - suffix: Appended to image tag (empty = no suffix)
+
+[variants.default]
+tei_variant = ""
+suffix = ""
+description = "Multi-arch (default, works everywhere)"
+
+[variants.ada]
+tei_variant = "89-"
+suffix = "-ada"
+description = "Ada Lovelace (RTX 4090/4080 optimized)"
+
+[variants.hopper]
+tei_variant = "hopper-"
+suffix = "-hopper"
+description = "Hopper (H100/H200 optimized)"

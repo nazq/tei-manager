@@ -182,7 +182,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires network access and downloads ~100MB"]
     async fn test_download_small_model() {
         // This test downloads a real model to a temp directory
         let temp_dir = tempfile::tempdir().unwrap();

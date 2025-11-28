@@ -21,6 +21,8 @@ pub struct AppState {
     pub state_manager: Arc<StateManager>,
     pub prometheus_handle: metrics_exporter_prometheus::PrometheusHandle,
     pub auth_manager: Option<Arc<AuthManager>>,
+    /// Whether to require X-SSL-Client-Cert headers for auth (see AuthConfig docs)
+    pub require_cert_headers: bool,
     pub model_registry: Arc<ModelRegistry>,
     pub model_loader: Arc<ModelLoader>,
 }
@@ -28,6 +30,7 @@ pub struct AppState {
 /// Create the main API router
 pub fn create_router(state: AppState) -> Router {
     let auth_manager = state.auth_manager.clone();
+    let require_cert_headers = state.require_cert_headers;
 
     let mut router = Router::new()
         // Health and status (always public)
@@ -62,10 +65,28 @@ pub fn create_router(state: AppState) -> Router {
 
     // Add auth middleware to protected routes if auth is enabled
     let protected_routes = if let Some(auth) = auth_manager {
-        tracing::info!("Auth enabled - protecting instance management endpoints");
+        tracing::info!(
+            require_cert_headers = require_cert_headers,
+            "Auth enabled - protecting instance management endpoints"
+        );
+        if !require_cert_headers {
+            tracing::warn!(
+                "SECURITY: require_cert_headers=false. Requests without X-SSL-Client-Cert \
+                 headers will be assumed to be native TLS. Set require_cert_headers=true \
+                 if running behind a reverse proxy."
+            );
+        }
         protected_routes.layer(axum::middleware::from_fn(move |req, next| {
             let auth = auth.clone();
-            async move { crate::auth::service::auth_middleware(auth, req, next).await }
+            async move {
+                crate::auth::service::auth_middleware_with_options(
+                    auth,
+                    require_cert_headers,
+                    req,
+                    next,
+                )
+                .await
+            }
         }))
     } else {
         tracing::warn!("Auth disabled - instance management endpoints are PUBLIC");
@@ -129,6 +150,7 @@ mod tests {
             state_manager,
             prometheus_handle,
             auth_manager: None,
+            require_cert_headers: false,
             model_registry,
             model_loader,
         }

@@ -1,137 +1,117 @@
-# Multiplexer Benchmarks
+# Benchmarks
 
-Benchmarks measuring gRPC multiplexer overhead by comparing direct TEI instance calls vs routed calls through tei-manager.
+Performance benchmarks for tei-manager components and TEI integration.
 
-## Benchmark Groups
+## Benchmark Suites
 
-| Group | Description |
-|-------|-------------|
-| `embedding_overhead` | Single embedding requests at various input lengths |
-| `concurrent_requests` | Parallel requests (5, 10, 20 concurrent) |
-| `streaming_requests` | Streaming RPC batches (5, 10, 20 items) |
-| `arrow_batch` | Arrow IPC batch embedding (1, 10, 50, 100 rows) |
+| Suite | Description | External Deps |
+|-------|-------------|---------------|
+| `embedding` | Arrow IPC serialization/deserialization | None |
+| `pool` | Connection pool (DashMap) operations | None |
+| `registry` | Instance registry operations | None |
+| `multiplexer_overhead` | End-to-end TEI latency | Testcontainers (Docker) |
 
 ## Quick Start
 
 ```bash
-# Start benchmark environment (tei-manager + TEI instance)
-just bench-start
-
-# Run benchmarks
+# Run all benchmarks (multiplexer_overhead will start TEI container automatically)
 just bench
 
-# Stop environment
-just bench-stop
+# Run only local benchmarks (no Docker needed)
+just bench-local
+
+# Open HTML report after running
+just bench-open
 ```
+
+## Results Summary (v0.8.0)
+
+Measured on Intel CPU with `BAAI/bge-small-en-v1.5` model (CPU inference via testcontainers).
+
+### Pool Operations (DashMap)
+
+| Operation | Pool Size | Latency |
+|-----------|-----------|---------|
+| get (hit) | 10-1000 | **12 ns** |
+| get + touch | 10-1000 | **25 ns** |
+| insert | 10-1000 | **135 ns** |
+| entry API | 10-1000 | **17 ns** |
+| concurrent reads (100) | 100 | 77 µs |
+
+**Verdict:** O(1) performance regardless of pool size. Not a bottleneck.
+
+### Registry Operations
+
+| Operation | Instances | Latency |
+|-----------|-----------|---------|
+| get | 10-1000 | **39 ns** |
+| list | 10 | 111 ns |
+| list | 100 | 821 ns |
+| list | 1000 | 8.3 µs |
+| add/remove | 10-100 | 2.1 µs |
+| write contention (5 writers) | | ~1 ms |
+
+**Verdict:** Get is O(1). List scales linearly. Write contention includes TCP bind check (~1.6µs/port).
+
+### Arrow IPC
+
+| Operation | Batch Size | Latency | Throughput |
+|-----------|------------|---------|------------|
+| serialize | 100 | 1.5 µs | 65 M items/s |
+| serialize | 1000 | 6.8 µs | 147 M items/s |
+| serialize | 10000 | 48 µs | 208 M items/s |
+| deserialize | 100 | 0.98 µs | 102 M items/s |
+| deserialize | 1000 | 3.4 µs | 294 M items/s |
+| deserialize | 10000 | 30.6 µs | 327 M items/s |
+| roundtrip | 100 | 15.8 µs | |
+| roundtrip | 1000 | 161 µs | |
+| roundtrip | 10000 | 1.68 ms | |
+
+**Verdict:** Arrow IPC is highly efficient. 10K items round-trip in <2ms. Scales linearly.
+
+### TEI Latency (CPU, via testcontainers)
+
+| Benchmark | Input | Latency |
+|-----------|-------|---------|
+| embed/short | "Hello world" | **3.5 ms** |
+| embed/medium | ~100 chars | **4.6 ms** |
+| embed/long | ~600 chars | **15 ms** |
+| concurrent/2 | | 7.8 ms |
+| concurrent/5 | | 15.3 ms |
+| concurrent/10 | | 21.5 ms |
+| streaming/5 | | 13.6 ms |
+| streaming/10 | | 18.7 ms |
+| streaming/20 | | 31 ms |
+
+**Note:** These are CPU inference times. GPU inference is 3-10x faster.
+
+### TCP Port Binding
+
+| Operation | Latency |
+|-----------|---------|
+| single bind check | 1.6 µs |
+| 10 sequential binds | 15.9 µs |
+
+**Verdict:** Port availability check is ~1.6µs. Not a bottleneck.
+
+## Key Takeaways
+
+1. **Pool is not a bottleneck** - 12ns get, perfect O(1) scaling
+2. **Registry is fast** - 39ns get, list is O(n) but acceptable
+3. **Arrow IPC overhead is minimal** - sub-ms for typical batch sizes
+4. **TEI inference dominates latency** - 3.5-15ms per request (CPU)
+5. **Write contention ~1ms** - TCP bind check in hot path, acceptable for instance creation
 
 ## Available Commands
 
 ```bash
-just bench-start      # Start tei-manager + bench-instance on ports 9000/9001/8081
-just bench            # Run full benchmark suite
-just bench-quick      # Quick run without saving
-just bench-baseline   # Save baseline for comparison
-just bench-compare    # Compare against saved baseline
-just bench-open       # Run and open HTML report
-just bench-stop       # Stop benchmark environment
-just bench-status     # Check if environment is running
-```
-
-## Endpoints
-
-When `bench-start` is running:
-
-| Service | Endpoint |
-|---------|----------|
-| tei-manager API | http://localhost:9000 |
-| gRPC Multiplexer | http://localhost:9001 |
-| TEI Instance (direct) | http://localhost:8081 |
-
-## Results (v0.6.0)
-
-Measured on NVIDIA RTX GPU with `BAAI/bge-small-en-v1.5` model.
-
-### Single Request Latency
-
-| Input Size | Direct | Multiplexer | Overhead |
-|------------|--------|-------------|----------|
-| short (~2 tokens) | 1.12 ms | 1.26 ms | +12.5% |
-| medium (~20 tokens) | 1.11 ms | 1.33 ms | +20% |
-| long (~100 tokens) | 1.39 ms | 1.59 ms | +14% |
-| extra-long (~500 tokens) | 1.97 ms | 2.22 ms | +13% |
-
-### Concurrent Requests (medium text)
-
-| Concurrency | Direct | Multiplexer | Overhead |
-|-------------|--------|-------------|----------|
-| 5 | 1.72 ms | 1.85 ms | +7.5% |
-| 10 | 1.92 ms | 2.08 ms | +8% |
-| 20 | 2.31 ms | 2.73 ms | +18% |
-
-### Streaming Batches
-
-| Batch Size | Direct | Multiplexer | Overhead |
-|------------|--------|-------------|----------|
-| 5 | 1.80 ms | 2.04 ms | +13% |
-| 10 | 1.93 ms | 2.22 ms | +15% |
-| 20 | 2.14 ms | 2.39 ms | +12% |
-
-### Arrow IPC Batch Embedding
-
-| Batch Size | Arrow IPC | Streaming | Arrow Advantage |
-|------------|-----------|-----------|-----------------|
-| 1 | 1.28 ms | 1.18 ms | −8% (overhead) |
-| 10 | 2.26 ms | 2.21 ms | −2% |
-| 50 | 3.08 ms | 2.97 ms | −4% |
-| 100 | 3.76 ms | 3.80 ms | ~0% |
-
-Arrow IPC shows similar performance to streaming at batch sizes up to 100. The benefit of Arrow comes from reduced serialization overhead at very large batch sizes (1000+) and columnar data interoperability.
-
-## Interpreting Results
-
-### Expected Overhead
-
-The multiplexer adds one gRPC hop (client → multiplexer → TEI), which introduces:
-- Connection routing (~50-100μs)
-- Request/response forwarding
-- Target extraction from metadata
-
-**Typical overhead: 7-20%** depending on:
-- Input size (smaller inputs = higher % overhead)
-- Concurrency (batching amortizes overhead)
-- GPU inference time (longer inference = lower % overhead)
-
-### Variance
-
-Benchmarks may show ±5% variance between runs due to:
-- GPU thermal throttling
-- System load
-- Network jitter (even on localhost)
-
-For reliable comparisons, use `just bench-baseline` and `just bench-compare`.
-
-## Manual Setup
-
-If you need custom configuration:
-
-```bash
-# 1. Start tei-manager
-cargo run --release -- -c config/tei-manager.toml
-
-# 2. Create benchmark instance
-curl -X POST http://localhost:9000/instances \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "bench-instance",
-    "model_id": "BAAI/bge-small-en-v1.5",
-    "port": 8081
-  }'
-
-# 3. Wait for instance to be ready
-curl http://localhost:9000/instances/bench-instance
-
-# 4. Run benchmarks
-cargo bench --bench multiplexer_overhead
+just bench           # Run all benchmarks
+just bench-local     # Run local benchmarks only (no Docker)
+just bench-quick     # Quick run with fewer samples
+just bench-baseline  # Save baseline for comparison
+just bench-compare   # Compare against saved baseline
+just bench-open      # Run and open HTML report
+just bench-clean     # Remove benchmark results
 ```
 
 ## HTML Reports
@@ -146,22 +126,27 @@ open target/criterion/report/index.html
 Reports include:
 - Latency distributions
 - Throughput graphs
-- Historical comparisons
+- Historical comparisons (if baseline saved)
 - Statistical analysis
 
 ## Troubleshooting
 
-**"Connection refused" errors:**
+**Docker errors during multiplexer_overhead:**
 ```bash
-just bench-status  # Check if environment is running
-just bench-start   # Start it if not
+# Ensure Docker is running
+docker ps
+
+# Check for leftover containers
+docker ps -a | grep text-embeddings
 ```
 
 **High variance in results:**
 - Close other applications
-- Ensure GPU isn't thermal throttling: `nvidia-smi -q -d TEMPERATURE`
-- Increase sample size in benchmark code
+- Increase sample size: edit `group.sample_size(N)` in bench code
+- Run multiple times and compare
 
-**Benchmarks timeout:**
-- Check TEI instance health: `curl http://localhost:8081/health`
-- Check logs: `cat /tmp/tei-manager-bench.log`
+**Benchmarks take too long:**
+```bash
+# Use quick mode
+just bench-quick
+```

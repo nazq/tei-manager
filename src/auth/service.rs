@@ -69,8 +69,28 @@ fn extract_tls_info_from_connection(_request: &Request) -> Option<TlsInfo> {
 }
 
 /// Axum middleware for authentication
+///
+/// # Security
+///
+/// When `require_cert_headers` is false (default), requests without X-SSL-Client-Cert
+/// headers are assumed to be native TLS connections where rustls already verified
+/// the client certificate. This is ONLY safe if your API is not directly accessible
+/// from untrusted networks.
+///
+/// Set `require_cert_headers` to true in production when behind a reverse proxy
+/// to ensure all requests must include certificate headers.
 pub async fn auth_middleware(
     auth_manager: Arc<AuthManager>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    auth_middleware_with_options(auth_manager, false, request, next).await
+}
+
+/// Axum middleware for authentication with configurable cert header requirement
+pub async fn auth_middleware_with_options(
+    auth_manager: Arc<AuthManager>,
+    require_cert_headers: bool,
     request: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
@@ -86,11 +106,25 @@ pub async fn auth_middleware(
     // Try to extract TLS info from headers (nginx proxy scenario)
     let tls_info = extract_tls_info_from_headers(&headers_clone);
 
-    // If we couldn't extract cert info from headers, this is likely native TLS
-    // where rustls already verified the client certificate at the TLS handshake layer.
-    // In that case, if the connection reached here, authentication succeeded.
+    // If we couldn't extract cert info from headers...
     if tls_info.is_none() {
-        tracing::debug!("No cert in headers - assuming native TLS verified by rustls");
+        if require_cert_headers {
+            // In strict mode, reject requests without cert headers
+            tracing::warn!(
+                peer_addr = %peer_addr,
+                "Request rejected: missing X-SSL-Client-Cert header (require_cert_headers=true)"
+            );
+            return Err(AuthError::MissingClientCert);
+        }
+
+        // In permissive mode (default), assume native TLS where rustls verified the cert
+        // SECURITY WARNING: This logs a warning because it's a potential bypass vector
+        // if the API is directly accessible without going through a reverse proxy.
+        tracing::debug!(
+            peer_addr = %peer_addr,
+            "No cert in headers - assuming native TLS verified by rustls. \
+             Set require_cert_headers=true if behind a reverse proxy."
+        );
         return Ok(next.run(request).await);
     }
 
@@ -568,5 +602,65 @@ AKxxx/wT4GxmFLRQZeJPLJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==
 
         // Should be unauthorized since authenticated=false
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_require_cert_headers_true() {
+        let provider = Arc::new(MockProvider {
+            should_succeed: true,
+        });
+        let manager = Arc::new(AuthManager::new(vec![provider]));
+
+        // Use auth_middleware_with_options with require_cert_headers=true
+        let app = Router::new()
+            .route("/test", get(|| async { "Hello" }))
+            .route_layer(middleware::from_fn(move |req, next| {
+                let manager = manager.clone();
+                auth_middleware_with_options(manager, true, req, next)
+            }));
+
+        // Request WITHOUT cert headers should be rejected
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // With require_cert_headers=true, missing cert headers returns 401
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_require_cert_headers_false() {
+        let provider = Arc::new(MockProvider {
+            should_succeed: true,
+        });
+        let manager = Arc::new(AuthManager::new(vec![provider]));
+
+        // Use auth_middleware_with_options with require_cert_headers=false (default)
+        let app = Router::new()
+            .route("/test", get(|| async { "Hello" }))
+            .route_layer(middleware::from_fn(move |req, next| {
+                let manager = manager.clone();
+                auth_middleware_with_options(manager, false, req, next)
+            }));
+
+        // Request WITHOUT cert headers should pass (native TLS assumption)
+        let response = app
+            .oneshot(
+                AxumRequest::builder()
+                    .uri("/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // With require_cert_headers=false, assumes native TLS verified
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

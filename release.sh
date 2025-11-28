@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
+# DEPRECATED: Use GitHub Actions release workflow instead
+#
+# This script is kept for emergency/fallback use only.
+# Preferred method: git tag v0.9.0 && git push --tags
+#
+# See: .github/workflows/release.yml
+# ============================================================================
+
+# ============================================================================
 # Release script for TEI Manager
 # ============================================================================
 #

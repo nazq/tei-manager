@@ -21,7 +21,68 @@ use super::pool::BackendPool;
 use super::proto::multiplexer::v1 as mux;
 use super::proto::tei::v1 as tei;
 
-/// Macro to implement streaming RPC methods
+/// Implements a bidirectional streaming RPC method for the multiplexer.
+///
+/// This macro generates the boilerplate for forwarding gRPC streaming calls
+/// to the appropriate backend TEI instance. It handles:
+///
+/// 1. **Request extraction**: Reads the first request to get the target instance name
+/// 2. **Instance routing**: Looks up the backend connection from the connection pool
+/// 3. **Stream forwarding**: Spawns a task to forward requests to the backend
+/// 4. **Response streaming**: Returns responses from the backend via a channel
+///
+/// # Arguments
+///
+/// * `$self` - The service instance (`&self`)
+/// * `$request` - The incoming tonic `Request<Streaming<MuxRequest>>`
+/// * `$mux_req` - The multiplexer request type (e.g., `mux::EmbedRequest`)
+/// * `$backend_client` - The client field name on `TeiClients` (e.g., `embed`, `predict`)
+/// * `$backend_method` - The method name to call on the backend client (e.g., `embed_stream`)
+///
+/// # Generated Flow
+///
+/// ```text
+/// Client Request Stream
+///        │
+///        ▼
+/// ┌──────────────┐
+/// │ Read First   │──► Extract target instance name
+/// │ Request      │
+/// └──────────────┘
+///        │
+///        ▼
+/// ┌──────────────┐
+/// │ Get Backend  │──► Lock-free lookup in connection pool
+/// │ Clients      │
+/// └──────────────┘
+///        │
+///        ▼
+/// ┌──────────────┐
+/// │ Spawn Async  │──► Forward stream to backend
+/// │ Task         │
+/// └──────────────┘
+///        │
+///        ▼
+/// Client Response Stream ◄── Backend responses via mpsc channel
+/// ```
+///
+/// # Example Usage
+///
+/// ```rust,ignore
+/// async fn embed_stream(
+///     &self,
+///     request: Request<Streaming<mux::EmbedRequest>>,
+/// ) -> Result<Response<Self::EmbedStreamStream>, Status> {
+///     impl_stream_rpc!(self, request, mux::EmbedRequest, embed, embed_stream)
+/// }
+/// ```
+///
+/// # Error Handling
+///
+/// - Returns `InvalidArgument` if the stream is empty
+/// - Returns `NotFound` if the target instance doesn't exist
+/// - Returns `Unavailable` if the backend connection fails
+/// - Stream errors are logged and terminate the forwarding task
 macro_rules! impl_stream_rpc {
     ($self:ident, $request:ident, $mux_req:ty, $backend_client:ident, $backend_method:ident) => {{
         let mut stream: Streaming<$mux_req> = $request.into_inner();

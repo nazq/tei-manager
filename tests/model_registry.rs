@@ -36,26 +36,23 @@ fn get_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
         .clone()
 }
 
+/// Stub binary for tests (model registry tests don't spawn processes)
+#[cfg(unix)]
+const STUB_BINARY: &str = "/bin/sleep";
+#[cfg(not(unix))]
+const STUB_BINARY: &str = "timeout";
+
 /// Create a test server with model registry support
 async fn create_test_server() -> (TestServer, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("state.toml");
 
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
-    let registry = Arc::new(Registry::new(
-        Some(10),
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
+    let registry = Arc::new(Registry::new(Some(10), STUB_BINARY.to_string(), 8080, 8180));
 
     let state_manager = Arc::new(StateManager::new(
         state_file,
         registry.clone(),
-        tei_binary.to_string_lossy().to_string(),
+        STUB_BINARY.to_string(),
     ));
 
     let model_registry = Arc::new(ModelRegistry::new());
@@ -66,6 +63,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
         state_manager,
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
+        require_cert_headers: false,
         model_registry,
         model_loader,
     };
@@ -323,20 +321,11 @@ async fn test_downloading_state_visible() {
     // Create shared state we can access from multiple tasks
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("state.toml");
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
-    let registry = Arc::new(Registry::new(
-        Some(10),
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
+    let registry = Arc::new(Registry::new(Some(10), STUB_BINARY.to_string(), 8080, 8180));
     let state_manager = Arc::new(StateManager::new(
         state_file,
         registry.clone(),
-        tei_binary.to_string_lossy().to_string(),
+        STUB_BINARY.to_string(),
     ));
     let model_registry = Arc::new(ModelRegistry::new());
     let model_loader = Arc::new(ModelLoader::new());
@@ -349,6 +338,7 @@ async fn test_downloading_state_visible() {
         state_manager,
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
+        require_cert_headers: false,
         model_registry,
         model_loader,
     };
@@ -407,20 +397,11 @@ async fn test_concurrent_download_rejected() {
     // Create shared state
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("state.toml");
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
-    let registry = Arc::new(Registry::new(
-        Some(10),
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
+    let registry = Arc::new(Registry::new(Some(10), STUB_BINARY.to_string(), 8080, 8180));
     let state_manager = Arc::new(StateManager::new(
         state_file,
         registry.clone(),
-        tei_binary.to_string_lossy().to_string(),
+        STUB_BINARY.to_string(),
     ));
     let model_registry = Arc::new(ModelRegistry::new());
     let model_registry_ref = model_registry.clone();
@@ -431,6 +412,7 @@ async fn test_concurrent_download_rejected() {
         state_manager,
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
+        require_cert_headers: false,
         model_registry,
         model_loader,
     };

@@ -151,15 +151,11 @@ COPY --from=builder /tmp/bench-client /usr/local/bin/bench-client
 COPY scripts/raw-gpu-test.py /usr/local/bin/raw-gpu-test.py
 COPY scripts/bench.sh /usr/local/bin/bench
 
-# Copy real text-embeddings-router from official TEI image (default for production use)
+# Copy real text-embeddings-router from official TEI image
 COPY --from=tei /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router
-
-# Copy mock TEI router for testing only (use TEI_BINARY_PATH=/usr/local/bin/text-embeddings-router-mock)
-COPY tests/mock-tei-router /usr/local/bin/text-embeddings-router-mock
 
 # Make scripts and binaries executable
 RUN chmod +x /usr/local/bin/text-embeddings-router \
-    /usr/local/bin/text-embeddings-router-mock \
     /usr/local/bin/raw-gpu-test.py \
     /usr/local/bin/bench-client \
     /usr/local/bin/bench

@@ -176,6 +176,7 @@ async fn main() -> Result<()> {
         state_manager: state_manager.clone(),
         prometheus_handle,
         auth_manager: auth_manager.clone(),
+        require_cert_headers: config.auth.require_cert_headers,
         model_registry,
         model_loader,
     };

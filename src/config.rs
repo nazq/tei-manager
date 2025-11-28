@@ -27,10 +27,18 @@ pub struct ManagerConfig {
     /// Maximum time to wait for an instance to become ready after starting (default: 300 = 5 min)
     /// If instance is still in "Starting" state after this timeout, it's considered hung.
     /// Set high enough for large models to download and load into VRAM.
+    ///
+    /// **Interaction with health checks**: Health check failures are NOT counted while an
+    /// instance is in "Starting" status. The startup timeout is the only mechanism that
+    /// can fail a starting instance. Health check-triggered restarts only apply to
+    /// instances that have reached "Running" status.
     pub startup_timeout_secs: u64,
 
     /// Number of consecutive health check failures before restarting a running instance (default: 3)
-    /// Only applies to instances that have successfully started (status = Running)
+    ///
+    /// **Important**: This only applies to instances that have successfully started
+    /// (status = "Running"). Instances in "Starting" status are protected from premature
+    /// failure marking - use `startup_timeout_secs` to control startup failure behavior.
     pub max_failures_before_restart: u32,
 
     /// Graceful shutdown timeout in seconds (default: 30)
@@ -378,6 +386,23 @@ pub struct AuthConfig {
     /// Supported: ["mtls"]
     pub providers: Vec<String>,
 
+    /// Require certificate headers from reverse proxy (default: false)
+    ///
+    /// When true, requests without X-SSL-Client-Cert headers will be rejected.
+    /// Use this in production when running behind nginx/envoy to ensure
+    /// attackers cannot bypass authentication by connecting directly to the
+    /// API port.
+    ///
+    /// When false (default), requests without cert headers are assumed to be
+    /// native TLS connections where rustls already verified the client cert.
+    /// This is ONLY safe if your API port is not directly accessible from
+    /// untrusted networks.
+    ///
+    /// SECURITY WARNING: If require_cert_headers=false and your API is directly
+    /// accessible (not behind a reverse proxy), authentication can be bypassed.
+    #[serde(default)]
+    pub require_cert_headers: bool,
+
     /// mTLS configuration (required if "mtls" is in providers)
     pub mtls: Option<MtlsConfig>,
 }
@@ -480,6 +505,7 @@ fn default_verify_subject() -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // Tests intentionally use env::set_var to test env parsing
 mod tests {
     use super::*;
     use serial_test::serial;

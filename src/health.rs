@@ -447,6 +447,20 @@ impl HealthMonitor {
     }
 
     async fn handle_failure(&self, instance: &TeiInstance, reason: String) {
+        // Check if instance is still starting - don't count failures or restart during startup
+        // This prevents premature failure marking while the instance is loading model weights
+        let current_status = *instance.status.read().await;
+        if current_status == InstanceStatus::Starting {
+            tracing::debug!(
+                instance = %instance.config.name,
+                reason = %reason,
+                "Health check failed for starting instance - waiting for startup to complete"
+            );
+            // Don't increment failure count for starting instances
+            // The startup timeout (separate from health checks) handles this case
+            return;
+        }
+
         let mut stats = instance.stats.write().await;
         stats.health_check_failures += 1;
         let failures = stats.health_check_failures;
@@ -1071,5 +1085,135 @@ mod tests {
         // Verify failure count was reset
         let stats = instance.stats.read().await;
         assert_eq!(stats.health_check_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn test_starting_instance_not_failed_by_health_checks() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        let config = InstanceConfig {
+            name: "starting-test".to_string(),
+            model_id: "model".to_string(),
+            port: 8080,
+            max_batch_tokens: 1024,
+            max_concurrent_requests: 10,
+            pooling: None,
+            gpu_id: None,
+            prometheus_port: None,
+            ..Default::default()
+        };
+
+        let instance = registry.add(config).await.unwrap();
+
+        // Set instance status to Starting (simulates a just-started instance)
+        *instance.status.write().await = InstanceStatus::Starting;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        let restart = Arc::new(MockRestartStrategy::new());
+        let events = Arc::new(RecordingEventHandler::new());
+
+        checker.set_unhealthy("connection refused".to_string());
+
+        let monitor_config = HealthMonitorConfig::builder()
+            .max_failures_before_restart(3)
+            .auto_restart(true)
+            .build();
+
+        let monitor = HealthMonitor::builder(registry)
+            .config(monitor_config)
+            .health_checker(checker.clone())
+            .restart_strategy(restart.clone())
+            .event_handler(events.clone())
+            .build("mock".to_string());
+
+        // Fail many times while instance is Starting
+        for _ in 0..10 {
+            monitor.check_single_instance(&instance).await;
+        }
+
+        // Should NOT have triggered restart (instance is still Starting)
+        assert_eq!(restart.restart_count(), 0);
+
+        // Verify failure count was NOT incremented (Starting instances are skipped)
+        let stats = instance.stats.read().await;
+        assert_eq!(stats.health_check_failures, 0);
+
+        // CheckFailed events should NOT have been emitted for Starting instances
+        let has_failed_events = events
+            .has_event_type(|e| matches!(e, HealthEvent::CheckFailed { .. }))
+            .await;
+        assert!(!has_failed_events);
+    }
+
+    #[tokio::test]
+    async fn test_running_instance_fails_after_threshold() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        let config = InstanceConfig {
+            name: "running-test".to_string(),
+            model_id: "model".to_string(),
+            port: 8080,
+            max_batch_tokens: 1024,
+            max_concurrent_requests: 10,
+            pooling: None,
+            gpu_id: None,
+            prometheus_port: None,
+            ..Default::default()
+        };
+
+        let instance = registry.add(config).await.unwrap();
+
+        // Set instance status to Running (fully operational)
+        *instance.status.write().await = InstanceStatus::Running;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        let restart = Arc::new(MockRestartStrategy::new());
+        let events = Arc::new(RecordingEventHandler::new());
+
+        checker.set_unhealthy("connection refused".to_string());
+
+        let monitor_config = HealthMonitorConfig::builder()
+            .max_failures_before_restart(3)
+            .auto_restart(true)
+            .build();
+
+        let monitor = HealthMonitor::builder(registry)
+            .config(monitor_config)
+            .health_checker(checker.clone())
+            .restart_strategy(restart.clone())
+            .event_handler(events.clone())
+            .build("mock".to_string());
+
+        // Fail exactly 3 times (threshold)
+        for _ in 0..3 {
+            monitor.check_single_instance(&instance).await;
+        }
+
+        // Should have triggered restart (Running instance exceeded threshold)
+        assert_eq!(restart.restart_count(), 1);
+
+        // CheckFailed events should have been emitted
+        let has_failed_events = events
+            .has_event_type(|e| matches!(e, HealthEvent::CheckFailed { .. }))
+            .await;
+        assert!(has_failed_events);
+
+        // RestartTriggered should have been emitted
+        let has_restart_events = events
+            .has_event_type(|e| matches!(e, HealthEvent::RestartTriggered { .. }))
+            .await;
+        assert!(has_restart_events);
     }
 }

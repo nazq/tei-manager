@@ -336,8 +336,9 @@ tei-manager/
 ├── benches/                 # Criterion benchmarks
 │   └── multiplexer_overhead.rs
 ├── tests/
-│   ├── integration.rs       # Integration tests
-│   └── mock-tei-router      # Mock TEI for testing
+│   ├── integration.rs       # Integration tests (in-process API tests)
+│   ├── e2e/                  # E2E test helpers (testcontainers)
+│   └── e2e_*.rs              # E2E tests using real TEI containers
 ├── config/
 │   └── tei-manager.example.toml
 ├── docs/
@@ -452,7 +453,82 @@ All errors use the unified `TeiError` enum with structured error responses:
 - gRPC multiplexer: Scales well to 20+ concurrent requests
 
 ### Benchmarks
-See `benches/multiplexer_overhead.rs` for detailed performance metrics.
+
+All benchmarks use [Criterion](https://github.com/bheisler/criterion.rs) for statistical rigor.
+
+**Running benchmarks:**
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run specific benchmark suite
+cargo bench --bench embedding
+cargo bench --bench pool
+cargo bench --bench registry
+
+# Quick benchmark (fewer iterations)
+cargo bench -- --quick
+
+# Save baseline for comparison
+cargo bench -- --save-baseline main
+cargo bench -- --baseline main
+```
+
+#### Benchmark Results Summary
+
+Results measured on AMD Ryzen 9 5900X, Ubuntu 22.04, Rust 1.91:
+
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| **Pool Operations** | | |
+| Pool get (hit) | ~12 ns | Lock-free DashMap lookup |
+| Pool get + touch | ~25 ns | With timestamp update |
+| Pool insert | ~430 ns | New connection entry |
+| Pool remove | ~270 ns | |
+| **Registry Operations** | | |
+| Registry get | ~38-40 ns | RwLock read |
+| Registry list (100 instances) | ~825 ns | Clone all instances |
+| Registry add/remove | ~2.1 µs | Write lock + validation |
+| **Port Allocation** | | |
+| TCP bind check | ~1.6 µs | Single port availability check |
+| Port allocation (empty range) | ~1.6 µs | First available port |
+| Port allocation (90% full) | ~2.1 µs | Scan to find free port |
+| **Arrow IPC** | | |
+| Serialize 1K texts | ~7 µs | Input batch creation |
+| Deserialize 1K texts | ~3.4 µs | Text extraction |
+| Embedding result (1K items) | ~1.5 ms | 384-dim embeddings + LZ4 |
+| Full roundtrip (1K items) | ~160 µs | Deserialize + process + serialize |
+
+#### Scaling Characteristics
+
+**Arrow batch processing:**
+- Sub-linear scaling: 10K items takes ~1.9ms (vs 100 items at ~16µs)
+- Throughput improves with batch size due to LZ4 compression efficiency
+
+**Connection pool:**
+- Constant time lookups regardless of pool size (DashMap)
+- Concurrent reads scale linearly with reader count
+
+**Registry:**
+- Read operations O(1) for get, O(n) for list
+- Write contention minimal with RwLock (readers don't block)
+
+**Port allocation:**
+- ~1.6µs per port check (TCP bind dominates)
+- Well under 10ms even for 100-port range scans
+
+#### Benchmark Methodology
+
+1. **Isolation:** Each benchmark runs in its own process
+2. **Warmup:** Criterion performs warmup iterations before measurement
+3. **Statistical analysis:** Reports mean, std dev, and throughput
+4. **Reproducibility:** Run `cargo bench` 3x to verify < 10% variance
+
+See individual benchmark files for detailed test cases:
+- `benches/embedding.rs` - Arrow IPC serialization/deserialization
+- `benches/pool.rs` - DashMap connection pool operations
+- `benches/registry.rs` - Registry contention and port allocation
+- `benches/multiplexer_overhead.rs` - gRPC routing overhead (requires live TEI)
 
 ## Future Enhancements
 

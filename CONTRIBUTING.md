@@ -360,7 +360,10 @@ Add example showing how to create and use SPLADE sparse models.
 
 ## 🚢 Release Process
 
-See [release.sh](release.sh) for automated release process.
+Releases are managed by [release-please](https://github.com/googleapis/release-please). When you merge PRs with conventional commits to `main`, release-please automatically:
+
+1. Creates/updates a Release PR with version bumps and CHANGELOG
+2. When the Release PR is merged, creates a GitHub Release and triggers Docker builds
 
 ### Version Numbering
 
@@ -371,17 +374,41 @@ We use [Semantic Versioning](https://semver.org/):
 - **MINOR** - New features (backwards compatible)
 - **PATCH** - Bug fixes (backwards compatible)
 
-### Creating a Release
+### Conventional Commits for CHANGELOG
 
-1. **Update version** in `Cargo.toml`
-2. **Update CHANGELOG.md**
-3. **Update version references** in `README.md` (Docker tags, examples)
-4. **Run release script:**
+Release-please generates the CHANGELOG from your commit messages. Use conventional commit format:
+
+- `feat:` → appears under "Features" (bumps minor)
+- `fix:` → appears under "Bug Fixes" (bumps patch)
+- `feat!:` or `BREAKING CHANGE:` → appears under "Breaking Changes" (bumps major)
+
+### Multiple Changes in One PR
+
+If your PR contains multiple fixes or features, use footers to generate multiple CHANGELOG entries:
+
+```
+feat: add primary feature
+
+This is the main feature description.
+
+fix: resolve secondary bug
+feat: add another small feature
+```
+
+Each footer line becomes a separate CHANGELOG entry. This is useful for squash-merged PRs.
+
+### Release Workflow
+
+1. **Merge PRs** with conventional commits to `main`
+2. **Release-please creates/updates** a Release PR automatically
+3. **Review the Release PR** - check CHANGELOG and version bump
+4. **Update README versions** (run on the release PR branch):
    ```bash
-   ./release.sh <NEW_VERSION> <TEI_VERSION>
-   # Example: ./release.sh 0.8.0 1.8.3
+   gh pr checkout <release-pr-number>
+   ./scripts/update-readme-version.sh --commit
+   git push
    ```
-5. **Create GitHub release** with changelog
+5. **Merge the Release PR** - triggers Docker builds and GitHub Release
 
 ---
 

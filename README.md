@@ -443,6 +443,7 @@ just pre-commit          # Run before committing
 
 - **[DESIGN.md](DESIGN.md)** - Architecture and design decisions
 - **[docs/GRPC_MULTIPLEXER.md](docs/GRPC_MULTIPLEXER.md)** - Full gRPC API reference
+- **[docs/RUST_CLIENT.md](docs/RUST_CLIENT.md)** - Rust client integration guide
 - **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** - Production deployment guide
 - **[docs/MTLS.md](docs/MTLS.md)** - mTLS configuration
 

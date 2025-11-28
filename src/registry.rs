@@ -1,4 +1,27 @@
 //! Thread-safe instance registry
+//!
+//! # Design Note: No Shared Trait with ModelRegistry
+//!
+//! Both `Registry` (instances) and `ModelRegistry` (models) use similar storage
+//! patterns (`Arc<RwLock<HashMap<String, T>>>`), but they intentionally do NOT
+//! share a common trait because:
+//!
+//! 1. **Different add semantics**: Instance registry validates configs, allocates
+//!    ports, and returns `Result<Arc<TeiInstance>>`. Model registry simply inserts
+//!    and returns the entry.
+//!
+//! 2. **Different error handling**: Instance operations can fail (port conflicts,
+//!    max instances reached). Model operations typically succeed.
+//!
+//! 3. **Domain-specific behavior**: Instance registry manages process lifecycle
+//!    (start/stop), port allocation, and event broadcasting. Model registry
+//!    manages HuggingFace cache discovery and verification status.
+//!
+//! 4. **Different value semantics**: Instances are `Arc<T>` for shared ownership
+//!    across async tasks. Model entries are cloned on retrieval.
+//!
+//! A shared trait would either be too generic to be useful or would force
+//! artificial unification of these different semantics.
 
 use crate::config::InstanceConfig;
 use crate::instance::TeiInstance;
@@ -238,6 +261,20 @@ impl Registry {
 
     /// Find next available port in a given range, avoiding already-used ports
     /// Searches from search_start to range_end, then wraps around from range_start
+    ///
+    /// # Limitations
+    ///
+    /// Deleted instances don't release ports back to the OS immediately due to TCP TIME_WAIT
+    /// (typically ~60s). During rapid create/delete cycles, ports may appear unavailable
+    /// even though no TEI instance is using them.
+    ///
+    /// **Mitigation**: Configure a port range larger than needed (default is 100 ports).
+    /// For high-churn workloads, consider a range of 2-3x your maximum concurrent instances.
+    ///
+    /// The port check uses `TcpListener::bind` which respects TIME_WAIT state. We intentionally
+    /// do NOT use SO_REUSEADDR here because the TEI process itself binds to the port, and
+    /// we cannot control its socket options. A "false positive" available port would cause
+    /// the TEI process to fail on startup.
     fn find_free_port_in_range(
         search_start: u16,
         range_start: u16,
@@ -259,7 +296,9 @@ impl Registry {
         }
 
         anyhow::bail!(
-            "Could not find free port in range [{}, {})",
+            "Could not find free port in range [{}, {}). \
+             If you're doing rapid create/delete cycles, consider increasing the port range \
+             (instance_port_start/instance_port_end) to account for TCP TIME_WAIT (~60s).",
             range_start,
             range_end
         )

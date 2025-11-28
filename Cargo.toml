@@ -76,7 +76,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2.2"
 tokio-rustls = "0.26"
 
-[build]
+[profile.dev]
 incremental = true
 
 [build-dependencies]
@@ -93,6 +93,7 @@ http-body-util = "0.1"
 serial_test = "3.2"
 futures = "0.3"
 testcontainers = "0.25"
+proptest = "1.6"
 
 [lib]
 name = "tei_manager"
@@ -108,4 +109,16 @@ path = "src/bin/bench-client.rs"
 
 [[bench]]
 name = "multiplexer_overhead"
+harness = false
+
+[[bench]]
+name = "embedding"
+harness = false
+
+[[bench]]
+name = "pool"
+harness = false
+
+[[bench]]
+name = "registry"
 harness = false

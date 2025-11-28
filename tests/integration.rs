@@ -3,7 +3,11 @@
 //! These tests exercise the API handlers directly using axum-test,
 //! which runs in-process and contributes to code coverage metrics.
 //!
-//! Uses `tests/mock-tei-router` for simulating TEI backend behavior.
+//! Note: Tests that require actual process spawning (start/stop/restart)
+//! use a stub binary path. The process spawning itself is tested in
+//! src/instance.rs unit tests with MockProcessManager.
+
+#![allow(clippy::disallowed_methods)] // Tests intentionally use env::set_var to test env parsing
 
 use axum_test::TestServer;
 use serde_json::json;
@@ -27,19 +31,24 @@ fn get_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
         .clone()
 }
 
+/// Stub binary for integration tests.
+/// On Unix, we use /bin/sleep which exists on all systems and can be spawned.
+/// The sleep command will just run until killed, simulating a running process.
+#[cfg(unix)]
+const STUB_BINARY: &str = "/bin/sleep";
+#[cfg(not(unix))]
+const STUB_BINARY: &str = "timeout"; // Windows equivalent
+
 /// Helper to create a test server with the API
 async fn create_test_server() -> (TestServer, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("state.toml");
 
-    // Use the mock TEI binary for integration tests
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
+    // Use a stub binary for integration tests.
+    // The actual process spawning logic is tested in src/instance.rs unit tests.
     let config = ManagerConfig {
         state_file: state_file.clone(),
-        tei_binary_path: tei_binary.to_string_lossy().to_string(),
+        tei_binary_path: STUB_BINARY.to_string(),
         max_instances: Some(10),
         ..Default::default()
     };
@@ -65,6 +74,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
         state_manager,
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
+        require_cert_headers: false,
         model_registry,
         model_loader,
     };
@@ -380,15 +390,10 @@ async fn test_max_instances_limit() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("state.toml");
 
-    // Use the mock TEI binary for integration tests
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
     // Create server with max_instances = 2
     let config = ManagerConfig {
         state_file: state_file.clone(),
-        tei_binary_path: tei_binary.to_string_lossy().to_string(),
+        tei_binary_path: STUB_BINARY.to_string(),
         max_instances: Some(2),
         ..Default::default()
     };
@@ -414,6 +419,7 @@ async fn test_max_instances_limit() {
         state_manager,
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
+        require_cert_headers: false,
         model_registry,
         model_loader,
     };
@@ -478,20 +484,11 @@ async fn test_state_persistence() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("test-state.toml");
 
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
-    let registry = Arc::new(Registry::new(
-        None,
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
+    let registry = Arc::new(Registry::new(None, STUB_BINARY.to_string(), 8080, 8180));
     let state_manager = Arc::new(StateManager::new(
         state_file.clone(),
         registry.clone(),
-        tei_binary.to_string_lossy().to_string(),
+        STUB_BINARY.to_string(),
     ));
 
     // Create an instance
@@ -539,21 +536,8 @@ async fn test_state_load_missing_file() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("nonexistent.toml");
 
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
-    let registry = Arc::new(Registry::new(
-        None,
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
-    let state_manager = StateManager::new(
-        state_file,
-        registry,
-        tei_binary.to_string_lossy().to_string(),
-    );
+    let registry = Arc::new(Registry::new(None, STUB_BINARY.to_string(), 8080, 8180));
+    let state_manager = StateManager::new(state_file, registry, STUB_BINARY.to_string());
 
     // Loading missing file should return empty state
     let result = state_manager.load().await;
@@ -820,10 +804,6 @@ async fn test_state_restore_multiple_instances() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("restore-multi.toml");
 
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
     // Create state file with multiple instances
     let state_content = r#"
 last_updated = "2025-01-01T00:00:00Z"
@@ -846,20 +826,11 @@ max_concurrent_requests = 10
 
     std::fs::write(&state_file, state_content).expect("Failed to write state file");
 
-    let registry = Arc::new(Registry::new(
-        None,
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
-    let state_manager = StateManager::new(
-        state_file,
-        registry.clone(),
-        tei_binary.to_string_lossy().to_string(),
-    );
+    let registry = Arc::new(Registry::new(None, STUB_BINARY.to_string(), 8080, 8180));
+    let state_manager = StateManager::new(state_file, registry.clone(), STUB_BINARY.to_string());
 
-    // Restore instances
-    let result = state_manager.restore().await;
+    // Restore instances (skip readiness wait - mock instances don't respond to health checks)
+    let result = state_manager.restore_with_options(false).await;
 
     // Restore should complete without error (even if individual instances fail to start)
     assert!(result.is_ok());
@@ -878,10 +849,6 @@ async fn test_state_restore_with_invalid_instance() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("restore-invalid.toml");
 
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
     // Create state file with an instance that will fail (invalid model path)
     let state_content = r#"
 last_updated = "2025-01-01T00:00:00Z"
@@ -896,20 +863,12 @@ max_concurrent_requests = 10
 
     std::fs::write(&state_file, state_content).expect("Failed to write state file");
 
-    let registry = Arc::new(Registry::new(
-        None,
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
-    let state_manager = StateManager::new(
-        state_file,
-        registry,
-        tei_binary.to_string_lossy().to_string(),
-    );
+    let registry = Arc::new(Registry::new(None, STUB_BINARY.to_string(), 8080, 8180));
+    let state_manager = StateManager::new(state_file, registry, STUB_BINARY.to_string());
 
     // Restore should complete (not panic) even though instance will fail
-    let result = state_manager.restore().await;
+    // Skip readiness wait - mock instances don't respond to health checks
+    let result = state_manager.restore_with_options(false).await;
     assert!(result.is_ok());
 }
 
@@ -920,10 +879,6 @@ async fn test_state_restore_empty_state() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let state_file = temp_dir.path().join("restore-empty.toml");
 
-    let tei_binary = std::env::current_dir()
-        .expect("Failed to get current dir")
-        .join("tests/mock-tei-router");
-
     // Create empty state file
     let state_content = r#"
 last_updated = "2025-01-01T00:00:00Z"
@@ -932,17 +887,8 @@ instances = []
 
     std::fs::write(&state_file, state_content).expect("Failed to write state file");
 
-    let registry = Arc::new(Registry::new(
-        None,
-        tei_binary.to_string_lossy().to_string(),
-        8080,
-        8180,
-    ));
-    let state_manager = StateManager::new(
-        state_file,
-        registry,
-        tei_binary.to_string_lossy().to_string(),
-    );
+    let registry = Arc::new(Registry::new(None, STUB_BINARY.to_string(), 8080, 8180));
+    let state_manager = StateManager::new(state_file, registry, STUB_BINARY.to_string());
 
     // Should handle empty state gracefully
     let result = state_manager.restore().await;

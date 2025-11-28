@@ -18,9 +18,9 @@ fmt-check:
 clippy:
     cargo clippy --all-targets --all-features -- -D warnings
 
-# Setup test environment (extract TEI binary)
+# Setup test environment (no longer needed - tests use testcontainers)
 setup-test:
-    ./scripts/setup-test-binary.sh
+    @echo "No setup required - tests use testcontainers or /bin/sleep stub"
 
 # Run all unit tests
 test:
@@ -257,7 +257,13 @@ pre-commit: fcheck
 ci: fmt-check clippy test
     @echo "✅ CI pipeline passed!"
 
-# Benchmark performance (requires bench-start first)
+# Run local benchmarks (no external dependencies)
+bench-local:
+    cargo bench --bench embedding
+    cargo bench --bench pool
+    cargo bench --bench registry
+
+# Benchmark performance (requires bench-start first for multiplexer_overhead)
 bench:
     cargo bench
 
@@ -266,7 +272,7 @@ bench-open:
     cargo bench -- --open
 
 # Start local benchmark environment (tei-manager + bench-instance)
-bench-start: setup-test
+bench-start:
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -282,14 +288,26 @@ bench-start: setup-test
     # Build release binary
     cargo build --release
 
-    # Get the TEI binary path (relative to justfile location)
-    TEI_BINARY="$(pwd)/tests/text-embeddings-router"
+    # Find TEI binary - check common locations
+    TEI_BINARY=""
+    for candidate in \
+        "${TEI_BINARY_PATH:-}" \
+        "$(which text-embeddings-router 2>/dev/null || true)" \
+        "$HOME/.local/bin/text-embeddings-router" \
+        "/usr/local/bin/text-embeddings-router"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            TEI_BINARY="$candidate"
+            break
+        fi
+    done
 
-    if [ ! -x "$TEI_BINARY" ]; then
-        echo "ERROR: TEI binary not found at $TEI_BINARY"
-        echo "Run: just setup-test"
+    if [ -z "$TEI_BINARY" ]; then
+        echo "ERROR: TEI binary not found"
+        echo "Install text-embeddings-router or set TEI_BINARY_PATH"
+        echo "Download from: https://github.com/huggingface/text-embeddings-inference/releases"
         exit 1
     fi
+    echo "Using TEI binary: $TEI_BINARY"
 
     # Use a persistent state file in /tmp
     STATE_FILE="/tmp/tei-manager-bench.state"

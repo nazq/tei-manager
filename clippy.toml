@@ -1,0 +1,11 @@
+# Cognitive complexity threshold (default 25, we want stricter)
+cognitive-complexity-threshold = 15
+
+# Disallow certain methods that can cause issues
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "Not thread-safe, use config instead" },
+    { path = "std::process::exit", reason = "Use proper error propagation" },
+]
+
+# Type complexity threshold
+type-complexity-threshold = 300

@@ -193,13 +193,33 @@ ports:
 
 **2. Auto-allocation (recommended):**
 
-Set `port_range_start` and `port_range_end` in config:
+Set `instance_port_start` and `instance_port_end` in config:
 ```toml
-port_range_start = 8080
-port_range_end = 8089
+instance_port_start = 8080
+instance_port_end = 8180  # 100 ports available
 ```
 
 Instances get ports from this range automatically.
+
+### Port Exhaustion Limitation
+
+When an instance is deleted, the OS keeps the port in TIME_WAIT state for approximately 60 seconds.
+During rapid create/delete cycles, you may exhaust available ports even though no TEI process is
+using them.
+
+**Recommended port range sizing:**
+| Use Case | Min Port Range |
+|----------|----------------|
+| Stable workload (max N instances) | N + 10% buffer |
+| Moderate churn | 2x max instances |
+| High churn (frequent create/delete) | 3x max instances |
+
+Example for high-churn with max 10 instances:
+```toml
+instance_port_start = 8080
+instance_port_end = 8110  # 30 ports = 3x max instances
+max_instances = 10
+```
 
 **3. ClusterIP only:**
 
@@ -210,6 +230,56 @@ ports:
   port: 9001
   targetPort: 9001
 # Instance ports stay internal
+```
+
+## Security: Authentication Bypass Prevention
+
+When using mTLS authentication behind a reverse proxy (nginx, envoy), you must configure
+the `require_cert_headers` option to prevent authentication bypass:
+
+```toml
+[auth]
+enabled = true
+providers = ["mtls"]
+# IMPORTANT: Set to true when behind a reverse proxy
+require_cert_headers = true
+```
+
+### Security Modes
+
+| `require_cert_headers` | Deployment | Behavior |
+|------------------------|------------|----------|
+| `false` (default) | Native TLS (no proxy) | Requests without cert headers pass through (rustls verified) |
+| `true` | Behind reverse proxy | Requests without cert headers are rejected |
+
+### Why This Matters
+
+When `require_cert_headers = false`, requests without `X-SSL-Client-Cert` headers are
+assumed to be native TLS connections where rustls already verified the client certificate.
+
+**Risk**: If an attacker bypasses the reverse proxy and connects directly to the API port,
+they can send requests without cert headers and bypass authentication entirely.
+
+**Mitigation**:
+1. **Preferred**: Set `require_cert_headers = true` when running behind a reverse proxy
+2. Ensure the API port is not directly accessible from untrusted networks
+3. Use firewall rules to restrict access to the API port
+
+### Example nginx Configuration
+
+```nginx
+server {
+    listen 443 ssl;
+    ssl_client_certificate /etc/nginx/ca.crt;
+    ssl_verify_client on;
+
+    location / {
+        proxy_pass http://localhost:9000;
+        proxy_set_header X-SSL-Client-Cert $ssl_client_escaped_cert;
+        proxy_set_header X-SSL-Protocol $ssl_protocol;
+        proxy_set_header X-SSL-Cipher $ssl_cipher;
+    }
+}
 ```
 
 ## Health Checks

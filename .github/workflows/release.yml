@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (build but don't push)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: nazq/tei-manager
+
+jobs:
+  release-please:
+    name: Release Please
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.major }}.${{ steps.release.outputs.minor }}.${{ steps.release.outputs.patch }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: rust
+
+  build-config:
+    name: Load Build Config
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.config.outputs.version }}
+      tei_versions: ${{ steps.config.outputs.tei_versions }}
+      variants: ${{ steps.config.outputs.variants }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse release config
+        id: config
+        run: |
+          # Get version from release-please or Cargo.toml
+          if [[ -n "${{ needs.release-please.outputs.version }}" ]]; then
+            VERSION="${{ needs.release-please.outputs.version }}"
+          else
+            VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+          # Extract TEI versions as JSON array
+          TEI_VERSIONS=$(grep '^versions' release.toml | sed 's/.*= \[/[/' | tr -d ' ')
+          echo "tei_versions=$TEI_VERSIONS" >> "$GITHUB_OUTPUT"
+          echo "TEI versions: $TEI_VERSIONS"
+
+          # Build variants JSON array
+          VARIANTS='[{"name":"default","tei_variant":"","suffix":""},{"name":"ada","tei_variant":"89-","suffix":"-ada"},{"name":"hopper","tei_variant":"hopper-","suffix":"-hopper"}]'
+          echo "variants=$VARIANTS" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    name: Build ${{ matrix.variant.name }} (TEI ${{ matrix.tei_version }})
+    needs: build-config
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tei_version: ${{ fromJson(needs.build-config.outputs.tei_versions) }}
+        variant: ${{ fromJson(needs.build-config.outputs.variants) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: tags
+        run: |
+          VERSION="${{ needs.build-config.outputs.version }}"
+          TEI_VERSION="${{ matrix.tei_version }}"
+          SUFFIX="${{ matrix.variant.suffix }}"
+
+          TAG="${VERSION}-tei-${TEI_VERSION}${SUFFIX}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Image tag: $TAG"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}
+          build-args: |
+            TEI_VARIANT=${{ matrix.variant.tei_variant }}
+            TEI_VERSION=${{ matrix.tei_version }}
+            VARIANT_SUFFIX=${{ matrix.variant.name }}
+            VARIANT_NAME=${{ matrix.variant.name == 'default' && '' || matrix.variant.name }}
+            VARIANT_DESC=${{ matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.version=${{ needs.build-config.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}

@@ -7,8 +7,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 
 // ============================================================================
 // Trait Definitions
@@ -95,6 +97,8 @@ pub struct StateManager {
     registry: Arc<Registry>,
     tei_binary_path: Arc<str>,
     storage: Arc<dyn StorageBackend>,
+    /// Guard to prevent concurrent restore operations
+    restore_in_progress: AtomicBool,
 }
 
 impl StateManager {
@@ -110,6 +114,7 @@ impl StateManager {
             registry,
             tei_binary_path: Arc::from(tei_binary_path),
             storage,
+            restore_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -177,7 +182,36 @@ impl StateManager {
     }
 
     /// Restore instances from saved state
+    ///
+    /// This function is guarded against concurrent execution. If a restore is already
+    /// in progress, this call will return an error rather than starting a new restore
+    /// that could conflict with the in-flight operations.
+    ///
+    /// Spawned readiness-check tasks are tracked via JoinSet and awaited before
+    /// returning, ensuring the restore operation is fully complete.
+    ///
+    /// Set `wait_for_ready` to false to skip waiting for instances to become ready
+    /// (useful for tests where mock instances don't respond to health checks).
     pub async fn restore(&self) -> Result<()> {
+        self.restore_with_options(true).await
+    }
+
+    /// Restore instances with configurable readiness wait
+    pub async fn restore_with_options(&self, wait_for_ready: bool) -> Result<()> {
+        // Attempt to acquire the restore guard
+        if self
+            .restore_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            anyhow::bail!("Restore operation already in progress");
+        }
+
+        // Ensure we release the guard on exit (success or failure)
+        let _guard = RestoreGuard {
+            flag: &self.restore_in_progress,
+        };
+
         let state = self.load().await?;
 
         if state.instances.is_empty() {
@@ -192,6 +226,7 @@ impl StateManager {
 
         let mut restored = 0;
         let mut failed = 0;
+        let mut readiness_tasks: JoinSet<(String, Result<(), anyhow::Error>)> = JoinSet::new();
 
         for config in state.instances {
             match self.registry.add(config.clone()).await {
@@ -204,28 +239,34 @@ impl StateManager {
                         );
                         failed += 1;
                     } else {
-                        // Spawn background task to wait for readiness
-                        let instance_clone = instance.clone();
-                        tokio::spawn(async move {
-                            use crate::health::GrpcHealthChecker;
-                            use std::time::Duration;
+                        if wait_for_ready {
+                            // Track background task for readiness check
+                            let instance_clone = instance.clone();
+                            let instance_name = config.name.clone();
+                            readiness_tasks.spawn(async move {
+                                use crate::health::GrpcHealthChecker;
+                                use std::time::Duration;
 
-                            if let Err(e) = GrpcHealthChecker::wait_for_ready(
-                                &instance_clone,
-                                Duration::from_secs(300),
-                                Duration::from_millis(500),
-                            )
-                            .await
-                            {
-                                tracing::error!(
-                                    instance = %instance_clone.config.name,
-                                    error = %e,
-                                    "Restored instance failed to become ready"
-                                );
-                                *instance_clone.status.write().await =
-                                    crate::instance::InstanceStatus::Failed;
-                            }
-                        });
+                                let result = GrpcHealthChecker::wait_for_ready(
+                                    &instance_clone,
+                                    Duration::from_secs(300),
+                                    Duration::from_millis(500),
+                                )
+                                .await;
+
+                                if let Err(ref e) = result {
+                                    tracing::error!(
+                                        instance = %instance_clone.config.name,
+                                        error = %e,
+                                        "Restored instance failed to become ready"
+                                    );
+                                    *instance_clone.status.write().await =
+                                        crate::instance::InstanceStatus::Failed;
+                                }
+
+                                (instance_name, result)
+                            });
+                        }
                         restored += 1;
                     }
                 }
@@ -240,13 +281,43 @@ impl StateManager {
             }
         }
 
+        // Wait for all readiness checks to complete
+        let mut readiness_failed = 0;
+        while let Some(result) = readiness_tasks.join_next().await {
+            match result {
+                Ok((name, Ok(()))) => {
+                    tracing::debug!(instance = %name, "Instance readiness check completed");
+                }
+                Ok((name, Err(_))) => {
+                    tracing::warn!(instance = %name, "Instance readiness check failed");
+                    readiness_failed += 1;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Readiness task panicked");
+                    readiness_failed += 1;
+                }
+            }
+        }
+
         tracing::info!(
             restored = restored,
             failed = failed,
+            readiness_failed = readiness_failed,
             "Instance restoration complete"
         );
 
         Ok(())
+    }
+}
+
+/// RAII guard to ensure restore_in_progress flag is cleared on drop
+struct RestoreGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for RestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -708,5 +779,256 @@ mod tests {
         let loaded = state_manager.load().await.unwrap();
         assert_eq!(loaded.instances.len(), 1);
         assert_eq!(loaded.instances[0].name, "fs-test");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_restore_prevented() {
+        use std::sync::atomic::Ordering;
+
+        let state_file = PathBuf::from("/test/concurrent.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry,
+            "text-embeddings-router".to_string(),
+            storage,
+        );
+
+        // Simulate a restore already in progress by setting the flag
+        state_manager
+            .restore_in_progress
+            .store(true, Ordering::SeqCst);
+
+        // Attempting another restore should fail
+        let result = state_manager.restore().await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already in progress")
+        );
+
+        // Reset the flag
+        state_manager
+            .restore_in_progress
+            .store(false, Ordering::SeqCst);
+
+        // Now restore should work (with empty state)
+        let result = state_manager.restore().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_restore_guard_cleared_on_completion() {
+        use std::sync::atomic::Ordering;
+
+        let state_file = PathBuf::from("/test/guard.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry,
+            "text-embeddings-router".to_string(),
+            storage,
+        );
+
+        // Flag should start as false
+        assert!(!state_manager.restore_in_progress.load(Ordering::SeqCst));
+
+        // Run restore (with empty state)
+        state_manager.restore().await.unwrap();
+
+        // Flag should be cleared after restore completes
+        assert!(!state_manager.restore_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_restore_guard_cleared_on_error() {
+        use std::sync::atomic::Ordering;
+
+        let state_file = PathBuf::from("/test/guard_error.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+
+        // Inject load error to make restore fail
+        storage
+            .set_load_error("Simulated IO error".to_string())
+            .await;
+
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry,
+            "text-embeddings-router".to_string(),
+            storage,
+        );
+
+        // Flag should start as false
+        assert!(!state_manager.restore_in_progress.load(Ordering::SeqCst));
+
+        // Run restore (should fail due to load error)
+        let result = state_manager.restore().await;
+        assert!(result.is_err());
+
+        // Flag should still be cleared after restore fails (RAII guard)
+        assert!(!state_manager.restore_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_restore_with_registry_add_failure() {
+        let state_file = PathBuf::from("/test/add_failure.toml");
+        let storage = Arc::new(MockStorage::new());
+
+        // Create registry with max_instances = 1
+        let registry = Arc::new(Registry::new(
+            Some(1),
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+
+        // Create state with 2 instances (second will fail due to limit)
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "instance1"
+model_id = "model1"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+
+[[instances]]
+name = "instance2"
+model_id = "model2"
+port = 8081
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+
+        storage.save(&state_file, state_content).await.unwrap();
+
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry.clone(),
+            "text-embeddings-router".to_string(),
+            storage,
+        );
+
+        // Restore should complete (not panic) even though second instance fails
+        let result = state_manager.restore_with_options(false).await;
+        assert!(result.is_ok());
+
+        // Only 1 instance should be in registry
+        let instances = registry.list().await;
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].config.name, "instance1");
+    }
+
+    #[tokio::test]
+    async fn test_restore_with_duplicate_port_failure() {
+        let state_file = PathBuf::from("/test/dup_port.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+
+        // Create state with 2 instances using same port (second will fail)
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "instance1"
+model_id = "model1"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+
+[[instances]]
+name = "instance2"
+model_id = "model2"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+
+        storage.save(&state_file, state_content).await.unwrap();
+
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry.clone(),
+            "text-embeddings-router".to_string(),
+            storage,
+        );
+
+        // Restore should complete even though second instance fails (port conflict)
+        let result = state_manager.restore_with_options(false).await;
+        assert!(result.is_ok());
+
+        // Only 1 instance should be in registry
+        let instances = registry.list().await;
+        assert_eq!(instances.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_restore_without_waiting_for_ready() {
+        let state_file = PathBuf::from("/test/no_wait.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(
+            None,
+            "/bin/sleep".to_string(), // Stub binary
+            8080,
+            8180,
+        ));
+
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "no-wait-instance"
+model_id = "model"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+
+        storage.save(&state_file, state_content).await.unwrap();
+
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry.clone(),
+            "/bin/sleep".to_string(),
+            storage,
+        );
+
+        // Restore with wait_for_ready=false should complete quickly
+        let result = state_manager.restore_with_options(false).await;
+        assert!(result.is_ok());
+
+        // Instance should be in registry
+        let instances = registry.list().await;
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].config.name, "no-wait-instance");
     }
 }

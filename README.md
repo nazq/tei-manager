@@ -89,9 +89,9 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 <!-- x-release-please-start-version -->
 | Tag | Base Image | GPU Support |
 |-----|------------|-------------|
-| `0.9.0-tei-1.8.3` | `..text-embeddings-inference:1.8.3-grpc` | Multi-arch (auto-detect) |
-| `0.9.0-tei-1.8.3-ada` | `..text-embeddings-inference:89-1.8.3-grpc` | Ada (RTX 40xx, L4, L40, L40S) |
-| `0.9.0-tei-1.8.3-hopper` | `..text-embeddings-inference:hopper-1.8-grpc` | Hopper (H100, H200) |
+| `0.10.0-tei-1.8.3` | `..text-embeddings-inference:1.8.3-grpc` | Multi-arch (auto-detect) |
+| `0.10.0-tei-1.8.3-ada` | `..text-embeddings-inference:89-1.8.3-grpc` | Ada (RTX 40xx, L4, L40, L40S) |
+| `0.10.0-tei-1.8.3-hopper` | `..text-embeddings-inference:hopper-1.8-grpc` | Hopper (H100, H200) |
 <!-- x-release-please-end -->
 
 > **Note:** Only gRPC-enabled base images are supported. CPU-only and non-gRPC variants are not available.
@@ -105,9 +105,9 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 <!-- x-release-please-start-version -->
 ```bash
 # Pull the image for your GPU architecture
-docker pull ghcr.io/nazq/tei-manager:0.9.0-tei-1.8.3        # Multi-arch (auto-detect)
-docker pull ghcr.io/nazq/tei-manager:0.9.0-tei-1.8.3-ada    # Ada (RTX 40xx, L4, L40, L40S)
-docker pull ghcr.io/nazq/tei-manager:0.9.0-tei-1.8.3-hopper # Hopper (H100, H200)
+docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3        # Multi-arch (auto-detect)
+docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3-ada    # Ada (RTX 40xx, L4, L40, L40S)
+docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3-hopper # Hopper (H100, H200)
 
 # Run with GPU support
 docker run -d --gpus all \
@@ -115,7 +115,7 @@ docker run -d --gpus all \
   -p 9000:9000 \
   -p 9001:9001 \
   -p 8080-8089:8080-8089 \
-  ghcr.io/nazq/tei-manager:0.9.0-tei-1.8.3
+  ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3
 ```
 <!-- x-release-please-end -->
 

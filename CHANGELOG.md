@@ -5,6 +5,21 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0](https://github.com/nazq/tei-manager/compare/v0.9.0...v0.10.0) (2025-11-28)
+
+
+### Features
+
+* **release:** add Docker images section to release notes footer ([93defa2](https://github.com/nazq/tei-manager/commit/93defa2ac64e78c0f98ae50282d6fd945899da50))
+
+
+### Bug Fixes
+
+* **ci:** improve cargo caching with rust-cache and cargo-chef ([#26](https://github.com/nazq/tei-manager/issues/26)) ([701b1e9](https://github.com/nazq/tei-manager/commit/701b1e9d08722eedffa6b411180afc704846f2f4))
+* **ci:** release workflow waits for CI to pass ([#24](https://github.com/nazq/tei-manager/issues/24)) ([93defa2](https://github.com/nazq/tei-manager/commit/93defa2ac64e78c0f98ae50282d6fd945899da50))
+* **docker:** use cargo-chef for proper dependency caching ([701b1e9](https://github.com/nazq/tei-manager/commit/701b1e9d08722eedffa6b411180afc704846f2f4))
+* **e2e:** resolve flaky multiplexer test with warmup request ([93defa2](https://github.com/nazq/tei-manager/commit/93defa2ac64e78c0f98ae50282d6fd945899da50))
+
 ## [0.9.0](https://github.com/nazq/tei-manager/compare/v0.8.0...v0.9.0) (2025-11-28)
 
 

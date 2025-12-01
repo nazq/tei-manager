@@ -40,7 +40,7 @@ nix = { version = "0.30", features = ["signal"] }
 
 # Metrics
 metrics = "0.24"
-metrics-exporter-prometheus = "0.17"
+metrics-exporter-prometheus = "0.18"
 
 # gRPC client for health checks and TEI communication
 tonic = { version = "0.14", features = ["transport", "tls-ring", "gzip"] }

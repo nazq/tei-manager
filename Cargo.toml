@@ -64,7 +64,7 @@ futures = "0.3"
 # Certificate parsing for mTLS
 x509-parser = "0.18"
 urlencoding = "2.1"
-dirs = "5.0"
+dirs = "6.0"
 
 # HuggingFace Hub API
 # Use rustls-tls to avoid OpenSSL dependency for musl static builds

@@ -85,7 +85,7 @@ prost-build = "0.14"
 tonic-build = "0.14"
 
 [dev-dependencies]
-criterion = { version = "0.7", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3"
 tokio-test = "0.4"
 axum-test = "18.3"

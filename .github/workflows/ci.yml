@@ -87,7 +87,7 @@ jobs:
           shared-key: "ci"
 
       - name: Cache HuggingFace models
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/huggingface
           key: ${{ runner.os }}-hf-models-v1

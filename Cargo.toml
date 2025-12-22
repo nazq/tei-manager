@@ -88,7 +88,7 @@ tonic-build = "0.14"
 criterion = { version = "0.7", features = ["async_tokio"] }
 tempfile = "3"
 tokio-test = "0.4"
-axum-test = "18.3"
+axum-test = "18.4"
 http-body-util = "0.1"
 serial_test = "3.2"
 futures = "0.3"

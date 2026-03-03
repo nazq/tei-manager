@@ -38,7 +38,7 @@ fi
 echo "Updating README.md to version $VERSION"
 
 # Replace version pattern: X.Y.Z-tei- where X.Y.Z is the old version
-# This handles tags like 0.8.0-tei-1.8.3, 0.8.0-tei-1.8.3-ada, etc.
+# This handles tags like 0.8.0-tei-1.9.2, 0.8.0-tei-1.9.2-ada, etc.
 sed -i -E "s/[0-9]+\.[0-9]+\.[0-9]+(-tei-)/${VERSION}\1/g" "$README"
 
 # Show what changed

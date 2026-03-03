@@ -11,8 +11,8 @@
 #   - Build artifact cache (incremental compilation)
 #
 # Usage:
-#   ./scripts/build-all-variants.sh 0.3.0 1.8.3         # Build public images only
-#   ./scripts/build-all-variants.sh 0.3.0 1.8.3 --push  # Build + push public images
+#   ./scripts/build-all-variants.sh 0.3.0 1.9.2         # Build public images only
+#   ./scripts/build-all-variants.sh 0.3.0 1.9.2 --push  # Build + push public images
 #
 # ============================================================================
 
@@ -22,7 +22,7 @@ set -euo pipefail
 export DOCKER_BUILDKIT=1
 
 MANAGER_VERSION="${1:?Missing tei-manager version (e.g., 0.3.0)}"
-TEI_VERSION="${2:?Missing TEI version (e.g., 1.8.3)}"
+TEI_VERSION="${2:?Missing TEI version (e.g., 1.9.2)}"
 PUSH="${3:-}"
 
 REPO="ghcr.io/nazq/tei-manager"

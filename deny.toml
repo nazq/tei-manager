@@ -3,11 +3,7 @@
 
 [advisories]
 version = 2
-ignore = [
-    # number_prefix is unmaintained but still functional, pulled in by hf-hub -> indicatif
-    # Tracking: https://github.com/huggingface/hf-hub/issues - waiting for upstream fix
-    "RUSTSEC-2025-0119",
-]
+ignore = []
 
 [licenses]
 version = 2

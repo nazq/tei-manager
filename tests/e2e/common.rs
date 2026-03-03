@@ -58,7 +58,7 @@ impl Image for TeiImage {
 
     fn tag(&self) -> &str {
         // Use CPU gRPC image for CI compatibility
-        "cpu-1.8.3-grpc"
+        "cpu-1.9.2-grpc"
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {
@@ -183,7 +183,7 @@ impl TeiContainer {
                         let warmup_req = tei_manager::grpc::proto::tei::v1::EmbedRequest {
                             inputs: "warmup".to_string(),
                             truncate: true,
-                            normalize: true,
+                            normalize: Some(true),
                             truncation_direction: 0,
                             prompt_name: None,
                             dimensions: None,

@@ -10,7 +10,7 @@
 [tei]
 # TEI versions supported by this release
 # Build matrix will create images for each version × variant combination
-versions = ["1.8.3"]
+versions = ["1.9.2"]
 
 [variants]
 # Docker variants to build (maps to build-all-variants.sh)

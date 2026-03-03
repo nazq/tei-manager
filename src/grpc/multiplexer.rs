@@ -629,7 +629,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
 
             // Build requests directly from Arrow array - single allocation per row
             let truncate = req.truncate;
-            let normalize = req.normalize;
+            let normalize = Some(req.normalize);
 
             let requests: Vec<tei::EmbedRequest> = (0..num_rows)
                 .filter(|&i| !text_array.is_null(i))
@@ -1075,7 +1075,7 @@ mod tests {
             request: Some(tei::EmbedRequest {
                 inputs: "test".to_string(),
                 truncate: false,
-                normalize: false,
+                normalize: Some(false),
                 truncation_direction: tei::TruncationDirection::Right as i32,
                 prompt_name: None,
                 dimensions: None,
@@ -1114,7 +1114,7 @@ mod tests {
             request: Some(tei::EmbedRequest {
                 inputs: "test".to_string(),
                 truncate: false,
-                normalize: false,
+                normalize: Some(false),
                 truncation_direction: tei::TruncationDirection::Right as i32,
                 prompt_name: None,
                 dimensions: None,

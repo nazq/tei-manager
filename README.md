@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/nazq/tei-manager/branch/main/graph/badge.svg)](https://codecov.io/gh/nazq/tei-manager)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](Dockerfile)
-[![TEI](https://img.shields.io/badge/TEI-1.8.3-purple.svg)](https://github.com/huggingface/text-embeddings-inference)
+[![TEI](https://img.shields.io/badge/TEI-1.9.2-purple.svg)](https://github.com/huggingface/text-embeddings-inference)
 
 Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) (TEI). Run multiple embedding models simultaneously with intelligent resource management, health monitoring, and automatic recovery.
 
@@ -89,9 +89,9 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 <!-- x-release-please-start-version -->
 | Tag | Base Image | GPU Support |
 |-----|------------|-------------|
-| `0.10.0-tei-1.8.3` | `..text-embeddings-inference:1.8.3-grpc` | Multi-arch (auto-detect) |
-| `0.10.0-tei-1.8.3-ada` | `..text-embeddings-inference:89-1.8.3-grpc` | Ada (RTX 40xx, L4, L40, L40S) |
-| `0.10.0-tei-1.8.3-hopper` | `..text-embeddings-inference:hopper-1.8-grpc` | Hopper (H100, H200) |
+| `0.10.0-tei-1.9.2` | `..text-embeddings-inference:1.9.2-grpc` | Multi-arch (auto-detect) |
+| `0.10.0-tei-1.9.2-ada` | `..text-embeddings-inference:89-1.9.2-grpc` | Ada (RTX 40xx, L4, L40, L40S) |
+| `0.10.0-tei-1.9.2-hopper` | `..text-embeddings-inference:hopper-1.8-grpc` | Hopper (H100, H200) |
 <!-- x-release-please-end -->
 
 > **Note:** Only gRPC-enabled base images are supported. CPU-only and non-gRPC variants are not available.
@@ -105,9 +105,9 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 <!-- x-release-please-start-version -->
 ```bash
 # Pull the image for your GPU architecture
-docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3        # Multi-arch (auto-detect)
-docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3-ada    # Ada (RTX 40xx, L4, L40, L40S)
-docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3-hopper # Hopper (H100, H200)
+docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2        # Multi-arch (auto-detect)
+docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2-ada    # Ada (RTX 40xx, L4, L40, L40S)
+docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2-hopper # Hopper (H100, H200)
 
 # Run with GPU support
 docker run -d --gpus all \
@@ -115,7 +115,7 @@ docker run -d --gpus all \
   -p 9000:9000 \
   -p 9001:9001 \
   -p 8080-8089:8080-8089 \
-  ghcr.io/nazq/tei-manager:0.10.0-tei-1.8.3
+  ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2
 ```
 <!-- x-release-please-end -->
 

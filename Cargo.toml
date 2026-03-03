@@ -40,7 +40,7 @@ nix = { version = "0.30", features = ["signal"] }
 
 # Metrics
 metrics = "0.24"
-metrics-exporter-prometheus = "0.17"
+metrics-exporter-prometheus = "0.18"
 
 # gRPC client for health checks and TEI communication
 tonic = { version = "0.14", features = ["transport", "tls-ring", "gzip"] }
@@ -64,16 +64,16 @@ futures = "0.3"
 # Certificate parsing for mTLS
 x509-parser = "0.18"
 urlencoding = "2.1"
-dirs = "5.0"
+dirs = "6.0"
 
 # HuggingFace Hub API
 # Use rustls-tls to avoid OpenSSL dependency for musl static builds
-hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "rustls-tls"] }
 
 # Native TLS support
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2.2"
+rustls-pki-types = "1.14"
 tokio-rustls = "0.26"
 
 [profile.dev]
@@ -85,14 +85,14 @@ prost-build = "0.14"
 tonic-build = "0.14"
 
 [dev-dependencies]
-criterion = { version = "0.7", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3"
 tokio-test = "0.4"
 axum-test = "18.3"
 http-body-util = "0.1"
 serial_test = "3.2"
 futures = "0.3"
-testcontainers = "0.25"
+testcontainers = "0.27"
 proptest = "1.6"
 
 [lib]

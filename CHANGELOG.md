@@ -5,6 +5,13 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0](https://github.com/nazq/tei-manager/compare/v0.10.0...v0.11.0) (2026-03-03)
+
+
+### Features
+
+* update TEI to 1.9.2, bump dependencies, and update CI actions ([#47](https://github.com/nazq/tei-manager/issues/47)) ([9a10356](https://github.com/nazq/tei-manager/commit/9a1035604f068db0a4c4ffb215d1bc13ff22313a))
+
 ## [0.10.0](https://github.com/nazq/tei-manager/compare/v0.9.0...v0.10.0) (2025-11-28)
 
 

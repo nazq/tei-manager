@@ -433,19 +433,21 @@ fn build_tls_config(config: &ManagerConfig) -> Result<Option<rustls::ServerConfi
     let mut cert_reader = BufReader::new(cert_file);
     let mut key_reader = BufReader::new(key_file);
 
-    let certs = rustls_pemfile::certs(&mut cert_reader)
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+
+    let certs = CertificateDer::pem_reader_iter(&mut cert_reader)
         .collect::<Result<Vec<_>, _>>()
         .context("Failed to parse server certificate")?;
 
-    let key = rustls_pemfile::private_key(&mut key_reader)
-        .context("Failed to read private key")?
-        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+    let key =
+        PrivateKeyDer::from_pem_reader(&mut key_reader).context("Failed to read private key")?;
 
     // Load CA certificate for client verification
     let ca_file = File::open(&mtls_config.ca_cert).context("Failed to open CA certificate")?;
     let mut ca_reader = BufReader::new(ca_file);
 
-    let ca_certs = rustls_pemfile::certs(&mut ca_reader)
+    let ca_certs = CertificateDer::pem_reader_iter(&mut ca_reader)
         .collect::<Result<Vec<_>, _>>()
         .context("Failed to parse CA certificate")?;
 

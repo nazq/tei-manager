@@ -46,7 +46,7 @@ async fn test_embed_single_text() {
     let requests = vec![tei_manager::grpc::proto::tei::v1::EmbedRequest {
         inputs: "Hello, world!".to_string(),
         truncate: true,
-        normalize: true,
+        normalize: Some(true),
         truncation_direction: 0,
         prompt_name: None,
         dimensions: None,
@@ -86,7 +86,7 @@ async fn test_embed_batch() {
         .map(|text| tei_manager::grpc::proto::tei::v1::EmbedRequest {
             inputs: text.to_string(),
             truncate: true,
-            normalize: true,
+            normalize: Some(true),
             truncation_direction: 0,
             prompt_name: None,
             dimensions: None,
@@ -143,7 +143,7 @@ async fn test_embed_similarity() {
         .map(|text| tei_manager::grpc::proto::tei::v1::EmbedRequest {
             inputs: text.to_string(),
             truncate: true,
-            normalize: true,
+            normalize: Some(true),
             truncation_direction: 0,
             prompt_name: None,
             dimensions: None,

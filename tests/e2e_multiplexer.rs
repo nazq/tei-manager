@@ -38,7 +38,7 @@ async fn test_embed_arrow_with_real_backend() {
         .map(|text| tei_manager::grpc::proto::tei::v1::EmbedRequest {
             inputs: text.to_string(),
             truncate: true,
-            normalize: true,
+            normalize: Some(true),
             truncation_direction: 0,
             prompt_name: None,
             dimensions: None,

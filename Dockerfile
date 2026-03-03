@@ -4,7 +4,7 @@
 #
 # Build arguments for variant selection:
 #   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"cpu-")
-#   TEI_VERSION       - TEI version (default: 1.8.3)
+#   TEI_VERSION       - TEI version (default: 1.9.2)
 #   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"cpu")
 #   VARIANT_NAME      - Human-readable variant name for labels
 #   VARIANT_DESC      - Additional description for labels
@@ -41,7 +41,7 @@
 
 # Build arguments
 ARG TEI_VARIANT=
-ARG TEI_VERSION=1.8.3
+ARG TEI_VERSION=1.9.2
 ARG VARIANT_SUFFIX=
 ARG VARIANT_NAME=
 ARG VARIANT_DESC=

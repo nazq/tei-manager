@@ -44,7 +44,7 @@ impl Image for TeiImage {
     }
 
     fn tag(&self) -> &str {
-        "cpu-1.8.3-grpc"
+        "cpu-1.9.2-grpc"
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {
@@ -145,7 +145,7 @@ async fn benchmark_direct_embed(endpoint: &str, text: &str) {
     let request = EmbedRequest {
         inputs: text.to_string(),
         truncate: true,
-        normalize: true,
+        normalize: Some(true),
         truncation_direction: TruncationDirection::Right as i32,
         prompt_name: None,
         dimensions: None,
@@ -175,7 +175,7 @@ async fn benchmark_embed_stream(endpoint: &str, text: &str, batch_size: usize) {
     let requests = tokio_stream::iter((0..batch_size).map(move |_| EmbedRequest {
         inputs: text_owned.clone(),
         truncate: true,
-        normalize: true,
+        normalize: Some(true),
         truncation_direction: TruncationDirection::Right as i32,
         prompt_name: None,
         dimensions: None,

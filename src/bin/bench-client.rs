@@ -264,7 +264,7 @@ async fn embed_text_standard(
         request: Some(tei::EmbedRequest {
             inputs: text,
             truncate: true,
-            normalize: true,
+            normalize: Some(true),
             truncation_direction: 0,
             prompt_name: None,
             dimensions: None,

@@ -31,12 +31,13 @@ message EmbedRequest {
 ```toml
 # Cargo.toml
 [dependencies]
-tonic = "0.12"
-prost = "0.13"
+tonic = "0.14"
+prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-stream = "0.1"  # For streaming RPCs
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
 ```
 
 ### 2. Copy Proto Files
@@ -113,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request: Some(tei::EmbedRequest {
             inputs: "Hello, world!".to_string(),
             truncate: true,
-            normalize: true,
+            normalize: Some(true),
             truncation_direction: 0,
             prompt_name: None,
             dimensions: None,
@@ -151,7 +152,7 @@ async fn embed_text(
         request: Some(tei::EmbedRequest {
             inputs: text.to_string(),
             truncate: true,
-            normalize: true,
+            normalize: Some(true),
             truncation_direction: 0,  // Right truncation
             prompt_name: None,
             dimensions: None,
@@ -292,7 +293,7 @@ async fn embed_stream(
             request: Some(tei::EmbedRequest {
                 inputs: text,
                 truncate: true,
-                normalize: true,
+                normalize: Some(true),
                 truncation_direction: 0,
                 prompt_name: None,
                 dimensions: None,
@@ -395,7 +396,7 @@ async fn embed_arrow_batch(
 
 ```toml
 [dependencies]
-arrow = { version = "53", features = ["ipc_compression"] }
+arrow = { version = "57", features = ["ipc_compression"] }
 ```
 
 ## Connection Options

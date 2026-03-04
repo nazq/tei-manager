@@ -25,6 +25,11 @@ tei_variant = ""
 suffix = ""
 description = "Multi-arch (default, works everywhere)"
 
+[variants.cpu]
+tei_variant = "cpu-"
+suffix = "-cpu"
+description = "CPU-only (no GPU required)"
+
 [variants.ada]
 tei_variant = "89-"
 suffix = "-ada"

@@ -84,17 +84,16 @@ flowchart LR
 
 TEI Manager images are built on the [TEI gRPC base images](https://github.com/huggingface/text-embeddings-inference?tab=readme-ov-file#docker-images), which provide GPU-optimized kernels for embedding inference.
 
-**Tag format:** `{manager_version}-tei-{tei_version}[-{arch}]`
+**Tag format:** `{manager_version}-tei-{tei_version}[-{variant}]`
 
-<!-- x-release-please-start-version -->
-| Tag | Base Image | GPU Support |
-|-----|------------|-------------|
-| `0.10.0-tei-1.9.2` | `..text-embeddings-inference:1.9.2-grpc` | Multi-arch (auto-detect) |
-| `0.10.0-tei-1.9.2-ada` | `..text-embeddings-inference:89-1.9.2-grpc` | Ada (RTX 40xx, L4, L40, L40S) |
-| `0.10.0-tei-1.9.2-hopper` | `..text-embeddings-inference:hopper-1.8-grpc` | Hopper (H100, H200) |
-<!-- x-release-please-end -->
+> See [latest releases](https://github.com/nazq/tei-manager/releases) for current image tags.
 
-> **Note:** Only gRPC-enabled base images are supported. CPU-only and non-gRPC variants are not available.
+| Variant | Tag suffix | Base Image | Target |
+|---------|-----------|------------|--------|
+| Multi-arch | *(none)* | `text-embeddings-inference:{tei}-grpc` | Auto-detect GPU |
+| CPU | `-cpu` | `text-embeddings-inference:cpu-{tei}-grpc` | No GPU required |
+| Ada | `-ada` | `text-embeddings-inference:89-{tei}-grpc` | RTX 40xx, L4, L40, L40S |
+| Hopper | `-hopper` | `text-embeddings-inference:hopper-{tei}-grpc` | H100, H200 |
 
 ---
 
@@ -102,12 +101,12 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 
 ### Using Docker
 
-<!-- x-release-please-start-version -->
 ```bash
-# Pull the image for your GPU architecture
-docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2        # Multi-arch (auto-detect)
-docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2-ada    # Ada (RTX 40xx, L4, L40, L40S)
-docker pull ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2-hopper # Hopper (H100, H200)
+# Pull the image for your GPU architecture (replace <version> from latest release)
+docker pull ghcr.io/nazq/tei-manager:<version>        # Multi-arch (auto-detect)
+docker pull ghcr.io/nazq/tei-manager:<version>-cpu     # CPU-only (no GPU)
+docker pull ghcr.io/nazq/tei-manager:<version>-ada     # Ada (RTX 40xx, L4, L40, L40S)
+docker pull ghcr.io/nazq/tei-manager:<version>-hopper  # Hopper (H100, H200)
 
 # Run with GPU support
 docker run -d --gpus all \
@@ -115,9 +114,8 @@ docker run -d --gpus all \
   -p 9000:9000 \
   -p 9001:9001 \
   -p 8080-8089:8080-8089 \
-  ghcr.io/nazq/tei-manager:0.10.0-tei-1.9.2
+  ghcr.io/nazq/tei-manager:<version>
 ```
-<!-- x-release-please-end -->
 
 ```bash
 # Create an embedding instance

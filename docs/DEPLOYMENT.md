@@ -4,13 +4,13 @@ Production deployment patterns for TEI Manager.
 
 ## Docker Compose
 
-Basic single-host deployment:
+Basic single-host deployment (see [latest releases](https://github.com/nazq/tei-manager/releases) for current image tags):
 
 ```yaml
 version: '3.8'
 services:
   tei-manager:
-    image: ghcr.io/nazq/tei-manager:0.6.0-tei-1.9.2
+    image: ghcr.io/nazq/tei-manager:<version>
     ports:
       - "9000:9000"   # REST API
       - "9001:9001"   # gRPC Multiplexer
@@ -52,7 +52,7 @@ spec:
     spec:
       containers:
       - name: tei-manager
-        image: ghcr.io/nazq/tei-manager:0.6.0-tei-1.9.2
+        image: ghcr.io/nazq/tei-manager:<version>
         ports:
         - containerPort: 9000
           name: http

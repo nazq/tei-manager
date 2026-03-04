@@ -79,7 +79,7 @@ jobs:
           echo "TEI versions: $TEI_VERSIONS"
 
           # Build variants JSON array
-          VARIANTS='[{"name":"default","tei_variant":"","suffix":""},{"name":"ada","tei_variant":"89-","suffix":"-ada"},{"name":"hopper","tei_variant":"hopper-","suffix":"-hopper"}]'
+          VARIANTS='[{"name":"default","tei_variant":"","suffix":""},{"name":"cpu","tei_variant":"cpu-","suffix":"-cpu"},{"name":"ada","tei_variant":"89-","suffix":"-ada"},{"name":"hopper","tei_variant":"hopper-","suffix":"-hopper"}]'
           echo "variants=$VARIANTS" >> "$GITHUB_OUTPUT"
 
   build-and-push:
@@ -127,7 +127,7 @@ jobs:
             TEI_VERSION=${{ matrix.tei_version }}
             VARIANT_SUFFIX=${{ matrix.variant.name }}
             VARIANT_NAME=${{ matrix.variant.name == 'default' && '' || matrix.variant.name }}
-            VARIANT_DESC=${{ matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || '' }}
+            VARIANT_DESC=${{ matrix.variant.name == 'cpu' && ' - CPU-only, no GPU required' || matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |

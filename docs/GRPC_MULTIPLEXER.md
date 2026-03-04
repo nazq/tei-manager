@@ -118,7 +118,15 @@ grpcurl -plaintext localhost:9001 list
 
 ### Rust Client Example
 
-For a complete Rust client implementation, see the built-in benchmark client at `src/bin/bench-client.rs`. It demonstrates:
+For a complete Rust client integration guide, see **[RUST_CLIENT.md](RUST_CLIENT.md)**. It covers:
+
+- Proto compilation with `tonic-build`
+- All RPC methods with code examples
+- Arrow batch processing
+- mTLS configuration
+- Error handling
+
+The built-in benchmark client at `src/bin/bench-client.rs` serves as a reference implementation demonstrating:
 
 - Connecting to the gRPC multiplexer with/without TLS
 - Creating Arrow IPC batches with LZ4 compression

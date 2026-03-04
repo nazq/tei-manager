@@ -5,6 +5,13 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0](https://github.com/nazq/tei-manager/compare/v0.11.0...v0.12.0) (2026-03-04)
+
+
+### Features
+
+* add CPU variant and replace hardcoded doc versions with placeholders ([#49](https://github.com/nazq/tei-manager/issues/49)) ([6d8eb2b](https://github.com/nazq/tei-manager/commit/6d8eb2bf45328bf791867f1aa6e806c3bf818cce))
+
 ## [0.11.0](https://github.com/nazq/tei-manager/compare/v0.10.0...v0.11.0) (2026-03-03)
 
 

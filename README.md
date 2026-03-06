@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/nazq/tei-manager/branch/main/graph/badge.svg)](https://codecov.io/gh/nazq/tei-manager)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](Dockerfile)
-[![TEI](https://img.shields.io/badge/TEI-1.9.2-purple.svg)](https://github.com/huggingface/text-embeddings-inference)
+[![TEI](https://img.shields.io/badge/TEI-1.9.3-purple.svg)](https://github.com/huggingface/text-embeddings-inference)
 
 Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) (TEI). Run multiple embedding models simultaneously with intelligent resource management, health monitoring, and automatic recovery.
 
@@ -94,6 +94,9 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 | CPU | `-cpu` | `text-embeddings-inference:cpu-{tei}-grpc` | No GPU required |
 | Ada | `-ada` | `text-embeddings-inference:89-{tei}-grpc` | RTX 40xx, L4, L40, L40S |
 | Hopper | `-hopper` | `text-embeddings-inference:hopper-{tei}-grpc` | H100, H200 |
+| Blackwell | `-blackwell` | `text-embeddings-inference:120-{tei}-grpc` | RTX 5090, RTX 5080 |
+| Blackwell 121 | `-blackwell-121` | `text-embeddings-inference:121-{tei}-grpc` | DGX Spark GB10 |
+| CPU ARM64 | `-cpu-arm64` | `text-embeddings-inference:cpu-arm64-{tei}-grpc` | ARM64/aarch64, no GPU |
 
 ---
 
@@ -103,10 +106,13 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 
 ```bash
 # Pull the image for your GPU architecture (replace <version> from latest release)
-docker pull ghcr.io/nazq/tei-manager:<version>        # Multi-arch (auto-detect)
-docker pull ghcr.io/nazq/tei-manager:<version>-cpu     # CPU-only (no GPU)
-docker pull ghcr.io/nazq/tei-manager:<version>-ada     # Ada (RTX 40xx, L4, L40, L40S)
-docker pull ghcr.io/nazq/tei-manager:<version>-hopper  # Hopper (H100, H200)
+docker pull ghcr.io/nazq/tei-manager:<version>              # Multi-arch (auto-detect)
+docker pull ghcr.io/nazq/tei-manager:<version>-cpu           # CPU-only (no GPU)
+docker pull ghcr.io/nazq/tei-manager:<version>-ada           # Ada (RTX 40xx, L4, L40, L40S)
+docker pull ghcr.io/nazq/tei-manager:<version>-hopper        # Hopper (H100, H200)
+docker pull ghcr.io/nazq/tei-manager:<version>-blackwell     # Blackwell (RTX 5090/5080)
+docker pull ghcr.io/nazq/tei-manager:<version>-blackwell-121 # Blackwell 12.1 (DGX Spark GB10)
+docker pull ghcr.io/nazq/tei-manager:<version>-cpu-arm64     # CPU ARM64/aarch64
 
 # Run with GPU support
 docker run -d --gpus all \

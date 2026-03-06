@@ -3,9 +3,9 @@
 # ============================================================================
 #
 # Build arguments for variant selection:
-#   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"cpu-")
-#   TEI_VERSION       - TEI version (default: 1.9.2)
-#   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"cpu")
+#   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"cpu-"/"120-"/"121-"/"cpu-arm64-")
+#   TEI_VERSION       - TEI version (default: 1.9.3)
+#   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"cpu"/"blackwell"/"blackwell-121"/"cpu-arm64")
 #   VARIANT_NAME      - Human-readable variant name for labels
 #   VARIANT_DESC      - Additional description for labels
 #
@@ -17,31 +17,43 @@
 #   docker build \
 #     --build-arg TEI_VARIANT=cpu- \
 #     --build-arg VARIANT_SUFFIX=cpu \
-#     --build-arg VARIANT_NAME="CPU" \
-#     --build-arg VARIANT_DESC=" - CPU-only, no GPU required" \
 #     -t tei-manager:latest-cpu .
 #
 #   # Ada Lovelace (RTX 4090/4080)
 #   docker build \
 #     --build-arg TEI_VARIANT=89- \
 #     --build-arg VARIANT_SUFFIX=ada \
-#     --build-arg VARIANT_NAME="Ada Lovelace" \
-#     --build-arg VARIANT_DESC=" - Optimized for RTX 4090/4080" \
 #     -t tei-manager:latest-ada .
 #
 #   # Hopper (H100/H200)
 #   docker build \
 #     --build-arg TEI_VARIANT=hopper- \
 #     --build-arg VARIANT_SUFFIX=hopper \
-#     --build-arg VARIANT_NAME="Hopper" \
-#     --build-arg VARIANT_DESC=" for H100/H200 GPUs" \
 #     -t tei-manager:latest-hopper .
+#
+#   # Blackwell desktop (RTX 5090/5080)
+#   docker build \
+#     --build-arg TEI_VARIANT=120- \
+#     --build-arg VARIANT_SUFFIX=blackwell \
+#     -t tei-manager:latest-blackwell .
+#
+#   # Blackwell 12.1 (DGX Spark GB10)
+#   docker build \
+#     --build-arg TEI_VARIANT=121- \
+#     --build-arg VARIANT_SUFFIX=blackwell-121 \
+#     -t tei-manager:latest-blackwell-121 .
+#
+#   # CPU ARM64/aarch64
+#   docker build \
+#     --build-arg TEI_VARIANT=cpu-arm64- \
+#     --build-arg VARIANT_SUFFIX=cpu-arm64 \
+#     -t tei-manager:latest-cpu-arm64 .
 #
 # ============================================================================
 
 # Build arguments
 ARG TEI_VARIANT=
-ARG TEI_VERSION=1.9.2
+ARG TEI_VERSION=1.9.3
 ARG VARIANT_SUFFIX=
 ARG VARIANT_NAME=
 ARG VARIANT_DESC=
@@ -80,15 +92,22 @@ RUN apt-get update && apt-get install -y \
     musl-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# Add musl target for static linking (works on any Linux distro)
-RUN rustup target add x86_64-unknown-linux-musl
+# Determine musl target based on build platform
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+    "arm64") MUSL_TARGET=aarch64-unknown-linux-musl ;; \
+    *)       MUSL_TARGET=x86_64-unknown-linux-musl  ;; \
+    esac \
+    && echo "$MUSL_TARGET" > /tmp/musl_target \
+    && rustup target add "$MUSL_TARGET"
 
 # Copy recipe from planner stage
 COPY --from=planner /build/recipe.json recipe.json
 
 # Build dependencies only - this layer is cached unless Cargo.toml/Cargo.lock change
 # This is the key optimization: dependencies are built in a separate layer
-RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+RUN MUSL_TARGET=$(cat /tmp/musl_target) \
+    && cargo chef cook --release --target "$MUSL_TARGET" --recipe-path recipe.json
 
 # Copy build script and proto files for gRPC compilation
 COPY build.rs ./
@@ -102,10 +121,11 @@ COPY src ./src
 COPY benches ./benches
 
 # Build the actual binaries - only recompiles if source changed
-RUN cargo build --release --target x86_64-unknown-linux-musl --locked && \
-    cargo build --release --target x86_64-unknown-linux-musl --bin bench-client --locked && \
-    cp target/x86_64-unknown-linux-musl/release/tei-manager /tmp/tei-manager && \
-    cp target/x86_64-unknown-linux-musl/release/bench-client /tmp/bench-client
+RUN MUSL_TARGET=$(cat /tmp/musl_target) \
+    && cargo build --release --target "$MUSL_TARGET" --locked \
+    && cargo build --release --target "$MUSL_TARGET" --bin bench-client --locked \
+    && cp "target/$MUSL_TARGET/release/tei-manager" /tmp/tei-manager \
+    && cp "target/$MUSL_TARGET/release/bench-client" /tmp/bench-client
 
 # ============================================================================
 # TEI stage - Extract text-embeddings-router binary

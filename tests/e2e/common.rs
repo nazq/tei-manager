@@ -17,12 +17,22 @@ pub const SPARSE_MODEL: &str = "naver/splade-cocondenser-selfdistil";
 /// Default gRPC port inside the container (TEI gRPC image uses port 80)
 const GRPC_PORT: u16 = 80;
 
+/// Default TEI version (overridden by TEI_VERSION env var in CI)
+const DEFAULT_TEI_VERSION: &str = "1.9.3";
+
+/// Get the TEI image tag from environment or default
+fn tei_image_tag() -> String {
+    let version = std::env::var("TEI_VERSION").unwrap_or_else(|_| DEFAULT_TEI_VERSION.to_string());
+    format!("cpu-{version}-grpc")
+}
+
 /// TEI Docker image configuration
 #[derive(Debug, Clone)]
 pub struct TeiImage {
     model_id: String,
     pooling: Option<String>,
     env_vars: Vec<(String, String)>,
+    tag: String,
 }
 
 impl TeiImage {
@@ -32,6 +42,7 @@ impl TeiImage {
             model_id: model_id.to_string(),
             pooling: None,
             env_vars: Vec::new(),
+            tag: tei_image_tag(),
         }
     }
 
@@ -41,6 +52,7 @@ impl TeiImage {
             model_id: model_id.to_string(),
             pooling: Some("splade".to_string()),
             env_vars: Vec::new(),
+            tag: tei_image_tag(),
         }
     }
 
@@ -57,8 +69,7 @@ impl Image for TeiImage {
     }
 
     fn tag(&self) -> &str {
-        // Use CPU gRPC image for CI compatibility
-        "cpu-1.9.2-grpc"
+        &self.tag
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {

@@ -21,8 +21,8 @@ proto/
 
 ### TEI Proto (Vendored)
 
-**Version**: v1.9.2
-**Source**: https://github.com/huggingface/text-embeddings-inference/blob/v1.9.2/proto/tei.proto
+**Version**: v1.9.3
+**Source**: https://github.com/huggingface/text-embeddings-inference/blob/v1.9.3/proto/tei.proto
 **Purpose**: Original TEI gRPC service definitions
 
 We vendor the upstream TEI proto to:

@@ -136,6 +136,36 @@ build_public_variant \
     " for H100/H200 GPUs" \
     "${MANAGER_VERSION}-tei-${TEI_VERSION}-hopper"
 
+# Blackwell desktop variant (RTX 5090/5080)
+build_public_variant \
+    "blackwell (RTX 5090/5080)" \
+    "120-" \
+    "$TEI_VERSION" \
+    "blackwell" \
+    "Blackwell" \
+    " for RTX 5090/5080 GPUs" \
+    "${MANAGER_VERSION}-tei-${TEI_VERSION}-blackwell"
+
+# Blackwell 12.1 variant (DGX Spark GB10)
+build_public_variant \
+    "blackwell-121 (DGX Spark GB10)" \
+    "121-" \
+    "$TEI_VERSION" \
+    "blackwell-121" \
+    "Blackwell 12.1" \
+    " for DGX Spark GB10" \
+    "${MANAGER_VERSION}-tei-${TEI_VERSION}-blackwell-121"
+
+# CPU ARM64 variant (aarch64, no GPU)
+build_public_variant \
+    "cpu-arm64 (aarch64)" \
+    "cpu-arm64-" \
+    "$TEI_VERSION" \
+    "cpu-arm64" \
+    "CPU ARM64" \
+    " - CPU-only ARM64/aarch64" \
+    "${MANAGER_VERSION}-tei-${TEI_VERSION}-cpu-arm64"
+
 # ============================================================================
 # Summary
 # ============================================================================
@@ -144,9 +174,12 @@ echo -e "${GREEN}Public images built successfully!${NC}"
 echo "======================================"
 echo
 echo "Images created:"
-echo "  Multi-arch: $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}"
-echo "  Ada:        $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}-ada"
-echo "  Hopper:     $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}-hopper"
+echo "  Multi-arch:     $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}"
+echo "  Ada:            $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}-ada"
+echo "  Hopper:         $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}-hopper"
+echo "  Blackwell:      $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}-blackwell"
+echo "  Blackwell 121:  $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}-blackwell-121"
+echo "  CPU ARM64:      $REPO:${MANAGER_VERSION}-tei-${TEI_VERSION}-cpu-arm64"
 echo
 
 if [ "$PUSH" != "--push" ]; then

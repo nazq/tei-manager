@@ -99,20 +99,35 @@ jobs:
       - name: Create HuggingFace cache directory
         run: mkdir -p ~/.cache/huggingface/hub
 
+      - name: Read TEI version from release.toml
+        id: tei
+        run: |
+          TEI_VERSION=$(grep '^versions' release.toml | sed 's/.*\["\(.*\)"\]/\1/')
+          echo "version=$TEI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "TEI version: $TEI_VERSION"
+
       - name: Pull TEI Docker image
-        run: docker pull ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.2-grpc
+        run: docker pull ghcr.io/huggingface/text-embeddings-inference:cpu-${{ steps.tei.outputs.version }}-grpc
 
       - name: Run E2E dense tests
         run: cargo test --test e2e_dense -- --nocapture
+        env:
+          TEI_VERSION: ${{ steps.tei.outputs.version }}
 
       - name: Run E2E sparse tests
         run: cargo test --test e2e_sparse -- --nocapture --test-threads=1
+        env:
+          TEI_VERSION: ${{ steps.tei.outputs.version }}
 
       - name: Run E2E multiplexer tests
         run: cargo test --test e2e_multiplexer -- --nocapture --test-threads=1
+        env:
+          TEI_VERSION: ${{ steps.tei.outputs.version }}
 
       - name: Run smoke tests
         run: cargo test --test e2e_smoke
+        env:
+          TEI_VERSION: ${{ steps.tei.outputs.version }}
 
   coverage:
     name: Code Coverage

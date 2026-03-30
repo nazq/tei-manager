@@ -140,7 +140,7 @@ jobs:
         run: cargo llvm-cov --lib --test integration --lcov --output-path lcov.info --ignore-filename-regex='tests/.*'
 
       - name: Upload to codecov.io
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: lcov.info
           fail_ci_if_error: false

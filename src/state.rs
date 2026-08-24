@@ -244,24 +244,22 @@ impl StateManager {
                             let instance_clone = instance.clone();
                             let instance_name = config.name.clone();
                             readiness_tasks.spawn(async move {
+                                use crate::config::DEFAULT_STARTUP_TIMEOUT_SECS;
                                 use crate::health::GrpcHealthChecker;
                                 use std::time::Duration;
 
+                                let timeout = instance_clone.config.startup_timeout(
+                                    Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS),
+                                );
                                 let result = GrpcHealthChecker::wait_for_ready(
                                     &instance_clone,
-                                    Duration::from_secs(300),
+                                    timeout,
                                     Duration::from_millis(500),
                                 )
                                 .await;
 
                                 if let Err(ref e) = result {
-                                    tracing::error!(
-                                        instance = %instance_clone.config.name,
-                                        error = %e,
-                                        "Restored instance failed to become ready"
-                                    );
-                                    *instance_clone.status.write().await =
-                                        crate::instance::InstanceStatus::Failed;
+                                    instance_clone.mark_failed(format!("restore: {e}")).await;
                                 }
 
                                 (instance_name, result)
@@ -1030,5 +1028,52 @@ max_concurrent_requests = 10
         let instances = registry.list().await;
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].config.name, "no-wait-instance");
+    }
+
+    #[tokio::test]
+    async fn test_restore_marks_exited_instance_failed_with_reason() {
+        let state_file = PathBuf::from("/test/no_wait.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(
+            None,
+            "/bin/false".to_string(), // Stub binary
+            8080,
+            8180,
+        ));
+
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "dies-on-start"
+model_id = "model"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+
+        storage.save(&state_file, state_content).await.unwrap();
+
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry.clone(),
+            "/bin/false".to_string(),
+            storage,
+        );
+
+        // /bin/false exits immediately: the readiness wait must fail fast
+        // (not poll for the full startup timeout) and record why.
+        let start = std::time::Instant::now();
+        state_manager.restore_with_options(true).await.unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(30));
+
+        let instance = registry.get("dies-on-start").await.unwrap();
+        assert_eq!(
+            *instance.status.read().await,
+            crate::instance::InstanceStatus::Failed
+        );
+        let err = instance.stats.read().await.last_error.clone().unwrap();
+        assert!(err.starts_with("restore: "), "{err}");
+        assert!(err.contains("exited during startup"), "{err}");
     }
 }

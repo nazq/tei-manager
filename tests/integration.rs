@@ -145,6 +145,45 @@ async fn test_create_instance() {
 }
 
 #[tokio::test]
+async fn test_instance_that_exits_on_start_reports_failed_with_reason() {
+    // The stub binary rejects TEI's arguments and exits immediately, which is
+    // exactly what a real TEI does on e.g. a CUDA compute-cap mismatch. The
+    // API must surface that as `failed` + `last_error`, not `starting` forever.
+    let (server, _temp_dir) = create_test_server().await;
+
+    let response = server
+        .post("/instances")
+        .json(&json!({
+            "name": "exits-immediately",
+            "model_id": "BAAI/bge-small-en-v1.5",
+            "port": 8081,
+        }))
+        .await;
+    assert_eq!(response.status_code(), 201);
+    let created: serde_json::Value = response.json();
+    assert_eq!(created["status"], "starting");
+    assert!(created.get("last_error").is_none());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let info = loop {
+        let info: serde_json::Value = server.get("/instances/exits-immediately").await.json();
+        if info["status"] == "failed" {
+            break info;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "instance never left 'starting': {info}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+
+    let err = info["last_error"].as_str().expect("last_error populated");
+    assert!(err.contains("exited during startup"), "{err}");
+    assert!(err.contains("process exited"), "{err}");
+    assert!(info["pid"].is_null());
+}
+
+#[tokio::test]
 async fn test_create_instance_with_invalid_gpu() {
     // Tests that invalid GPU IDs are rejected
     // GPU validation uses nvidia-smi to detect available GPUs

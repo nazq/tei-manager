@@ -4,6 +4,8 @@ use crate::config::InstanceConfig;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -34,6 +36,31 @@ pub struct ProcessHandle {
     pub(crate) id: String,
 }
 
+/// How a process terminated, plus the most useful line from its log
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessExit {
+    /// Exit code, if the process exited normally
+    pub code: Option<i32>,
+    /// Terminating signal number, if the process was killed by a signal
+    pub signal: Option<i32>,
+    /// Last error-level line from the process log, if one could be found
+    pub last_log_error: Option<String>,
+}
+
+impl std::fmt::Display for ProcessExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.code, self.signal) {
+            (Some(code), _) => write!(f, "process exited with code {code}")?,
+            (None, Some(sig)) => write!(f, "process killed by signal {sig}")?,
+            (None, None) => write!(f, "process exited")?,
+        }
+        if let Some(line) = &self.last_log_error {
+            write!(f, ": {line}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Trait for managing process lifecycle
 #[async_trait]
 pub trait ProcessManager: Send + Sync {
@@ -43,11 +70,54 @@ pub trait ProcessManager: Send + Sync {
     /// Stop a process gracefully with timeout
     async fn stop(&self, handle: ProcessHandle, timeout: Duration) -> Result<()>;
 
-    /// Check if process is running
+    /// Check if process is running.
+    ///
+    /// Implementations must reap exited children here so a dead process is
+    /// never reported as alive.
     async fn is_running(&self, handle: &ProcessHandle) -> bool;
 
     /// Get process ID
     async fn pid(&self, handle: &ProcessHandle) -> Option<u32>;
+
+    /// How the process terminated, if it has been observed to exit
+    async fn exit_status(&self, handle: &ProcessHandle) -> Option<ProcessExit>;
+}
+
+/// Read the last error-level line from a TEI log file.
+///
+/// TEI writes JSON lines with `"level":"ERROR"`; anyhow's final report is a plain
+/// `Error: ...` line. Only the tail of the file is scanned.
+pub(crate) fn last_log_error(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 16 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    // Prefer TEI's structured ERROR line (it carries the specific cause) over
+    // anyhow's generic `Error: ...` trailer.
+    let json_error = buf
+        .lines()
+        .rev()
+        .filter(|l| l.contains("\"level\":\"ERROR\""))
+        .find_map(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .ok()?
+                .get("message")?
+                .as_str()
+                .map(str::to_string)
+        });
+    json_error.or_else(|| {
+        buf.lines()
+            .rev()
+            .find(|l| l.starts_with("Error:"))
+            .map(|l| l.trim().to_string())
+    })
 }
 
 // ============================================================================
@@ -56,14 +126,60 @@ pub trait ProcessManager: Send + Sync {
 
 /// Production process manager using tokio::process
 pub struct SystemProcessManager {
-    processes: Arc<RwLock<std::collections::HashMap<String, Child>>>,
+    processes: Arc<RwLock<HashMap<String, Child>>>,
+    /// Log file per handle, used to surface the failure reason after exit
+    log_paths: Arc<RwLock<HashMap<String, PathBuf>>>,
+    /// Exit status of children that have been reaped
+    exited: Arc<RwLock<HashMap<String, ProcessExit>>>,
 }
 
 impl SystemProcessManager {
     pub fn new() -> Self {
         Self {
-            processes: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            processes: Arc::new(RwLock::new(HashMap::new())),
+            log_paths: Arc::new(RwLock::new(HashMap::new())),
+            exited: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Reap `child` if it has exited, recording how it terminated.
+    /// Returns true if the child is still running.
+    async fn reap_if_exited(&self, handle_id: &str, child: &mut Child) -> bool {
+        let status = match child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => return true,
+            Err(e) => {
+                tracing::warn!(handle = handle_id, error = %e, "try_wait failed");
+                return true;
+            }
+        };
+
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
+
+        let last_log_error = self
+            .log_paths
+            .read()
+            .await
+            .get(handle_id)
+            .and_then(|p| last_log_error(p));
+
+        let exit = ProcessExit {
+            code: status.code(),
+            signal,
+            last_log_error,
+        };
+        tracing::error!(handle = handle_id, exit = %exit, "TEI process exited");
+        self.exited
+            .write()
+            .await
+            .insert(handle_id.to_string(), exit);
+        false
     }
 }
 
@@ -170,6 +286,11 @@ impl ProcessManager for SystemProcessManager {
             id: handle_id.clone(),
         };
 
+        self.log_paths
+            .write()
+            .await
+            .insert(handle_id.clone(), log_path);
+        self.exited.write().await.remove(&handle_id);
         self.processes.write().await.insert(handle_id, child);
 
         Ok(handle)
@@ -177,6 +298,8 @@ impl ProcessManager for SystemProcessManager {
 
     async fn stop(&self, handle: ProcessHandle, timeout: Duration) -> Result<()> {
         let mut processes = self.processes.write().await;
+        self.log_paths.write().await.remove(&handle.id);
+        self.exited.write().await.remove(&handle.id);
 
         if let Some(mut child) = processes.remove(&handle.id) {
             // Try graceful shutdown first (SIGTERM)
@@ -214,13 +337,24 @@ impl ProcessManager for SystemProcessManager {
     }
 
     async fn is_running(&self, handle: &ProcessHandle) -> bool {
-        let processes = self.processes.read().await;
-        processes.contains_key(&handle.id)
+        let mut processes = self.processes.write().await;
+        let Some(child) = processes.get_mut(&handle.id) else {
+            return false;
+        };
+        if self.reap_if_exited(&handle.id, child).await {
+            return true;
+        }
+        processes.remove(&handle.id);
+        false
     }
 
     async fn pid(&self, handle: &ProcessHandle) -> Option<u32> {
         let processes = self.processes.read().await;
         processes.get(&handle.id).and_then(|p| p.id())
+    }
+
+    async fn exit_status(&self, handle: &ProcessHandle) -> Option<ProcessExit> {
+        self.exited.read().await.get(&handle.id).cloned()
     }
 }
 
@@ -255,6 +389,8 @@ pub struct InstanceStats {
     pub restarts: u32,
     pub last_health_check: Option<chrono::DateTime<chrono::Utc>>,
     pub health_check_failures: u32,
+    /// Why the instance last transitioned to `Failed`, if it has
+    pub last_error: Option<String>,
 }
 
 impl TeiInstance {
@@ -298,6 +434,7 @@ impl TeiInstance {
         // Update stats
         let mut stats = self.stats.write().await;
         stats.started_at = Some(chrono::Utc::now());
+        stats.last_error = None;
 
         tracing::info!(
             instance = %self.config.name,
@@ -353,6 +490,23 @@ impl TeiInstance {
         }
     }
 
+    /// How the process terminated, if it has exited
+    pub async fn exit_status(&self) -> Option<ProcessExit> {
+        let handle_guard = self.process_handle.read().await;
+        match handle_guard.as_ref() {
+            Some(handle) => self.process_manager.exit_status(handle).await,
+            None => None,
+        }
+    }
+
+    /// Transition to `Failed`, recording the reason for the API and logs
+    pub async fn mark_failed(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        tracing::error!(instance = %self.config.name, reason = %reason, "Instance failed");
+        self.stats.write().await.last_error = Some(reason);
+        *self.status.write().await = InstanceStatus::Failed;
+    }
+
     /// Get current PID
     pub async fn pid(&self) -> Option<u32> {
         let handle_guard = self.process_handle.read().await;
@@ -384,6 +538,7 @@ pub mod mocks {
         pid: u32,
         running: bool,
         config: SpawnConfig,
+        exit: Option<ProcessExit>,
     }
 
     impl Default for MockProcessManager {
@@ -418,6 +573,14 @@ pub mod mocks {
             let processes = self.processes.read().await;
             processes.get(&handle.id).map(|p| p.config.clone())
         }
+
+        /// Simulate every spawned process having exited with `exit`
+        pub async fn exit_all(&self, exit: ProcessExit) {
+            for state in self.processes.write().await.values_mut() {
+                state.running = false;
+                state.exit = Some(exit.clone());
+            }
+        }
     }
 
     #[async_trait]
@@ -436,6 +599,7 @@ pub mod mocks {
                 pid,
                 running: true,
                 config,
+                exit: None,
             };
 
             self.processes.write().await.insert(handle_id, state);
@@ -461,6 +625,11 @@ pub mod mocks {
             let processes = self.processes.read().await;
             processes.get(&handle.id).map(|p| p.pid)
         }
+
+        async fn exit_status(&self, handle: &ProcessHandle) -> Option<ProcessExit> {
+            let processes = self.processes.read().await;
+            processes.get(&handle.id).and_then(|p| p.exit.clone())
+        }
     }
 }
 
@@ -468,6 +637,165 @@ pub mod mocks {
 mod tests {
     use super::*;
     use mocks::MockProcessManager;
+
+    fn write_log(dir: &tempfile::TempDir, lines: &[&str]) -> PathBuf {
+        let path = dir.path().join("x.log");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_last_log_error_extracts_json_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(
+            &dir,
+            &[
+                r#"{"level":"INFO","message":"Starting model backend"}"#,
+                r#"{"level":"ERROR","message":"Could not start Candle backend: compute cap 120"}"#,
+                "Error: Could not create backend",
+                "",
+                "Caused by:",
+                "    Could not start backend",
+            ],
+        );
+        // The structured ERROR line carries the real cause and wins over the
+        // trailing plain `Error:` report.
+        assert_eq!(
+            last_log_error(&path).as_deref(),
+            Some("Could not start Candle backend: compute cap 120")
+        );
+    }
+
+    #[test]
+    fn test_last_log_error_falls_back_to_plain_error_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(
+            &dir,
+            &[
+                r#"{"level":"INFO","message":"hello"}"#,
+                "Error: Could not create backend",
+                "Caused by: something",
+            ],
+        );
+        assert_eq!(
+            last_log_error(&path).as_deref(),
+            Some("Error: Could not create backend")
+        );
+    }
+
+    #[test]
+    fn test_last_log_error_parses_json_error_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(
+            &dir,
+            &[
+                r#"{"level":"INFO","message":"hello"}"#,
+                r#"{"level":"ERROR","message":"boom","target":"x"}"#,
+                r#"{"level":"INFO","message":"after"}"#,
+            ],
+        );
+        assert_eq!(last_log_error(&path).as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn test_last_log_error_none_when_no_errors_or_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(&dir, &[r#"{"level":"INFO","message":"fine"}"#]);
+        assert_eq!(last_log_error(&path), None);
+        assert_eq!(last_log_error(&dir.path().join("missing.log")), None);
+    }
+
+    #[test]
+    fn test_process_exit_display() {
+        let code = ProcessExit {
+            code: Some(1),
+            signal: None,
+            last_log_error: Some("bad cap".to_string()),
+        };
+        assert_eq!(code.to_string(), "process exited with code 1: bad cap");
+
+        let sig = ProcessExit {
+            code: None,
+            signal: Some(9),
+            last_log_error: None,
+        };
+        assert_eq!(sig.to_string(), "process killed by signal 9");
+
+        let unknown = ProcessExit {
+            code: None,
+            signal: None,
+            last_log_error: None,
+        };
+        assert_eq!(unknown.to_string(), "process exited");
+    }
+
+    /// Real child process: a binary that exits immediately must be reaped and
+    /// reported as not running, with its exit code captured.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_system_manager_reaps_exited_child() {
+        let manager = SystemProcessManager::new();
+        let handle = manager
+            .spawn(SpawnConfig {
+                instance_name: "reap-test".to_string(),
+                binary_path: "/bin/false".to_string(),
+                model_id: "m".to_string(),
+                port: 1,
+                max_batch_tokens: 1,
+                max_concurrent_requests: 1,
+                pooling: None,
+                gpu_id: None,
+                prometheus_port: None,
+                extra_args: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Poll until the child has exited and been reaped
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while manager.is_running(&handle).await {
+            assert!(std::time::Instant::now() < deadline, "child never exited");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert!(!manager.is_running(&handle).await);
+        assert_eq!(manager.pid(&handle).await, None);
+        let exit = manager.exit_status(&handle).await.expect("exit recorded");
+        assert_eq!(exit.code, Some(1));
+        assert_eq!(exit.signal, None);
+
+        // stop() on an already-reaped handle is a no-op and clears the record
+        manager
+            .stop(handle.clone(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(manager.exit_status(&handle).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_mark_failed_records_reason_and_start_clears_it() {
+        let instance = TeiInstance::new_with_manager(
+            InstanceConfig {
+                name: "mf".to_string(),
+                model_id: "m".to_string(),
+                port: 9999,
+                ..Default::default()
+            },
+            Arc::new(MockProcessManager::new()),
+        );
+
+        instance.mark_failed("compute cap mismatch").await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+        assert_eq!(
+            instance.stats.read().await.last_error.as_deref(),
+            Some("compute cap mismatch")
+        );
+
+        instance.start("mock").await.unwrap();
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
+        assert!(instance.stats.read().await.last_error.is_none());
+        assert_eq!(instance.exit_status().await, None);
+    }
 
     #[tokio::test]
     async fn test_instance_creation() {

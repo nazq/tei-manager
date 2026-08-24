@@ -14,6 +14,25 @@ use axum::{
 use serde::Deserialize;
 
 /// GET /health - Manager health check
+/// Poll a freshly started instance until it is ready, marking it `Failed`
+/// (with the reason) if it exits or the startup timeout elapses.
+fn spawn_readiness_watch(instance: std::sync::Arc<crate::instance::TeiInstance>) {
+    use crate::config::DEFAULT_STARTUP_TIMEOUT_SECS;
+    use crate::health::GrpcHealthChecker;
+    use std::time::Duration;
+
+    tokio::spawn(async move {
+        let timeout = instance
+            .config
+            .startup_timeout(Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS));
+        if let Err(e) =
+            GrpcHealthChecker::wait_for_ready(&instance, timeout, Duration::from_millis(500)).await
+        {
+            instance.mark_failed(e.to_string()).await;
+        }
+    });
+}
+
 pub async fn health() -> (StatusCode, Json<HealthResponse>) {
     (
         StatusCode::OK,
@@ -89,28 +108,9 @@ pub async fn create_instance(
             message: e.to_string(),
         })?;
 
-    // Wait for instance to be ready (poll every 500ms, timeout after 5 minutes)
-    // This runs in background so API returns immediately with "starting" status
-    let instance_clone = instance.clone();
-    tokio::spawn(async move {
-        use crate::health::GrpcHealthChecker;
-        use std::time::Duration;
-
-        if let Err(e) = GrpcHealthChecker::wait_for_ready(
-            &instance_clone,
-            Duration::from_secs(300), // 5 minute timeout for model download
-            Duration::from_millis(500),
-        )
-        .await
-        {
-            tracing::error!(
-                instance = %instance_clone.config.name,
-                error = %e,
-                "Instance failed to become ready"
-            );
-            *instance_clone.status.write().await = crate::instance::InstanceStatus::Failed;
-        }
-    });
+    // Wait for instance to be ready in the background so the API returns
+    // immediately with "starting" status
+    spawn_readiness_watch(instance.clone());
 
     // Save state asynchronously
     let state_manager = state.state_manager.clone();
@@ -188,26 +188,7 @@ pub async fn start_instance(
         })?;
 
     // Wait for instance to be ready in background
-    let instance_clone = instance.clone();
-    tokio::spawn(async move {
-        use crate::health::GrpcHealthChecker;
-        use std::time::Duration;
-
-        if let Err(e) = GrpcHealthChecker::wait_for_ready(
-            &instance_clone,
-            Duration::from_secs(300),
-            Duration::from_millis(500),
-        )
-        .await
-        {
-            tracing::error!(
-                instance = %instance_clone.config.name,
-                error = %e,
-                "Instance failed to become ready"
-            );
-            *instance_clone.status.write().await = crate::instance::InstanceStatus::Failed;
-        }
-    });
+    spawn_readiness_watch(instance.clone());
 
     let info = InstanceInfo::from_instance(&instance).await;
 

@@ -3,14 +3,14 @@
 # ============================================================================
 #
 # Build arguments for variant selection:
-#   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"cpu-")
+#   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"120-"/"cpu-")
 #   TEI_VERSION       - TEI version (default: 1.9.2)
-#   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"cpu")
+#   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"blackwell"/"cpu")
 #   VARIANT_NAME      - Human-readable variant name for labels
 #   VARIANT_DESC      - Additional description for labels
 #
 # Usage:
-#   # Standard GPU (multi-arch, default)
+#   # Ampere sm_80 (A100/A30, default)
 #   docker build -t tei-manager:latest .
 #
 #   # CPU (for CI/testing, no GPU required)
@@ -36,6 +36,14 @@
 #     --build-arg VARIANT_NAME="Hopper" \
 #     --build-arg VARIANT_DESC=" for H100/H200 GPUs" \
 #     -t tei-manager:latest-hopper .
+#
+#   # Blackwell (RTX 5090/5080, sm_120)
+#   docker build \
+#     --build-arg TEI_VARIANT=120- \
+#     --build-arg VARIANT_SUFFIX=blackwell \
+#     --build-arg VARIANT_NAME="Blackwell" \
+#     --build-arg VARIANT_DESC=" - Optimized for RTX 5090/5080 (sm_120)" \
+#     -t tei-manager:latest-blackwell .
 #
 # ============================================================================
 

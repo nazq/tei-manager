@@ -122,6 +122,17 @@ impl GrpcHealthChecker {
                 return Ok(());
             }
 
+            // A process that has already exited will never become ready; fail fast
+            // instead of polling until the timeout.
+            if !instance.is_running().await {
+                let reason = exit_reason(instance, result.reason).await;
+                anyhow::bail!(
+                    "Instance '{}' exited during startup: {}",
+                    instance.config.name,
+                    reason
+                );
+            }
+
             tracing::debug!(
                 instance = %instance.config.name,
                 reason = ?result.reason,
@@ -134,12 +145,25 @@ impl GrpcHealthChecker {
     }
 }
 
+/// Best description of why a process is gone: its recorded exit status if the
+/// child has been reaped, otherwise whatever the last health probe reported.
+async fn exit_reason(instance: &TeiInstance, probe_reason: Option<String>) -> String {
+    match instance.exit_status().await {
+        Some(exit) => exit.to_string(),
+        None => probe_reason.unwrap_or_else(|| "process not running".to_string()),
+    }
+}
+
 #[async_trait]
 impl HealthChecker for GrpcHealthChecker {
     async fn check(&self, instance: &TeiInstance) -> HealthCheckResult {
-        // Check if process is running
+        // Check if process is running (this reaps an exited child)
         if !instance.is_running().await {
-            return HealthCheckResult::unhealthy("Process not running".to_string());
+            let reason = match instance.exit_status().await {
+                Some(exit) => exit.to_string(),
+                None => "process not running".to_string(),
+            };
+            return HealthCheckResult::unhealthy(reason);
         }
 
         // gRPC health check - call Info RPC to verify TEI is ready
@@ -258,6 +282,9 @@ impl HealthEventHandler for MetricsEventHandler {
 pub struct HealthMonitorConfig {
     pub check_interval: Duration,
     pub initial_delay: Duration,
+    /// How long an instance may stay in `Starting` before it is marked `Failed`.
+    /// A per-instance `startup_timeout_secs` overrides this.
+    pub startup_timeout: Duration,
     pub max_failures_before_restart: u32,
     pub auto_restart: bool,
 }
@@ -267,6 +294,7 @@ impl Default for HealthMonitorConfig {
         Self {
             check_interval: Duration::from_secs(30),
             initial_delay: Duration::from_secs(60),
+            startup_timeout: Duration::from_secs(crate::config::DEFAULT_STARTUP_TIMEOUT_SECS),
             max_failures_before_restart: 3,
             auto_restart: true,
         }
@@ -284,6 +312,7 @@ impl HealthMonitorConfig {
 pub struct HealthMonitorConfigBuilder {
     check_interval: Option<Duration>,
     initial_delay: Option<Duration>,
+    startup_timeout: Option<Duration>,
     max_failures_before_restart: Option<u32>,
     auto_restart: Option<bool>,
 }
@@ -296,6 +325,11 @@ impl HealthMonitorConfigBuilder {
 
     pub fn initial_delay(mut self, delay: Duration) -> Self {
         self.initial_delay = Some(delay);
+        self
+    }
+
+    pub fn startup_timeout(mut self, timeout: Duration) -> Self {
+        self.startup_timeout = Some(timeout);
         self
     }
 
@@ -314,6 +348,7 @@ impl HealthMonitorConfigBuilder {
         HealthMonitorConfig {
             check_interval: self.check_interval.unwrap_or(defaults.check_interval),
             initial_delay: self.initial_delay.unwrap_or(defaults.initial_delay),
+            startup_timeout: self.startup_timeout.unwrap_or(defaults.startup_timeout),
             max_failures_before_restart: self
                 .max_failures_before_restart
                 .unwrap_or(defaults.max_failures_before_restart),
@@ -338,17 +373,21 @@ pub struct HealthMonitor {
 
 impl HealthMonitor {
     /// Create a new health monitor with default implementations (backward compatible)
+    ///
+    /// The first check runs after one `check_interval`; instances that are still
+    /// loading are protected by `startup_timeout_secs`, not by delaying the monitor.
     pub fn new(
         registry: Arc<Registry>,
         check_interval_secs: u64,
-        initial_delay_secs: u64,
+        startup_timeout_secs: u64,
         max_failures_before_restart: u32,
         auto_restart: bool,
         tei_binary_path: String,
     ) -> Self {
         let config = HealthMonitorConfig {
             check_interval: Duration::from_secs(check_interval_secs),
-            initial_delay: Duration::from_secs(initial_delay_secs),
+            initial_delay: Duration::from_secs(check_interval_secs),
+            startup_timeout: Duration::from_secs(startup_timeout_secs),
             max_failures_before_restart,
             auto_restart,
         };
@@ -446,18 +485,48 @@ impl HealthMonitor {
             .await;
     }
 
+    /// Decide whether a Starting instance has definitively failed to start.
+    async fn startup_failure(&self, instance: &TeiInstance, reason: &str) -> Option<String> {
+        if !instance.is_running().await {
+            let reason = exit_reason(instance, Some(reason.to_string())).await;
+            return Some(format!("exited during startup: {reason}"));
+        }
+
+        let timeout = instance.config.startup_timeout(self.config.startup_timeout);
+        let started_at = instance.stats.read().await.started_at?;
+        let elapsed = (chrono::Utc::now() - started_at)
+            .to_std()
+            .unwrap_or_default();
+        (elapsed > timeout).then(|| {
+            format!(
+                "did not become ready within {}s (last check: {reason})",
+                timeout.as_secs()
+            )
+        })
+    }
+
     async fn handle_failure(&self, instance: &TeiInstance, reason: String) {
-        // Check if instance is still starting - don't count failures or restart during startup
-        // This prevents premature failure marking while the instance is loading model weights
+        // While an instance is Starting, failed checks are expected (model still loading)
+        // and are not counted. Two things end the grace period: the process exiting, or
+        // the startup timeout elapsing. Either marks the instance Failed with a reason.
         let current_status = *instance.status.read().await;
         if current_status == InstanceStatus::Starting {
-            tracing::debug!(
-                instance = %instance.config.name,
-                reason = %reason,
-                "Health check failed for starting instance - waiting for startup to complete"
-            );
-            // Don't increment failure count for starting instances
-            // The startup timeout (separate from health checks) handles this case
+            if let Some(failure) = self.startup_failure(instance, &reason).await {
+                instance.mark_failed(failure).await;
+                self.event_handler
+                    .handle(HealthEvent::StatusTransition {
+                        instance_name: instance.config.name.clone(),
+                        from: InstanceStatus::Starting,
+                        to: InstanceStatus::Failed,
+                    })
+                    .await;
+            } else {
+                tracing::debug!(
+                    instance = %instance.config.name,
+                    reason = %reason,
+                    "Health check failed for starting instance - waiting for startup to complete"
+                );
+            }
             return;
         }
 
@@ -503,7 +572,7 @@ impl HealthMonitor {
                         })
                         .await;
 
-                    *instance.status.write().await = InstanceStatus::Failed;
+                    instance.mark_failed(format!("restart failed: {e}")).await;
                 }
             }
         }
@@ -754,7 +823,8 @@ mod tests {
         );
 
         assert_eq!(monitor.config.check_interval.as_secs(), 30);
-        assert_eq!(monitor.config.initial_delay.as_secs(), 60);
+        assert_eq!(monitor.config.initial_delay.as_secs(), 30);
+        assert_eq!(monitor.config.startup_timeout.as_secs(), 60);
         assert_eq!(monitor.config.max_failures_before_restart, 3);
         assert!(monitor.config.auto_restart);
     }
@@ -770,6 +840,7 @@ mod tests {
         let config = HealthMonitorConfig::builder()
             .check_interval(Duration::from_secs(45))
             .initial_delay(Duration::from_secs(90))
+            .startup_timeout(Duration::from_secs(120))
             .max_failures_before_restart(5)
             .auto_restart(false)
             .build();
@@ -780,6 +851,7 @@ mod tests {
 
         assert_eq!(monitor.config.check_interval.as_secs(), 45);
         assert_eq!(monitor.config.initial_delay.as_secs(), 90);
+        assert_eq!(monitor.config.startup_timeout.as_secs(), 120);
         assert_eq!(monitor.config.max_failures_before_restart, 5);
         assert!(!monitor.config.auto_restart);
     }
@@ -1089,6 +1161,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_starting_instance_not_failed_by_health_checks() {
+        use crate::instance::mocks::MockProcessManager;
         use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
 
         let registry = Arc::new(Registry::new(
@@ -1109,10 +1182,13 @@ mod tests {
             ..Default::default()
         };
 
-        let instance = registry.add(config).await.unwrap();
-
-        // Set instance status to Starting (simulates a just-started instance)
-        *instance.status.write().await = InstanceStatus::Starting;
+        // A live (mock) process that has not become ready yet
+        let instance = Arc::new(TeiInstance::new_with_manager(
+            config,
+            Arc::new(MockProcessManager::new()),
+        ));
+        instance.start("mock").await.unwrap();
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
 
         let checker = Arc::new(MockHealthChecker::new());
         let restart = Arc::new(MockRestartStrategy::new());
@@ -1149,6 +1225,270 @@ mod tests {
             .has_event_type(|e| matches!(e, HealthEvent::CheckFailed { .. }))
             .await;
         assert!(!has_failed_events);
+
+        // Still starting: within the timeout and the process is alive
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
+        assert!(instance.stats.read().await.last_error.is_none());
+    }
+
+    /// Shared scaffolding for the startup-failure tests below
+    async fn starting_instance_with_mock(
+        name: &str,
+        startup_timeout_secs: Option<u64>,
+    ) -> (
+        Arc<TeiInstance>,
+        Arc<crate::instance::mocks::MockProcessManager>,
+    ) {
+        use crate::instance::mocks::MockProcessManager;
+
+        let manager = Arc::new(MockProcessManager::new());
+        let config = InstanceConfig {
+            name: name.to_string(),
+            model_id: "model".to_string(),
+            port: 8080,
+            max_batch_tokens: 1024,
+            max_concurrent_requests: 10,
+            startup_timeout_secs,
+            ..Default::default()
+        };
+        let instance = Arc::new(TeiInstance::new_with_manager(config, manager.clone()));
+        instance.start("mock").await.unwrap();
+        (instance, manager)
+    }
+
+    fn monitor_with(
+        checker: Arc<dyn HealthChecker>,
+        restart: Arc<dyn RestartStrategy>,
+        events: Arc<dyn HealthEventHandler>,
+        config: HealthMonitorConfig,
+    ) -> HealthMonitor {
+        let registry = Arc::new(Registry::new(None, "mock".to_string(), 8080, 8180));
+        HealthMonitor::builder(registry)
+            .config(config)
+            .health_checker(checker)
+            .restart_strategy(restart)
+            .event_handler(events)
+            .build("mock".to_string())
+    }
+
+    #[tokio::test]
+    async fn test_starting_instance_fails_when_process_exits() {
+        use crate::instance::ProcessExit;
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, manager) = starting_instance_with_mock("exits", None).await;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        let restart = Arc::new(MockRestartStrategy::new());
+        let events = Arc::new(RecordingEventHandler::new());
+        let monitor = monitor_with(
+            checker.clone(),
+            restart.clone(),
+            events.clone(),
+            HealthMonitorConfig::default(),
+        );
+
+        // Alive but not ready: stays Starting
+        checker.set_unhealthy("gRPC connect failed".to_string());
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
+
+        // Process dies (e.g. compute-cap mismatch): must flip to Failed immediately
+        manager
+            .exit_all(ProcessExit {
+                code: Some(1),
+                signal: None,
+                last_log_error: Some("Runtime compute cap 120 is not compatible".to_string()),
+            })
+            .await;
+        checker.set_unhealthy("process exited with code 1".to_string());
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+        let err = instance.stats.read().await.last_error.clone().unwrap();
+        assert!(err.contains("exited during startup"), "{err}");
+        assert!(err.contains("process exited with code 1"), "{err}");
+
+        // Exactly one Starting -> Failed transition, no restart during startup
+        assert_eq!(restart.restart_count(), 0);
+        let transitions = events
+            .has_event_type(|e| {
+                matches!(
+                    e,
+                    HealthEvent::StatusTransition {
+                        from: InstanceStatus::Starting,
+                        to: InstanceStatus::Failed,
+                        ..
+                    }
+                )
+            })
+            .await;
+        assert!(transitions);
+    }
+
+    #[tokio::test]
+    async fn test_starting_instance_fails_after_startup_timeout() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, _manager) = starting_instance_with_mock("slow", None).await;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        checker.set_unhealthy("gRPC connect failed".to_string());
+        let monitor = monitor_with(
+            checker,
+            Arc::new(MockRestartStrategy::new()),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::builder()
+                .startup_timeout(Duration::from_secs(300))
+                .build(),
+        );
+
+        // Within the timeout: still Starting
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
+
+        // Pretend it started long ago
+        instance.stats.write().await.started_at =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(301));
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+        let err = instance.stats.read().await.last_error.clone().unwrap();
+        assert!(err.contains("did not become ready within 300s"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_per_instance_startup_timeout_overrides_global() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        // Instance allows 1000s even though the monitor default is 300s
+        let (instance, _manager) = starting_instance_with_mock("big-model", Some(1000)).await;
+        let checker = Arc::new(MockHealthChecker::new());
+        checker.set_unhealthy("gRPC connect failed".to_string());
+        let monitor = monitor_with(
+            checker,
+            Arc::new(MockRestartStrategy::new()),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::builder()
+                .startup_timeout(Duration::from_secs(300))
+                .build(),
+        );
+
+        instance.stats.write().await.started_at =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(600));
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
+
+        instance.stats.write().await.started_at =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1001));
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_ready_bails_when_process_exits() {
+        use crate::instance::ProcessExit;
+
+        let (instance, manager) = starting_instance_with_mock("dead", None).await;
+        manager
+            .exit_all(ProcessExit {
+                code: Some(2),
+                signal: None,
+                last_log_error: None,
+            })
+            .await;
+
+        // Would wait 60s if it only honoured the timeout; must return promptly
+        let start = std::time::Instant::now();
+        let err = GrpcHealthChecker::wait_for_ready(
+            &instance,
+            Duration::from_secs(60),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(err.to_string().contains("exited during startup"), "{err}");
+        assert!(
+            err.to_string().contains("process exited with code 2"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_restart_records_reason() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, _manager) = starting_instance_with_mock("restart-fails", None).await;
+        *instance.status.write().await = InstanceStatus::Running;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        checker.set_unhealthy("Info RPC failed".to_string());
+        let restart = Arc::new(MockRestartStrategy::new());
+        restart.set_should_fail(true);
+        let monitor = monitor_with(
+            checker,
+            restart.clone(),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::builder()
+                .max_failures_before_restart(2)
+                .auto_restart(true)
+                .build(),
+        );
+
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Running);
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(restart.restart_count(), 1);
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+        let err = instance.stats.read().await.last_error.clone().unwrap();
+        assert!(err.contains("restart failed: Mock restart failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_ready_times_out_while_process_alive() {
+        // Mock process stays alive but nothing listens on the port, so the
+        // gRPC probe keeps failing until the timeout.
+        let (instance, _manager) = starting_instance_with_mock("never-ready", None).await;
+
+        let err = GrpcHealthChecker::wait_for_ready(
+            &instance,
+            Duration::from_millis(300),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("did not become ready within"),
+            "{err}"
+        );
+        assert!(instance.is_running().await);
+        // wait_for_ready reports; the caller decides how to mark the instance
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
+    }
+
+    #[tokio::test]
+    async fn test_restart_puts_instance_back_into_starting_with_fresh_error() {
+        use crate::instance::ProcessExit;
+
+        let (instance, manager) = starting_instance_with_mock("cycle", None).await;
+        manager
+            .exit_all(ProcessExit {
+                code: Some(1),
+                signal: None,
+                last_log_error: None,
+            })
+            .await;
+        instance.mark_failed("boom").await;
+        assert!(instance.stats.read().await.last_error.is_some());
+
+        instance.restart("mock").await.unwrap();
+        assert_eq!(*instance.status.read().await, InstanceStatus::Starting);
+        assert!(instance.stats.read().await.last_error.is_none());
+        assert!(instance.is_running().await);
     }
 
     #[tokio::test]

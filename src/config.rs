@@ -25,13 +25,15 @@ pub struct ManagerConfig {
     pub health_check_interval_secs: u64,
 
     /// Maximum time to wait for an instance to become ready after starting (default: 300 = 5 min)
-    /// If instance is still in "Starting" state after this timeout, it's considered hung.
-    /// Set high enough for large models to download and load into VRAM.
+    /// If instance is still in "Starting" state after this timeout, it's considered hung and
+    /// marked "Failed". Set high enough for large models to download and load into VRAM.
+    /// Individual instances can override this with their own `startup_timeout_secs`.
     ///
     /// **Interaction with health checks**: Health check failures are NOT counted while an
-    /// instance is in "Starting" status. The startup timeout is the only mechanism that
-    /// can fail a starting instance. Health check-triggered restarts only apply to
-    /// instances that have reached "Running" status.
+    /// instance is in "Starting" status. A starting instance fails only when this timeout
+    /// elapses or its process exits; either way the reason is recorded in the instance's
+    /// `last_error`. Health check-triggered restarts only apply to instances that have
+    /// reached "Running" status.
     pub startup_timeout_secs: u64,
 
     /// Number of consecutive health check failures before restarting a running instance (default: 3)
@@ -370,6 +372,15 @@ pub struct InstanceConfig {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl InstanceConfig {
+    /// Effective startup timeout: the per-instance override, else `default`
+    pub fn startup_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        self.startup_timeout_secs
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(default)
+    }
+}
+
 /// Authentication configuration
 ///
 /// Configure authentication providers for both HTTP API and gRPC servers.
@@ -461,8 +472,12 @@ fn default_state_file() -> PathBuf {
 fn default_health_check_interval() -> u64 {
     10
 }
+/// Default time an instance may spend in `Starting` before it is marked `Failed`.
+/// 5 minutes - enough for large model downloads.
+pub const DEFAULT_STARTUP_TIMEOUT_SECS: u64 = 300;
+
 fn default_startup_timeout() -> u64 {
-    300 // 5 minutes - enough for large model downloads
+    DEFAULT_STARTUP_TIMEOUT_SECS
 }
 fn default_max_failures_before_restart() -> u32 {
     3

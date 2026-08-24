@@ -62,6 +62,9 @@ pub struct InstanceInfo {
     pub last_health_check: Option<chrono::DateTime<chrono::Utc>>,
     pub gpu_id: Option<u32>,
     pub prometheus_port: Option<u16>,
+    /// Why the instance last entered `failed` (process exit, startup timeout, ...)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 impl InstanceInfo {
@@ -88,6 +91,7 @@ impl InstanceInfo {
             last_health_check: stats.last_health_check,
             gpu_id: instance.config.gpu_id,
             prometheus_port: instance.config.prometheus_port,
+            last_error: stats.last_error.clone(),
         }
     }
 }

@@ -90,10 +90,11 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 
 | Variant | Tag suffix | Base Image | Target |
 |---------|-----------|------------|--------|
-| Multi-arch | *(none)* | `text-embeddings-inference:{tei}-grpc` | Auto-detect GPU |
+| Ampere | *(none)* | `text-embeddings-inference:{tei}-grpc` | Ampere sm_80 (A100, A30) — **not** a universal image |
 | CPU | `-cpu` | `text-embeddings-inference:cpu-{tei}-grpc` | No GPU required |
 | Ada | `-ada` | `text-embeddings-inference:89-{tei}-grpc` | RTX 40xx, L4, L40, L40S |
 | Hopper | `-hopper` | `text-embeddings-inference:hopper-{tei}-grpc` | H100, H200 |
+| Blackwell | `-blackwell` | `text-embeddings-inference:120-{tei}-grpc` | RTX 50xx (5090, 5080) |
 
 ---
 
@@ -103,10 +104,11 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 
 ```bash
 # Pull the image for your GPU architecture (replace <version> from latest release)
-docker pull ghcr.io/nazq/tei-manager:<version>        # Multi-arch (auto-detect)
+docker pull ghcr.io/nazq/tei-manager:<version>        # Ampere sm_80 (A100, A30)
 docker pull ghcr.io/nazq/tei-manager:<version>-cpu     # CPU-only (no GPU)
 docker pull ghcr.io/nazq/tei-manager:<version>-ada     # Ada (RTX 40xx, L4, L40, L40S)
 docker pull ghcr.io/nazq/tei-manager:<version>-hopper  # Hopper (H100, H200)
+docker pull ghcr.io/nazq/tei-manager:<version>-blackwell  # Blackwell (RTX 5090, 5080)
 
 # Run with GPU support
 docker run -d --gpus all \

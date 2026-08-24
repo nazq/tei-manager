@@ -5,6 +5,19 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0](https://github.com/nazq/tei-manager/compare/v0.12.0...v0.13.0) (2026-08-24)
+
+
+### Features
+
+* add Blackwell (sm_120) Docker variant for RTX 50xx GPUs ([#76](https://github.com/nazq/tei-manager/issues/76)) ([7cae747](https://github.com/nazq/tei-manager/commit/7cae7476a865df9b0a92a991f70a713907cbad1c))
+
+
+### Bug Fixes
+
+* **ci:** trigger CI on release-please branch pushes ([#51](https://github.com/nazq/tei-manager/issues/51)) ([e6d59d6](https://github.com/nazq/tei-manager/commit/e6d59d654e05effee3343eab88ce930ee4483d46))
+* detect TEI process exit and enforce startup timeout instead of reporting 'starting' forever ([#77](https://github.com/nazq/tei-manager/issues/77)) ([774692b](https://github.com/nazq/tei-manager/commit/774692b5ed085f6421e36df88e1101444002f344))
+
 ## [0.12.0](https://github.com/nazq/tei-manager/compare/v0.11.0...v0.12.0) (2026-03-04)
 
 

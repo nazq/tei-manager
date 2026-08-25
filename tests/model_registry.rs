@@ -69,7 +69,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
     };
 
     let app = create_router(state);
-    let server = TestServer::new(app).expect("Failed to create test server");
+    let server = TestServer::new(app);
 
     (server, temp_dir)
 }
@@ -344,7 +344,7 @@ async fn test_downloading_state_visible() {
     };
 
     let app = create_router(state);
-    let server = TestServer::new(app).expect("Failed to create test server");
+    let server = TestServer::new(app);
 
     // Add the model first
     let add_req = json!({ "model_id": LARGER_MODEL });
@@ -418,7 +418,7 @@ async fn test_concurrent_download_rejected() {
     };
 
     let app = create_router(state);
-    let server = TestServer::new(app).expect("Failed to create test server");
+    let server = TestServer::new(app);
 
     // Add the model (this will be status: Available since it's not in cache)
     let add_req = json!({ "model_id": MODEL });

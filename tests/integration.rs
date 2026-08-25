@@ -80,7 +80,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
     };
 
     let app = create_router(state);
-    let server = TestServer::new(app).expect("Failed to create test server");
+    let server = TestServer::new(app);
 
     (server, temp_dir)
 }
@@ -464,7 +464,7 @@ async fn test_max_instances_limit() {
     };
 
     let app = create_router(state);
-    let server = TestServer::new(app).expect("Failed to create test server");
+    let server = TestServer::new(app);
 
     // Create 2 instances (should succeed)
     for i in 1..=2 {

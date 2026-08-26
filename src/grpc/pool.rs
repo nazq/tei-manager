@@ -274,19 +274,44 @@ impl BackendPool {
         // Note: We don't check instance status here - if the TEI server is ready,
         // we can route to it. The connection attempt below will fail naturally if not ready.
 
-        // Build endpoint with optimized settings from TEI patterns
-        let endpoint = Endpoint::from_shared(format!("http://127.0.0.1:{}", instance.config.port))
-            .map_err(|e| Status::internal(format!("Invalid endpoint: {}", e)))?
-            .tcp_keepalive(Some(Duration::from_secs(60)))
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .keep_alive_timeout(Duration::from_secs(10))
-            .connect_timeout(Duration::from_secs(5));
+        // EXPERIMENT knobs (env): TEI_MUX_H2_WINDOW (bytes), TEI_MUX_CHANNELS (n)
+        let window: Option<u32> = std::env::var("TEI_MUX_H2_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let n_channels: usize = std::env::var("TEI_MUX_CHANNELS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .max(1);
 
-        // Establish connection
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| Status::unavailable(format!("Failed to connect to backend: {}", e)))?;
+        let mut endpoint =
+            Endpoint::from_shared(format!("http://127.0.0.1:{}", instance.config.port))
+                .map_err(|e| Status::internal(format!("Invalid endpoint: {}", e)))?
+                .tcp_keepalive(Some(Duration::from_secs(60)))
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .keep_alive_timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5));
+        if let Some(w) = window {
+            endpoint = endpoint
+                .initial_stream_window_size(Some(w))
+                .initial_connection_window_size(Some(w));
+        }
+        tracing::info!(window = ?window, channels = n_channels, "EXPERIMENT backend transport");
+
+        // Establish connection(s)
+        let channel =
+            if n_channels == 1 {
+                endpoint.connect().await.map_err(|e| {
+                    Status::unavailable(format!("Failed to connect to backend: {}", e))
+                })?
+            } else {
+                // Probe once so a dead backend still surfaces as Unavailable
+                endpoint.connect().await.map_err(|e| {
+                    Status::unavailable(format!("Failed to connect to backend: {}", e))
+                })?;
+                let endpoints = (0..n_channels).map(|_| endpoint.clone());
+                Channel::balance_list(endpoints)
+            };
 
         // Create all clients (they share the channel internally via HTTP/2 multiplexing)
         let clients = BackendClients {

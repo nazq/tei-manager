@@ -36,6 +36,16 @@ where
 
     // Build server with optional TLS
     let mut builder = Server::builder();
+    // EXPERIMENT knob (env): TEI_MUX_SERVER_H2_WINDOW (bytes)
+    if let Some(w) = std::env::var("TEI_MUX_SERVER_H2_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        tracing::info!(window = w, "EXPERIMENT server h2 window");
+        builder = builder
+            .initial_stream_window_size(Some(w))
+            .initial_connection_window_size(Some(w));
+    }
 
     if let Some((cert_pem, key_pem, ca_pem)) = tls_config {
         tracing::info!(
@@ -94,6 +104,16 @@ pub async fn start_grpc_server(
 
     // Build server with optional TLS
     let mut builder = Server::builder();
+    // EXPERIMENT knob (env): TEI_MUX_SERVER_H2_WINDOW (bytes)
+    if let Some(w) = std::env::var("TEI_MUX_SERVER_H2_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        tracing::info!(window = w, "EXPERIMENT server h2 window");
+        builder = builder
+            .initial_stream_window_size(Some(w))
+            .initial_connection_window_size(Some(w));
+    }
 
     if let Some((cert_pem, key_pem, ca_pem)) = tls_config {
         tracing::info!(

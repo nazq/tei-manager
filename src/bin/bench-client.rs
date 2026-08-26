@@ -75,6 +75,14 @@ struct Args {
     /// Max message size in MB (default: 100, Arrow mode only)
     #[clap(long, default_value = "100")]
     max_message_size_mb: usize,
+
+    /// Outstanding Arrow requests in flight (Arrow mode only)
+    #[clap(long, default_value = "1")]
+    concurrency: usize,
+
+    /// Pad each generated text to roughly this many words (0 = templates as-is)
+    #[clap(long, default_value = "0")]
+    text_words: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -145,7 +153,7 @@ async fn build_channel(args: &Args) -> Result<Channel> {
         .context("Failed to connect to endpoint")
 }
 
-fn generate_test_texts(count: usize) -> Vec<String> {
+fn generate_test_texts(count: usize, text_words: usize) -> Vec<String> {
     let templates = vec![
         "The quick brown fox jumps over the lazy dog",
         "Machine learning models can process natural language efficiently",
@@ -165,6 +173,15 @@ fn generate_test_texts(count: usize) -> Vec<String> {
             let mut text = format!("{} - sample {}", base, i + 1);
             if i % 3 == 0 {
                 text.push_str(" with additional context for testing variable length inputs");
+            }
+            let mut words = text.split_whitespace().count();
+            let mut k = 0;
+            while words < text_words {
+                let filler = &templates[(i + k) % templates.len()];
+                text.push(' ');
+                text.push_str(filler);
+                words += filler.split_whitespace().count();
+                k += 1;
             }
             text
         })
@@ -280,94 +297,38 @@ async fn embed_text_standard(
 // =============================================================================
 
 async fn benchmark_arrow(
-    mut client: TeiMultiplexerClient<Channel>,
+    client: TeiMultiplexerClient<Channel>,
     instance_name: String,
     texts: Vec<String>,
     batch_size: usize,
     noop: bool,
+    concurrency: usize,
 ) -> Result<BenchmarkResult> {
     let total_texts = texts.len();
     let start = Instant::now();
 
-    let mut successful = 0;
-    let mut failed = 0;
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+    let mut tasks = Vec::new();
     let mut num_requests = 0;
 
     for (batch_idx, chunk) in texts.chunks(batch_size).enumerate() {
         num_requests += 1;
+        let permit = semaphore.clone().acquire_owned().await?;
+        let mut client = client.clone();
+        let instance_name = instance_name.clone();
+        let chunk: Vec<String> = chunk.to_vec();
+        tasks.push(tokio::spawn(async move {
+            let _permit = permit;
+            embed_arrow_batch(&mut client, instance_name, &chunk, batch_idx, noop).await
+        }));
+    }
 
-        // Create Arrow RecordBatch with text column
-        let text_array = StringArray::from(chunk.to_vec());
-        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(text_array) as ArrayRef])?;
-
-        // Serialize to Arrow IPC with LZ4 compression
-        let mut arrow_ipc = Vec::new();
-        {
-            use arrow::ipc::CompressionType;
-            use arrow::ipc::writer::IpcWriteOptions;
-
-            let write_options = IpcWriteOptions::default()
-                .try_with_compression(Some(CompressionType::LZ4_FRAME))?;
-
-            let mut writer =
-                StreamWriter::try_new_with_options(&mut arrow_ipc, &schema, write_options)?;
-            writer.write(&batch)?;
-            writer.finish()?;
-        }
-
-        // Send gRPC request
-        let request = EmbedArrowRequest {
-            target: Some(Target {
-                routing: Some(
-                    tei_manager::grpc::proto::multiplexer::v1::target::Routing::InstanceName(
-                        instance_name.clone(),
-                    ),
-                ),
-            }),
-            arrow_ipc,
-            truncate: true,
-            normalize: true,
-            noop,
-            ..Default::default()
-        };
-
-        match client.embed_arrow(request).await {
-            Ok(response) => {
-                let response_ipc = response.into_inner().arrow_ipc;
-
-                // Verify response
-                let cursor = Cursor::new(response_ipc);
-                let mut reader = StreamReader::try_new(cursor, None)?;
-
-                if let Some(result_batch) = reader.next() {
-                    let result_batch = result_batch?;
-                    // Column 1 is the per-row `error` column: null = success
-                    let errors = result_batch
-                        .columns()
-                        .get(1)
-                        .map(|c| c.len() - c.null_count())
-                        .unwrap_or(0);
-                    successful += result_batch.num_rows() - errors;
-                    failed += errors;
-                } else {
-                    failed += chunk.len();
-                }
-            }
-            Err(e) => {
-                eprintln!("Batch {} failed: {}", batch_idx, e);
-                failed += chunk.len();
-            }
-        }
-
-        // Progress indicator
-        if (batch_idx + 1) % 10 == 0 {
-            eprintln!(
-                "Progress: {} batches, {} texts processed",
-                batch_idx + 1,
-                successful + failed
-            );
-        }
+    let mut successful = 0;
+    let mut failed = 0;
+    for task in tasks {
+        let (ok, bad) = task.await??;
+        successful += ok;
+        failed += bad;
     }
 
     let duration = start.elapsed();
@@ -387,6 +348,74 @@ async fn benchmark_arrow(
     })
 }
 
+/// Embed one Arrow batch; returns (successful rows, failed rows)
+async fn embed_arrow_batch(
+    client: &mut TeiMultiplexerClient<Channel>,
+    instance_name: String,
+    chunk: &[String],
+    batch_idx: usize,
+    noop: bool,
+) -> Result<(usize, usize)> {
+    // Create Arrow RecordBatch with text column
+    let text_array = StringArray::from(chunk.to_vec());
+    let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(text_array) as ArrayRef])?;
+
+    // Serialize to Arrow IPC with LZ4 compression
+    let mut arrow_ipc = Vec::new();
+    {
+        use arrow::ipc::CompressionType;
+        use arrow::ipc::writer::IpcWriteOptions;
+
+        let write_options =
+            IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME))?;
+
+        let mut writer =
+            StreamWriter::try_new_with_options(&mut arrow_ipc, &schema, write_options)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+    }
+
+    let request = EmbedArrowRequest {
+        target: Some(Target {
+            routing: Some(
+                tei_manager::grpc::proto::multiplexer::v1::target::Routing::InstanceName(
+                    instance_name,
+                ),
+            ),
+        }),
+        arrow_ipc,
+        truncate: true,
+        normalize: true,
+        noop,
+        ..Default::default()
+    };
+
+    match client.embed_arrow(request).await {
+        Ok(response) => {
+            let response_ipc = response.into_inner().arrow_ipc;
+            let cursor = Cursor::new(response_ipc);
+            let mut reader = StreamReader::try_new(cursor, None)?;
+            if let Some(result_batch) = reader.next() {
+                let result_batch = result_batch?;
+                // Column 1 is the per-row `error` column: null = success
+                let errors = result_batch
+                    .columns()
+                    .get(1)
+                    .map(|c| c.len() - c.null_count())
+                    .unwrap_or(0);
+                Ok((result_batch.num_rows() - errors, errors))
+            } else {
+                Ok((0, chunk.len()))
+            }
+        }
+        Err(e) => {
+            eprintln!("Batch {} failed: {}", batch_idx, e);
+            Ok((0, chunk.len()))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -396,7 +425,7 @@ async fn main() -> Result<()> {
 
     // Generate test texts
     eprintln!("Generating {} test texts...", args.num_texts);
-    let texts = generate_test_texts(args.num_texts);
+    let texts = generate_test_texts(args.num_texts, args.text_words);
 
     // Run benchmark based on mode
     let result = match args.mode {
@@ -427,6 +456,7 @@ async fn main() -> Result<()> {
                 texts,
                 args.batch_size,
                 args.noop,
+                args.concurrency,
             )
             .await?
         }

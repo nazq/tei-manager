@@ -5,6 +5,13 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0](https://github.com/nazq/tei-manager/compare/v0.14.0...v0.15.0) (2026-08-26)
+
+
+### Features
+
+* vast.ai readiness — auto max_batch_tokens, f16 Arrow output, GPU preflight ([#81](https://github.com/nazq/tei-manager/issues/81)) ([799f37d](https://github.com/nazq/tei-manager/commit/799f37d0badf77d0afb836e5f84cfd3f29b562b0))
+
 ## [0.14.0](https://github.com/nazq/tei-manager/compare/v0.13.0...v0.14.0) (2026-08-26)
 
 

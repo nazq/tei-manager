@@ -498,19 +498,19 @@ mod tests {
 
     #[test]
     fn test_generate_test_texts_count() {
-        let texts = generate_test_texts(100);
+        let texts = generate_test_texts(100, 0);
         assert_eq!(texts.len(), 100);
     }
 
     #[test]
     fn test_generate_test_texts_empty() {
-        let texts = generate_test_texts(0);
+        let texts = generate_test_texts(0, 0);
         assert!(texts.is_empty());
     }
 
     #[test]
     fn test_generate_test_texts_content_variety() {
-        let texts = generate_test_texts(30);
+        let texts = generate_test_texts(30, 0);
 
         // Check that texts contain expected patterns
         assert!(texts.iter().any(|t| t.contains("quick brown fox")));
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_generate_test_texts_sample_numbers() {
-        let texts = generate_test_texts(5);
+        let texts = generate_test_texts(5, 0);
 
         assert!(texts[0].contains("sample 1"));
         assert!(texts[1].contains("sample 2"));

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use arrow::array::{ArrayRef, StringArray};
+use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -329,6 +329,7 @@ async fn benchmark_arrow(
             truncate: true,
             normalize: true,
             noop,
+            ..Default::default()
         };
 
         match client.embed_arrow(request).await {
@@ -341,7 +342,14 @@ async fn benchmark_arrow(
 
                 if let Some(result_batch) = reader.next() {
                     let result_batch = result_batch?;
-                    successful += result_batch.num_rows();
+                    // Column 1 is the per-row `error` column: null = success
+                    let errors = result_batch
+                        .columns()
+                        .get(1)
+                        .map(|c| c.len() - c.null_count())
+                        .unwrap_or(0);
+                    successful += result_batch.num_rows() - errors;
+                    failed += errors;
                 } else {
                     failed += chunk.len();
                 }

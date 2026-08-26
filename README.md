@@ -71,7 +71,7 @@ flowchart LR
 - **Model Registry** - Track, download, and verify HuggingFace models before deployment
 - **Multi-GPU Support** - Pin instances to specific GPUs or share across all available GPUs
 - **gRPC Multiplexer** - Unified streaming gRPC endpoint for routing requests to multiple instances
-- **Arrow Batch Embeddings** - High-throughput batch embedding via Arrow IPC with LZ4 compression
+- **Arrow Batch Embeddings** - High-throughput batch embedding via Arrow IPC with per-row error reporting
 - **Rust Benchmark Client** - Built-in gRPC client for benchmarking and integration examples
 - **State Persistence** - Automatic state saving with atomic writes and crash recovery
 - **Health Monitoring** - Continuous health checks with configurable auto-restart on failure
@@ -173,7 +173,7 @@ The gRPC multiplexer provides a unified endpoint for routing embedding requests 
 
 ### Arrow Batch Embeddings
 
-The `EmbedArrow` and `EmbedSparseArrow` endpoints enable high-throughput batch processing using Apache Arrow IPC format with LZ4 compression:
+The `EmbedArrow` and `EmbedSparseArrow` endpoints enable high-throughput batch processing using Apache Arrow IPC format:
 
 ```bash
 # Dense embeddings via Arrow IPC
@@ -192,12 +192,16 @@ grpcurl -plaintext -d '{
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparseArrow
 ```
 
+**Request:** the first column of the first RecordBatch is the text (`Utf8`, `LargeUtf8` or `Utf8View`). Optional fields: `truncation_direction`, `prompt_name`, `dimensions` (dense only, Matryoshka truncation) and `compression` for the *response* (`ARROW_COMPRESSION_NONE` default — vectors don't compress; `ARROW_COMPRESSION_LZ4` available).
+
+**Response:** exactly one row per input row, in input order, with two columns:
+- Dense: `embeddings` — `FixedSizeList<Float32>[dim]`, nullable; Sparse: `sparse_embeddings` — `List<Struct<index:u32, value:f32>>`, nullable
+- `error` — `Utf8`, nullable. Set (and the vector null) for rows the backend rejected (empty input, too long without `truncate`, null text). Backend failures such as a dead instance fail the whole call instead.
+
 **Benefits:**
-- Process thousands of texts in a single request
-- LZ4 compression reduces network overhead
-- Efficient memory layout for batch processing
-- Dense: Returns embeddings as Arrow `FixedSizeList<Float32>` for zero-copy access
-- Sparse: Returns embeddings as Arrow `List<Struct<index:u32, value:f32>>` for variable-length sparse vectors
+- Process thousands of texts in a single request; keep 2–4 requests in flight per instance to keep the GPU queue full
+- Skip-and-record per row: one bad document no longer fails the batch
+- Dense: zero-copy access to a contiguous `Float32` buffer
 
 ---
 
@@ -252,7 +256,7 @@ bench-client -e https://localhost:9001 -i bge-small \
 
 The bench-client source (`src/bin/bench-client.rs`) demonstrates:
 - Connecting to the gRPC multiplexer with/without TLS
-- Creating Arrow IPC batches with LZ4 compression
+- Creating Arrow IPC batches (LZ4-compressed on the text side)
 - Sending `EmbedArrow` requests and parsing responses
 - Concurrent request handling with Tokio
 

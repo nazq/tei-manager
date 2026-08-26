@@ -5,6 +5,13 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0](https://github.com/nazq/tei-manager/compare/v0.13.0...v0.14.0) (2026-08-26)
+
+
+### Features
+
+* **grpc:** per-row errors, request options and quiet TEI logs for Arrow batches ([#79](https://github.com/nazq/tei-manager/issues/79)) ([380db19](https://github.com/nazq/tei-manager/commit/380db19b7107fd055edbc7fdae6bb8f2d7ef3411))
+
 ## [0.13.0](https://github.com/nazq/tei-manager/compare/v0.12.0...v0.13.0) (2026-08-24)
 
 

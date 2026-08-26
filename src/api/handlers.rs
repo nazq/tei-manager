@@ -90,6 +90,7 @@ pub async fn create_instance(
         prometheus_port: req.prometheus_port,
         startup_timeout_secs: req.startup_timeout_secs,
         extra_args: req.extra_args.unwrap_or_default(),
+        log_level: req.log_level,
         created_at: Some(chrono::Utc::now()),
     };
 

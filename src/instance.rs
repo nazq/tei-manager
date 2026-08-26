@@ -28,6 +28,8 @@ pub struct SpawnConfig {
     pub gpu_id: Option<u32>,
     pub prometheus_port: Option<u16>,
     pub extra_args: Vec<String>,
+    /// `RUST_LOG` filter for the child process
+    pub log_level: String,
 }
 
 /// Opaque handle to a spawned process
@@ -193,6 +195,10 @@ impl Default for SystemProcessManager {
 impl ProcessManager for SystemProcessManager {
     async fn spawn(&self, config: SpawnConfig) -> Result<ProcessHandle> {
         let mut cmd = Command::new(&config.binary_path);
+
+        // TEI logs every embedded input at info level; keep the child quiet
+        // unless the instance asks for more.
+        cmd.env("RUST_LOG", &config.log_level);
 
         // Set GPU assignment if specified
         if let Some(gpu_id) = config.gpu_id {
@@ -423,6 +429,7 @@ impl TeiInstance {
             gpu_id: self.config.gpu_id,
             prometheus_port: self.config.prometheus_port,
             extra_args: self.config.extra_args.clone(),
+            log_level: self.config.log_level().to_string(),
         };
 
         let handle = self.process_manager.spawn(spawn_config).await?;
@@ -733,6 +740,54 @@ mod tests {
     /// reported as not running, with its exit code captured.
     #[cfg(unix)]
     #[tokio::test]
+    async fn test_system_manager_sets_child_rust_log() {
+        // A stand-in "router" that records its RUST_LOG next to itself
+        let dir =
+            std::env::temp_dir().join(format!("tei-manager-rust-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-router.sh");
+        let out = dir.join("out.txt");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"rust_log=$RUST_LOG\" > '{}'\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let manager = SystemProcessManager::new();
+        let handle = manager
+            .spawn(SpawnConfig {
+                instance_name: "rust-log-test".to_string(),
+                binary_path: script.to_string_lossy().to_string(),
+                model_id: "m".to_string(),
+                port: 1,
+                max_batch_tokens: 1,
+                max_concurrent_requests: 1,
+                pooling: None,
+                gpu_id: None,
+                prometheus_port: None,
+                extra_args: vec![],
+                log_level: "text_embeddings_router=debug".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while manager.is_running(&handle).await && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let recorded = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(recorded.trim(), "rust_log=text_embeddings_router=debug");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn test_system_manager_reaps_exited_child() {
         let manager = SystemProcessManager::new();
         let handle = manager
@@ -747,6 +802,7 @@ mod tests {
                 gpu_id: None,
                 prometheus_port: None,
                 extra_args: vec![],
+                log_level: "warn".to_string(),
             })
             .await
             .unwrap();

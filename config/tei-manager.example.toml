@@ -135,6 +135,7 @@ max_concurrent_requests = 512  # Higher values use more memory
 # prometheus_port = 9100       # Optional: Prometheus port (auto-assigned if omitted, 0 to disable)
 # startup_timeout_secs = 600   # Optional: override global startup timeout for large models
 # extra_args = ["--dtype", "float16", "--revision", "main"]  # Optional: extra CLI args
+# log_level = "info"           # Optional: RUST_LOG for the TEI process (default "warn"; "info" logs every request)
 
 [[instances]]
 name = "all-mpnet"

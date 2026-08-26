@@ -106,16 +106,32 @@ message DecodeRequest {
 }
 
 // Arrow batch embedding - Send RecordBatch with text column, receive RecordBatch with embeddings
+// Compression applied to the Arrow IPC payload in the *response*.
+// Dense/sparse vectors are effectively incompressible, so NONE (the default)
+// is the fastest choice; LZ4 remains available for text-heavy payloads.
+enum ArrowCompression {
+    ARROW_COMPRESSION_NONE = 0;
+    ARROW_COMPRESSION_LZ4 = 1;
+}
+
 message EmbedArrowRequest {
     Target target = 1;
     bytes arrow_ipc = 2;  // Arrow IPC RecordBatch with "text" column
     bool truncate = 3;
     bool normalize = 4;
     bool noop = 5;  // If true, return dummy embeddings for round-trip testing
+    tei.v1.TruncationDirection truncation_direction = 6;
+    optional string prompt_name = 7;   // Prompt/instruction prefix configured on the model
+    optional uint32 dimensions = 8;    // Matryoshka truncation of the output vector
+    ArrowCompression compression = 9;  // Response IPC compression (default NONE)
 }
 
+// Response RecordBatch has exactly one row per input row, in input order:
+//   embeddings: FixedSizeList<Float32>[dim], nullable — null when the row failed
+//   error:      Utf8, nullable — the failure reason for that row, else null
+// A null input text is reported as a per-row error rather than dropped.
 message EmbedArrowResponse {
-    bytes arrow_ipc = 1;  // Arrow IPC RecordBatch with "embeddings" FixedSizeList column
+    bytes arrow_ipc = 1;  // Arrow IPC RecordBatch with "embeddings" and "error" columns
 }
 
 // Arrow sparse batch embedding - variable-length sparse vectors
@@ -124,8 +140,14 @@ message EmbedSparseArrowRequest {
     bytes arrow_ipc = 2;  // Arrow IPC RecordBatch with "text" column
     bool truncate = 3;
     bool noop = 4;  // If true, return dummy sparse embeddings for round-trip testing
+    tei.v1.TruncationDirection truncation_direction = 5;
+    optional string prompt_name = 6;   // Prompt/instruction prefix configured on the model
+    ArrowCompression compression = 7;  // Response IPC compression (default NONE)
 }
 
 message EmbedSparseArrowResponse {
-    bytes arrow_ipc = 1;  // Arrow IPC RecordBatch with "sparse_embeddings" List<Struct<index:u32, value:f32>> column
+    // One row per input row, in input order:
+    //   sparse_embeddings: List<Struct<index:u32, value:f32>>, nullable — null when the row failed
+    //   error:             Utf8, nullable — the failure reason for that row, else null
+    bytes arrow_ipc = 1;  // Arrow IPC RecordBatch with "sparse_embeddings" and "error" columns
 }

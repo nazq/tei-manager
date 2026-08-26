@@ -98,6 +98,7 @@ grpcurl -plaintext -d '{
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparse
 
 # Batch dense embeddings via Arrow IPC
+# Response: one row per input row — `embeddings` (nullable) + `error` (nullable, per-row failure reason)
 grpcurl -plaintext -d '{
   "target": {"instance_name": "bge-small"},
   "arrow_ipc": "<base64-encoded-arrow-ipc>",
@@ -121,7 +122,7 @@ grpcurl -plaintext localhost:9001 list
 For a complete Rust client implementation, see the built-in benchmark client at `src/bin/bench-client.rs`. It demonstrates:
 
 - Connecting to the gRPC multiplexer with/without TLS
-- Creating Arrow IPC batches with LZ4 compression
+- Creating Arrow IPC batches (LZ4-compressed on the text side)
 - Sending `EmbedArrow` requests and parsing responses
 - Concurrent request handling with Tokio
 

@@ -8,7 +8,32 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use super::multiplexer::TeiMultiplexerService;
 use super::pool::BackendPool;
 use super::proto::multiplexer::v1::tei_multiplexer_server::TeiMultiplexerServer;
+use crate::config::ArrowOutputDtype;
 use crate::registry::Registry;
+
+/// Tunables for the gRPC multiplexer server
+#[derive(Debug, Clone, Copy)]
+pub struct GrpcOptions {
+    /// Max request/response message size in MB
+    pub max_message_size_mb: usize,
+    /// Channel buffer for concurrent stream forwarding
+    pub max_parallel_streams: usize,
+    /// Per-request timeout for forwarded unary/Arrow RPCs (0 = none)
+    pub request_timeout_secs: u64,
+    /// Element type for EmbedArrow responses when unspecified by the request
+    pub default_output_dtype: ArrowOutputDtype,
+}
+
+impl Default for GrpcOptions {
+    fn default() -> Self {
+        Self {
+            max_message_size_mb: 16,
+            max_parallel_streams: 1024,
+            request_timeout_secs: 30,
+            default_output_dtype: ArrowOutputDtype::F32,
+        }
+    }
+}
 
 /// Start the gRPC multiplexer server with graceful shutdown support
 ///
@@ -19,20 +44,14 @@ pub async fn start_grpc_server_with_shutdown<F>(
     addr: SocketAddr,
     registry: Arc<Registry>,
     tls_config: Option<(String, String, String)>, // (cert, key, ca)
-    max_message_size_mb: usize,
-    max_parallel_streams: usize,
-    request_timeout_secs: u64,
+    options: GrpcOptions,
     shutdown_signal: F,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     F: Future<Output = ()> + Send,
 {
-    let (service, reflection_service, max_message_size) = build_services(
-        registry,
-        max_parallel_streams,
-        request_timeout_secs,
-        max_message_size_mb,
-    )?;
+    let max_message_size_mb = options.max_message_size_mb;
+    let (service, reflection_service, max_message_size) = build_services(registry, options)?;
 
     // Build server with optional TLS
     let mut builder = Server::builder();
@@ -81,16 +100,10 @@ pub async fn start_grpc_server(
     addr: SocketAddr,
     registry: Arc<Registry>,
     tls_config: Option<(String, String, String)>, // (cert, key, ca)
-    max_message_size_mb: usize,
-    max_parallel_streams: usize,
-    request_timeout_secs: u64,
+    options: GrpcOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (service, reflection_service, max_message_size) = build_services(
-        registry,
-        max_parallel_streams,
-        request_timeout_secs,
-        max_message_size_mb,
-    )?;
+    let max_message_size_mb = options.max_message_size_mb;
+    let (service, reflection_service, max_message_size) = build_services(registry, options)?;
 
     // Build server with optional TLS
     let mut builder = Server::builder();
@@ -133,9 +146,7 @@ pub async fn start_grpc_server(
 /// Build the gRPC services (shared between server variants)
 fn build_services(
     registry: Arc<Registry>,
-    max_parallel_streams: usize,
-    request_timeout_secs: u64,
-    max_message_size_mb: usize,
+    options: GrpcOptions,
 ) -> Result<
     (
         TeiMultiplexerService,
@@ -150,7 +161,12 @@ fn build_services(
     let pool = BackendPool::new(registry);
 
     // Create multiplexer service with timeout
-    let service = TeiMultiplexerService::new(pool, max_parallel_streams, request_timeout_secs);
+    let service = TeiMultiplexerService::new(
+        pool,
+        options.max_parallel_streams,
+        options.request_timeout_secs,
+    )
+    .with_default_output_dtype(options.default_output_dtype);
 
     // Enable gRPC reflection
     let file_descriptor_set: &[u8] = tonic::include_file_descriptor_set!("descriptor");
@@ -159,7 +175,7 @@ fn build_services(
         .build_v1()?;
 
     // Message size limits from config
-    let max_message_size: usize = max_message_size_mb * 1024 * 1024;
+    let max_message_size: usize = options.max_message_size_mb * 1024 * 1024;
 
     Ok((service, reflection_service, max_message_size))
 }
@@ -217,13 +233,7 @@ mod tests {
 
         // Spawn server in background and cancel quickly
         let handle = tokio::spawn(async move {
-            start_grpc_server(
-                addr, registry, None, // No TLS
-                16,   // 16 MB max message
-                1024, // max parallel streams
-                30,   // 30s request timeout
-            )
-            .await
+            start_grpc_server(addr, registry, None, GrpcOptions::default()).await
         });
 
         // Give it a moment to start, then abort
@@ -242,7 +252,18 @@ mod tests {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
             let handle = tokio::spawn(async move {
-                start_grpc_server(addr, registry, None, size_mb, 1024, 30).await
+                start_grpc_server(
+                    addr,
+                    registry,
+                    None,
+                    GrpcOptions {
+                        max_message_size_mb: size_mb,
+                        max_parallel_streams: 1024,
+                        request_timeout_secs: 30,
+                        ..Default::default()
+                    },
+                )
+                .await
             });
 
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -257,7 +278,18 @@ mod tests {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
             let handle = tokio::spawn(async move {
-                start_grpc_server(addr, registry, None, 16, streams, 30).await
+                start_grpc_server(
+                    addr,
+                    registry,
+                    None,
+                    GrpcOptions {
+                        max_message_size_mb: 16,
+                        max_parallel_streams: streams,
+                        request_timeout_secs: 30,
+                        ..Default::default()
+                    },
+                )
+                .await
             });
 
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -282,7 +314,7 @@ mod tests {
 
         let result = timeout(
             Duration::from_secs(1),
-            start_grpc_server(addr, registry, invalid_tls, 16, 1024, 30),
+            start_grpc_server(addr, registry, invalid_tls, GrpcOptions::default()),
         )
         .await;
 
@@ -365,9 +397,9 @@ mod tests {
             .map(|_| {
                 let registry = create_test_registry();
                 let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-                tokio::spawn(
-                    async move { start_grpc_server(addr, registry, None, 16, 1024, 30).await },
-                )
+                tokio::spawn(async move {
+                    start_grpc_server(addr, registry, None, GrpcOptions::default()).await
+                })
             })
             .collect();
 
@@ -387,9 +419,15 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let handle = tokio::spawn(async move {
-            start_grpc_server_with_shutdown(addr, registry, None, 16, 1024, 30, async move {
-                let _ = shutdown_rx.await;
-            })
+            start_grpc_server_with_shutdown(
+                addr,
+                registry,
+                None,
+                GrpcOptions::default(),
+                async move {
+                    let _ = shutdown_rx.await;
+                },
+            )
             .await
         });
 
@@ -418,9 +456,15 @@ mod tests {
         let mut shutdown_rx = shutdown_tx.subscribe();
 
         let handle = tokio::spawn(async move {
-            start_grpc_server_with_shutdown(addr, registry, None, 16, 1024, 30, async move {
-                let _ = shutdown_rx.recv().await;
-            })
+            start_grpc_server_with_shutdown(
+                addr,
+                registry,
+                None,
+                GrpcOptions::default(),
+                async move {
+                    let _ = shutdown_rx.recv().await;
+                },
+            )
             .await
         });
 
@@ -438,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_services_creates_valid_services() {
         let registry = create_test_registry();
-        let result = build_services(registry, 1024, 30, 16);
+        let result = build_services(registry, GrpcOptions::default());
 
         assert!(result.is_ok());
         let (_service, _reflection, max_size) = result.unwrap();

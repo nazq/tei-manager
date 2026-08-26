@@ -75,6 +75,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
         require_cert_headers: false,
+        auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
     };
@@ -142,6 +143,41 @@ async fn test_create_instance() {
     assert_eq!(instance["model_id"], "BAAI/bge-small-en-v1.5");
     assert_eq!(instance["port"], 8080);
     assert!(instance["prometheus_port"].is_number());
+}
+
+#[tokio::test]
+async fn test_create_instance_with_auto_max_batch_tokens() {
+    let (server, _temp_dir) = create_test_server().await;
+
+    let response = server
+        .post("/instances")
+        .json(&json!({
+            "name": "auto-batch",
+            "model_id": "BAAI/bge-small-en-v1.5",
+            "port": 8090,
+            "max_batch_tokens": "auto"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 201, "{}", response.text());
+
+    let instance: serde_json::Value = response.json();
+    // Resolved at creation: never the 0 sentinel, always within the clamps
+    let resolved = instance["max_batch_tokens"]
+        .as_u64()
+        .expect("max_batch_tokens in response");
+    assert!((4096..=262_144).contains(&resolved), "resolved {resolved}");
+
+    // Anything other than a number or "auto" is rejected
+    let response = server
+        .post("/instances")
+        .json(&json!({
+            "name": "bad-batch",
+            "model_id": "BAAI/bge-small-en-v1.5",
+            "port": 8091,
+            "max_batch_tokens": "lots"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 422, "{}", response.text());
 }
 
 #[tokio::test]
@@ -459,6 +495,7 @@ async fn test_max_instances_limit() {
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
         require_cert_headers: false,
+        auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
     };

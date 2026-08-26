@@ -92,6 +92,26 @@ grpc_max_message_size_mb = 40
 # Higher values allow more parallelism but use more memory
 grpc_max_parallel_streams = 1024
 
+# Element type of EmbedArrow responses when a request leaves output_dtype
+# unspecified: "f32" (default) or "f16". f16 halves the payload; lossy —
+# validated to keep top-k ordering for normalized-cosine retrieval, measure
+# on your own data before switching the default.
+arrow_output_dtype = "f32"
+
+# =============================================================================
+# GPU
+# =============================================================================
+
+# Check visible GPUs against the compute capability this image's TEI was
+# compiled for (the image sets TEI_VARIANT). "warn" (default) logs a mismatch,
+# "fail" refuses to start, "off" skips the check.
+gpu_preflight = "warn"
+
+# max_batch_tokens = 0 / "auto" on an instance derives the value from the
+# free VRAM of its GPU: this many tokens per GiB (default 2048, so 32 GiB free
+# → 65536), clamped to [4096, 262144]. Without a GPU the auto value is 16384.
+auto_max_batch_tokens_per_gib = 2048
+
 # =============================================================================
 # Authentication Configuration (Optional)
 # =============================================================================
@@ -128,7 +148,7 @@ providers = []
 name = "bge-small"
 model_id = "BAAI/bge-small-en-v1.5"
 port = 8080
-max_batch_tokens = 16384       # Controls memory usage and throughput
+max_batch_tokens = 16384       # Controls memory usage and throughput (0 = auto from free VRAM)
 max_concurrent_requests = 512  # Higher values use more memory
 # pooling = "splade"           # Optional: for SPLADE models
 # gpu_id = 0                   # Optional: pin to specific GPU (omit to use all GPUs)

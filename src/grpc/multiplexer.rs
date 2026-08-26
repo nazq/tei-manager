@@ -19,6 +19,7 @@ use tracing::{Span, instrument};
 use super::pool::BackendPool;
 use super::proto::multiplexer::v1 as mux;
 use super::proto::tei::v1 as tei;
+use crate::config::ArrowOutputDtype;
 
 /// Implements a bidirectional streaming RPC method for the multiplexer.
 ///
@@ -157,6 +158,8 @@ pub struct TeiMultiplexerService {
     pool: BackendPool,
     max_parallel_stream_requests: usize,
     request_timeout: Option<Duration>,
+    /// Element type for EmbedArrow responses when the request says UNSPECIFIED
+    default_output_dtype: ArrowOutputDtype,
 }
 
 impl TeiMultiplexerService {
@@ -174,6 +177,25 @@ impl TeiMultiplexerService {
             } else {
                 None
             },
+            default_output_dtype: ArrowOutputDtype::F32,
+        }
+    }
+
+    /// Set the element type used when a request leaves `output_dtype` unspecified
+    pub fn with_default_output_dtype(mut self, dtype: ArrowOutputDtype) -> Self {
+        self.default_output_dtype = dtype;
+        self
+    }
+
+    /// Resolve a request's `output_dtype` against the server default
+    fn output_dtype(&self, requested: i32) -> Result<ArrowOutputDtype, Status> {
+        match mux::OutputDtype::try_from(requested) {
+            Ok(mux::OutputDtype::Unspecified) => Ok(self.default_output_dtype),
+            Ok(mux::OutputDtype::F32) => Ok(ArrowOutputDtype::F32),
+            Ok(mux::OutputDtype::F16) => Ok(ArrowOutputDtype::F16),
+            Err(_) => Err(Status::invalid_argument(format!(
+                "unknown output_dtype value {requested}"
+            ))),
         }
     }
 
@@ -597,6 +619,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
 
         let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
         Span::current().record("num_rows", rows.len());
+        let output_dtype = self.output_dtype(req.output_dtype)?;
 
         let outcome: RowOutcomes<Vec<f32>> = if req.noop {
             RowOutcomes::noop(rows.len(), || vec![0.0f32; NOOP_EMBEDDING_DIM])
@@ -623,7 +646,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .map(|r| r.embeddings)
         };
 
-        let batch = arrow_batch::dense_batch(&outcome)?;
+        let batch = arrow_batch::dense_batch(&outcome, output_dtype)?;
         let buffer = arrow_batch::serialize(&batch, req.compression)?;
         Ok(Response::new(mux::EmbedArrowResponse { arrow_ipc: buffer }))
     }
@@ -910,8 +933,11 @@ mod arrow_batch {
         Some(NullBuffer::new(b.finish()))
     }
 
-    /// `embeddings: FixedSizeList<f32>[dim]?`, `error: Utf8?`
-    pub fn dense_batch(outcome: &RowOutcomes<Vec<f32>>) -> Result<RecordBatch, Status> {
+    /// `embeddings: FixedSizeList<f32|f16>[dim]?`, `error: Utf8?`
+    pub fn dense_batch(
+        outcome: &RowOutcomes<Vec<f32>>,
+        dtype: ArrowOutputDtype,
+    ) -> Result<RecordBatch, Status> {
         let dim = outcome
             .rows
             .iter()
@@ -931,8 +957,16 @@ mod arrow_batch {
                 Err(_) => flat.extend(std::iter::repeat_n(0.0f32, dim)),
             }
         }
-        let item = Arc::new(Field::new("item", DataType::Float32, false));
-        let values = Arc::new(Float32Array::from(flat)) as ArrayRef;
+        let (element, values): (DataType, ArrayRef) = match dtype {
+            ArrowOutputDtype::F32 => (DataType::Float32, Arc::new(Float32Array::from(flat))),
+            ArrowOutputDtype::F16 => (
+                DataType::Float16,
+                Arc::new(arrow::array::Float16Array::from_iter_values(
+                    flat.into_iter().map(half::f16::from_f32),
+                )),
+            ),
+        };
+        let item = Arc::new(Field::new("item", element, false));
         let embeddings =
             FixedSizeListArray::try_new(item.clone(), dim as i32, values, validity(outcome))
                 .map_err(|e| {
@@ -2141,7 +2175,7 @@ mod tests {
     #[test]
     fn test_dense_batch_aligns_rows_and_errors() {
         use arrow::array::FixedSizeListArray;
-        let batch = arrow_batch::dense_batch(&dense_outcome()).unwrap();
+        let batch = arrow_batch::dense_batch(&dense_outcome(), ArrowOutputDtype::F32).unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema().field(0).name(), "embeddings");
         assert_eq!(batch.schema().field(1).name(), "error");
@@ -2174,7 +2208,7 @@ mod tests {
         let outcome = RowOutcomes {
             rows: vec![Ok(vec![1.0f32]), Ok(vec![2.0])],
         };
-        let batch = arrow_batch::dense_batch(&outcome).unwrap();
+        let batch = arrow_batch::dense_batch(&outcome, ArrowOutputDtype::F32).unwrap();
         assert_eq!(batch.column(0).null_count(), 0);
         assert_eq!(batch.column(1).null_count(), 2);
     }
@@ -2185,7 +2219,7 @@ mod tests {
         let outcome: RowOutcomes<Vec<f32>> = RowOutcomes {
             rows: vec![Err("x".to_string()), Err("y".to_string())],
         };
-        let batch = arrow_batch::dense_batch(&outcome).unwrap();
+        let batch = arrow_batch::dense_batch(&outcome, ArrowOutputDtype::F32).unwrap();
         assert_eq!(batch.num_rows(), 2);
         let emb = batch
             .column(0)
@@ -2197,11 +2231,88 @@ mod tests {
     }
 
     #[test]
+    fn test_dense_batch_f16_round_trips_values() {
+        use arrow::array::{FixedSizeListArray, Float16Array};
+        let batch = arrow_batch::dense_batch(&dense_outcome(), ArrowOutputDtype::F16).unwrap();
+        let emb = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(emb.value_type(), DataType::Float16);
+        assert!(emb.is_null(1));
+        let row2 = emb.value(2);
+        let row2 = row2.as_any().downcast_ref::<Float16Array>().unwrap();
+        assert_eq!(row2.value(0).to_f32(), 3.0);
+        assert_eq!(row2.value(1).to_f32(), 4.0);
+        let f32_batch = arrow_batch::dense_batch(&dense_outcome(), ArrowOutputDtype::F32).unwrap();
+        assert!(
+            batch.column(0).get_array_memory_size() < f32_batch.column(0).get_array_memory_size()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_output_dtype_resolution() {
+        let service = create_test_service();
+        assert_eq!(
+            service
+                .output_dtype(mux::OutputDtype::Unspecified as i32)
+                .unwrap(),
+            ArrowOutputDtype::F32
+        );
+        assert_eq!(
+            service.output_dtype(mux::OutputDtype::F16 as i32).unwrap(),
+            ArrowOutputDtype::F16
+        );
+        let service = service.with_default_output_dtype(ArrowOutputDtype::F16);
+        assert_eq!(
+            service
+                .output_dtype(mux::OutputDtype::Unspecified as i32)
+                .unwrap(),
+            ArrowOutputDtype::F16
+        );
+        assert_eq!(
+            service.output_dtype(mux::OutputDtype::F32 as i32).unwrap(),
+            ArrowOutputDtype::F32
+        );
+        assert_eq!(
+            service.output_dtype(9).unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_noop_f16_output() {
+        use arrow::array::FixedSizeListArray;
+        let service = create_test_service();
+        let arrow_ipc = ipc_from_array(Arc::new(StringArray::from(vec!["a", "b"])), "text");
+        let request = Request::new(mux::EmbedArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc,
+            noop: true,
+            output_dtype: mux::OutputDtype::F16 as i32,
+            ..Default::default()
+        });
+        let response = service.embed_arrow(request).await.unwrap().into_inner();
+        let mut reader = StreamReader::try_new(Cursor::new(response.arrow_ipc), None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let emb = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(emb.value_type(), DataType::Float16);
+        assert_eq!(emb.value_length(), NOOP_EMBEDDING_DIM as i32);
+    }
+
+    #[test]
     fn test_dense_batch_rejects_mixed_dimensions() {
         let outcome = RowOutcomes {
             rows: vec![Ok(vec![1.0f32, 2.0]), Ok(vec![3.0])],
         };
-        let err = arrow_batch::dense_batch(&outcome).unwrap_err();
+        let err = arrow_batch::dense_batch(&outcome, ArrowOutputDtype::F32).unwrap_err();
         assert_eq!(err.code(), Code::Internal);
         assert!(err.message().contains("inconsistent embedding dimensions"));
     }
@@ -2298,7 +2409,7 @@ mod tests {
 
     #[test]
     fn test_serialize_compression_modes() {
-        let batch = arrow_batch::dense_batch(&dense_outcome()).unwrap();
+        let batch = arrow_batch::dense_batch(&dense_outcome(), ArrowOutputDtype::F32).unwrap();
         let plain = arrow_batch::serialize(&batch, mux::ArrowCompression::None as i32).unwrap();
         let lz4 = arrow_batch::serialize(&batch, mux::ArrowCompression::Lz4 as i32).unwrap();
         for buf in [&plain, &lz4] {

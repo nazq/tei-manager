@@ -286,3 +286,92 @@ async fn test_embed_arrow_via_multiplexer_reports_per_row_errors() {
         "rows after a failure still embed"
     );
 }
+
+#[tokio::test]
+async fn test_embed_arrow_via_multiplexer_f16_output() {
+    use arrow::array::{Array, FixedSizeListArray, Float16Array};
+    use arrow::datatypes::DataType;
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use tei_manager::config::InstanceConfig;
+    use tei_manager::grpc::multiplexer::TeiMultiplexerService;
+    use tei_manager::grpc::pool::BackendPool;
+    use tei_manager::grpc::proto::multiplexer::v1 as mux;
+    use tei_manager::grpc::proto::multiplexer::v1::tei_multiplexer_server::TeiMultiplexer;
+    use tei_manager::registry::Registry;
+
+    let tei = TeiContainer::start_dense(DENSE_MODEL)
+        .await
+        .expect("Failed to start dense TEI container");
+    let registry = Arc::new(Registry::new(
+        None,
+        "text-embeddings-router".to_string(),
+        8080,
+        8180,
+    ));
+    registry
+        .add(InstanceConfig {
+            name: "e2e-f16".to_string(),
+            model_id: DENSE_MODEL.to_string(),
+            port: tei.grpc_port(),
+            ..Default::default()
+        })
+        .await
+        .expect("registry add");
+    let service = TeiMultiplexerService::new(BackendPool::new(registry), 1024, 60);
+
+    let texts = ["Hello world", "Rust"];
+    let embed = |dtype: mux::OutputDtype| {
+        let service = service.clone();
+        let ipc = create_arrow_batch(&texts);
+        async move {
+            let response = service
+                .embed_arrow(tonic::Request::new(mux::EmbedArrowRequest {
+                    target: Some(mux::Target {
+                        routing: Some(mux::target::Routing::InstanceName("e2e-f16".to_string())),
+                    }),
+                    arrow_ipc: ipc,
+                    truncate: true,
+                    normalize: true,
+                    output_dtype: dtype as i32,
+                    ..Default::default()
+                }))
+                .await
+                .expect("embed_arrow")
+                .into_inner();
+            let mut reader = StreamReader::try_new(Cursor::new(response.arrow_ipc), None).unwrap();
+            reader.next().unwrap().unwrap()
+        }
+    };
+
+    let f32_batch = embed(mux::OutputDtype::F32).await;
+    let f16_batch = embed(mux::OutputDtype::F16).await;
+
+    let f32_col = f32_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    let f16_col = f16_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    assert_eq!(f32_col.value_type(), DataType::Float32);
+    assert_eq!(f16_col.value_type(), DataType::Float16);
+    assert_eq!(f16_col.value_length(), 384);
+    assert_eq!(f16_batch.num_rows(), 2);
+
+    // f16 is a faithful rounding of the f32 result (max abs error for |x|<=1 is ~5e-4)
+    let f32_row = f32_col.value(0);
+    let f32_row = f32_row
+        .as_any()
+        .downcast_ref::<arrow::array::Float32Array>()
+        .unwrap();
+    let f16_row = f16_col.value(0);
+    let f16_row = f16_row.as_any().downcast_ref::<Float16Array>().unwrap();
+    for i in 0..384 {
+        assert!((f32_row.value(i) - f16_row.value(i).to_f32()).abs() < 1e-3);
+    }
+}

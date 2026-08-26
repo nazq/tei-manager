@@ -26,6 +26,25 @@ enum BenchMode {
     Arrow,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OutputDtypeArg {
+    /// Whatever the server is configured to return
+    Server,
+    F32,
+    F16,
+}
+
+impl OutputDtypeArg {
+    fn to_proto(self) -> i32 {
+        use tei_manager::grpc::proto::multiplexer::v1::OutputDtype;
+        match self {
+            OutputDtypeArg::Server => OutputDtype::Unspecified as i32,
+            OutputDtypeArg::F32 => OutputDtype::F32 as i32,
+            OutputDtypeArg::F16 => OutputDtype::F16 as i32,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[clap(
     name = "tei-bench-client",
@@ -83,6 +102,10 @@ struct Args {
     /// Pad each generated text to roughly this many words (0 = templates as-is)
     #[clap(long, default_value = "0")]
     text_words: usize,
+
+    /// Element type of returned embeddings (Arrow mode only)
+    #[clap(long, value_enum, default_value = "server")]
+    output_dtype: OutputDtypeArg,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -303,6 +326,7 @@ async fn benchmark_arrow(
     batch_size: usize,
     noop: bool,
     concurrency: usize,
+    output_dtype: i32,
 ) -> Result<BenchmarkResult> {
     let total_texts = texts.len();
     let start = Instant::now();
@@ -319,7 +343,15 @@ async fn benchmark_arrow(
         let chunk: Vec<String> = chunk.to_vec();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
-            embed_arrow_batch(&mut client, instance_name, &chunk, batch_idx, noop).await
+            embed_arrow_batch(
+                &mut client,
+                instance_name,
+                &chunk,
+                batch_idx,
+                noop,
+                output_dtype,
+            )
+            .await
         }));
     }
 
@@ -355,6 +387,7 @@ async fn embed_arrow_batch(
     chunk: &[String],
     batch_idx: usize,
     noop: bool,
+    output_dtype: i32,
 ) -> Result<(usize, usize)> {
     // Create Arrow RecordBatch with text column
     let text_array = StringArray::from(chunk.to_vec());
@@ -388,6 +421,7 @@ async fn embed_arrow_batch(
         truncate: true,
         normalize: true,
         noop,
+        output_dtype,
         ..Default::default()
     };
 
@@ -457,6 +491,7 @@ async fn main() -> Result<()> {
                 args.batch_size,
                 args.noop,
                 args.concurrency,
+                args.output_dtype.to_proto(),
             )
             .await?
         }

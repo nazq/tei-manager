@@ -3737,6 +3737,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "futures",
+ "half",
  "hf-hub",
  "http-body-util",
  "hyper-rustls",

@@ -192,10 +192,10 @@ grpcurl -plaintext -d '{
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparseArrow
 ```
 
-**Request:** the first column of the first RecordBatch is the text (`Utf8`, `LargeUtf8` or `Utf8View`). Optional fields: `truncation_direction`, `prompt_name`, `dimensions` (dense only, Matryoshka truncation) and `compression` for the *response* (`ARROW_COMPRESSION_NONE` default — vectors don't compress; `ARROW_COMPRESSION_LZ4` available).
+**Request:** the first column of the first RecordBatch is the text (`Utf8`, `LargeUtf8` or `Utf8View`). Optional fields: `truncation_direction`, `prompt_name`, `dimensions` (dense only, Matryoshka truncation), `compression` for the *response* (`ARROW_COMPRESSION_NONE` default — vectors don't compress; `ARROW_COMPRESSION_LZ4` available) and `output_dtype` (`F32` default via server config, `F16` halves the payload).
 
 **Response:** exactly one row per input row, in input order, with two columns:
-- Dense: `embeddings` — `FixedSizeList<Float32>[dim]`, nullable; Sparse: `sparse_embeddings` — `List<Struct<index:u32, value:f32>>`, nullable
+- Dense: `embeddings` — `FixedSizeList<Float32|Float16>[dim]`, nullable; Sparse: `sparse_embeddings` — `List<Struct<index:u32, value:f32>>`, nullable
 - `error` — `Utf8`, nullable. Set (and the vector null) for rows the backend rejected (empty input, too long without `truncate`, null text). Backend failures such as a dead instance fail the whole call instead.
 
 **Benefits:**
@@ -380,7 +380,19 @@ models = [
 name = "bge-small"
 model_id = "BAAI/bge-small-en-v1.5"
 gpu_id = 0
+max_batch_tokens = 0            # 0 / "auto" via the API: derived from free VRAM
+
+# Rented / unknown hardware
+gpu_preflight = "warn"          # "fail" to refuse to start on a mismatched GPU image
+auto_max_batch_tokens_per_gib = 2048
+arrow_output_dtype = "f32"      # or "f16" to halve EmbedArrow payloads by default
 ```
+
+### Running on rented GPUs (vast.ai, RunPod)
+
+- Pick the image for the card (see [Docker Images](#docker-images)). On start, tei-manager compares every visible GPU's compute capability with the TEI build in the image and logs a mismatch with the tag to use instead (`gpu_preflight = "fail"` turns that into a hard stop).
+- Create instances with `"max_batch_tokens": "auto"` — the value is derived from the free VRAM of the target GPU at creation time and reported back in the instance JSON.
+- For batch export over the network, request `output_dtype: OUTPUT_DTYPE_F16` on `EmbedArrow` (or set `arrow_output_dtype = "f16"`) to halve egress; f16 is lossy, so validate retrieval on your own data first.
 
 ---
 

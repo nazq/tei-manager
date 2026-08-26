@@ -25,6 +25,8 @@ pub struct AppState {
     pub require_cert_headers: bool,
     pub model_registry: Arc<ModelRegistry>,
     pub model_loader: Arc<ModelLoader>,
+    /// Tokens per GiB of free VRAM for `max_batch_tokens = "auto"`
+    pub auto_max_batch_tokens_per_gib: u32,
 }
 
 /// Create the main API router
@@ -151,6 +153,7 @@ mod tests {
             prometheus_handle,
             auth_manager: None,
             require_cert_headers: false,
+            auto_max_batch_tokens_per_gib: 2048,
             model_registry,
             model_loader,
         }

@@ -64,6 +64,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
         require_cert_headers: false,
+        auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
     };
@@ -339,6 +340,7 @@ async fn test_downloading_state_visible() {
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
         require_cert_headers: false,
+        auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
     };
@@ -413,6 +415,7 @@ async fn test_concurrent_download_rejected() {
         prometheus_handle: get_metrics_handle(),
         auth_manager: None,
         require_cert_headers: false,
+        auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
     };

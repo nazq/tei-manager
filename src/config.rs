@@ -112,10 +112,75 @@ pub struct ManagerConfig {
     #[serde(default = "default_grpc_request_timeout_secs")]
     pub grpc_request_timeout_secs: u64,
 
+    /// What to do when a visible GPU's compute capability does not match the
+    /// TEI build bundled in this image (default: "warn")
+    /// - "warn": log and continue (instances on that GPU will fail at start)
+    /// - "fail": refuse to start tei-manager
+    /// - "off": skip the check
+    #[serde(default)]
+    pub gpu_preflight: GpuPreflight,
+
+    /// Tokens of `max_batch_tokens` granted per GiB of free VRAM when an
+    /// instance asks for `max_batch_tokens = 0` / "auto" (default: 2048,
+    /// i.e. 32 GiB free → 65536). Clamped to [4096, 262144]; without a GPU
+    /// the auto value is the regular default (16384).
+    #[serde(default = "default_auto_max_batch_tokens_per_gib")]
+    pub auto_max_batch_tokens_per_gib: u32,
+
+    /// Default element type for EmbedArrow responses when the request leaves
+    /// `output_dtype` unspecified (default: "f32"). "f16" halves the payload;
+    /// validated on normalized-cosine retrieval to leave top-k ordering
+    /// unchanged, but it is a lossy conversion — measure on your own data.
+    #[serde(default)]
+    pub arrow_output_dtype: ArrowOutputDtype,
+
     /// Authentication configuration
     /// See [auth] section in config file
     #[serde(default)]
     pub auth: AuthConfig,
+}
+
+/// GPU compute-capability preflight policy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuPreflight {
+    #[default]
+    Warn,
+    Fail,
+    Off,
+}
+
+/// Element type of the dense vector column in EmbedArrow responses
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArrowOutputDtype {
+    #[default]
+    F32,
+    F16,
+}
+
+/// Lower clamp for auto-derived `max_batch_tokens`
+pub const AUTO_MAX_BATCH_TOKENS_MIN: u32 = 4096;
+/// Upper clamp for auto-derived `max_batch_tokens`
+pub const AUTO_MAX_BATCH_TOKENS_MAX: u32 = 262_144;
+
+fn default_auto_max_batch_tokens_per_gib() -> u32 {
+    2048
+}
+
+/// Derive `max_batch_tokens` from free VRAM. `None` (no GPU / unknown) yields
+/// the regular default.
+pub fn auto_max_batch_tokens(free_vram_mib: Option<u64>, per_gib: u32) -> u32 {
+    match free_vram_mib {
+        Some(mib) => {
+            let tokens = (mib as f64 / 1024.0 * per_gib as f64) as u64;
+            tokens.clamp(
+                AUTO_MAX_BATCH_TOKENS_MIN as u64,
+                AUTO_MAX_BATCH_TOKENS_MAX as u64,
+            ) as u32
+        }
+        None => default_max_batch_tokens(),
+    }
 }
 
 impl Default for ManagerConfig {
@@ -139,6 +204,9 @@ impl Default for ManagerConfig {
             grpc_max_message_size_mb: default_grpc_max_message_size_mb(),
             grpc_max_parallel_streams: default_grpc_max_parallel_streams(),
             grpc_request_timeout_secs: default_grpc_request_timeout_secs(),
+            gpu_preflight: GpuPreflight::default(),
+            auto_max_batch_tokens_per_gib: default_auto_max_batch_tokens_per_gib(),
+            arrow_output_dtype: ArrowOutputDtype::default(),
             auth: AuthConfig::default(),
         }
     }
@@ -332,7 +400,9 @@ pub struct InstanceConfig {
     pub port: u16,
 
     /// Maximum batch tokens for embedding requests (default: 16384)
-    /// Controls memory usage and throughput
+    /// Controls memory usage and throughput. `0` means auto: derived from the
+    /// free VRAM of the target GPU at creation time (see
+    /// `auto_max_batch_tokens_per_gib`); the API also accepts the string "auto".
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: u32,
 
@@ -387,6 +457,27 @@ impl InstanceConfig {
     /// Effective `RUST_LOG` filter for this instance's TEI process
     pub fn log_level(&self) -> &str {
         self.log_level.as_deref().unwrap_or(DEFAULT_TEI_LOG_LEVEL)
+    }
+
+    /// Replace `max_batch_tokens = 0` (auto) with a value derived from the
+    /// free VRAM of the GPU this instance targets. Returns the resolved value.
+    pub fn resolve_auto_max_batch_tokens(
+        &mut self,
+        gpu: &crate::gpu::GpuInfo,
+        per_gib: u32,
+    ) -> u32 {
+        if self.max_batch_tokens == 0 {
+            let free = gpu.free_vram_mib(self.gpu_id);
+            self.max_batch_tokens = auto_max_batch_tokens(free, per_gib);
+            tracing::info!(
+                instance = %self.name,
+                gpu_id = ?self.gpu_id,
+                free_vram_mib = ?free,
+                max_batch_tokens = self.max_batch_tokens,
+                "Resolved auto max_batch_tokens"
+            );
+        }
+        self.max_batch_tokens
     }
 
     /// Effective startup timeout: the per-instance override, else `default`
@@ -682,6 +773,68 @@ health_check_interval_secs = 60
 
         // Now it should exist
         assert!(state_file.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn test_auto_max_batch_tokens() {
+        assert_eq!(auto_max_batch_tokens(None, 2048), 16384);
+        assert_eq!(auto_max_batch_tokens(Some(32 * 1024), 2048), 65536);
+        assert_eq!(auto_max_batch_tokens(Some(27662), 2048), 55324);
+        assert_eq!(
+            auto_max_batch_tokens(Some(512), 2048),
+            AUTO_MAX_BATCH_TOKENS_MIN
+        );
+        assert_eq!(
+            auto_max_batch_tokens(Some(1024 * 1024), 2048),
+            AUTO_MAX_BATCH_TOKENS_MAX
+        );
+        assert_eq!(auto_max_batch_tokens(Some(8 * 1024), 4096), 32768);
+    }
+
+    #[test]
+    fn test_resolve_auto_max_batch_tokens() {
+        let gpu = crate::gpu::parse_nvidia_smi("0, X, 8.0, 16384, 8192\n1, Y, 8.0, 81920, 40960\n");
+        let mut auto = InstanceConfig {
+            max_batch_tokens: 0,
+            ..Default::default()
+        };
+        // Unpinned → smallest free VRAM (8 GiB)
+        assert_eq!(auto.resolve_auto_max_batch_tokens(&gpu, 2048), 16384);
+        let mut pinned = InstanceConfig {
+            max_batch_tokens: 0,
+            gpu_id: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(pinned.resolve_auto_max_batch_tokens(&gpu, 2048), 81920);
+        let mut explicit = InstanceConfig {
+            max_batch_tokens: 1234,
+            ..Default::default()
+        };
+        assert_eq!(explicit.resolve_auto_max_batch_tokens(&gpu, 2048), 1234);
+        let mut no_gpu = InstanceConfig {
+            max_batch_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_gpu.resolve_auto_max_batch_tokens(&crate::gpu::GpuInfo::default(), 2048),
+            16384
+        );
+    }
+
+    #[test]
+    fn test_new_manager_config_knobs_parse() {
+        let cfg: ManagerConfig = toml::from_str(
+            "gpu_preflight = \"fail\"\nauto_max_batch_tokens_per_gib = 1024\narrow_output_dtype = \"f16\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.gpu_preflight, GpuPreflight::Fail);
+        assert_eq!(cfg.auto_max_batch_tokens_per_gib, 1024);
+        assert_eq!(cfg.arrow_output_dtype, ArrowOutputDtype::F16);
+        let cfg: ManagerConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.gpu_preflight, GpuPreflight::Warn);
+        assert_eq!(cfg.auto_max_batch_tokens_per_gib, 2048);
+        assert_eq!(cfg.arrow_output_dtype, ArrowOutputDtype::F32);
+        assert!(toml::from_str::<ManagerConfig>("gpu_preflight = \"maybe\"").is_err());
     }
 
     #[test]

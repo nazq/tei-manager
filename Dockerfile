@@ -131,6 +131,11 @@ FROM ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-
 
 ARG VARIANT_NAME
 ARG VARIANT_DESC
+ARG TEI_VARIANT
+
+# Lets tei-manager check visible GPUs against the compute capability this
+# image's text-embeddings-router was compiled for (see gpu_preflight)
+ENV TEI_VARIANT=${TEI_VARIANT}
 
 LABEL org.opencontainers.image.title="TEI Manager${VARIANT_NAME:+ (${VARIANT_NAME})}"
 LABEL org.opencontainers.image.description="Dynamic TEI Instance Manager${VARIANT_DESC}"

@@ -1,7 +1,8 @@
 //! API request handlers
 
 use super::models::{
-    AddModelRequest, CreateInstanceRequest, HealthResponse, InstanceInfo, LogsResponse, ModelInfo,
+    AddModelRequest, CreateInstanceRequest, HealthResponse, InstanceInfo, LogsResponse,
+    MaxBatchTokens, ModelInfo,
 };
 use super::routes::AppState;
 use crate::config::InstanceConfig;
@@ -79,11 +80,14 @@ pub async fn create_instance(
         }
     }
 
-    let config = InstanceConfig {
+    let mut config = InstanceConfig {
         name: req.name,
         model_id: req.model_id.clone(),
         port: req.port.unwrap_or(0), // 0 signals auto-allocation to registry
-        max_batch_tokens: req.max_batch_tokens.unwrap_or(16384),
+        max_batch_tokens: req
+            .max_batch_tokens
+            .map(MaxBatchTokens::to_config_value)
+            .unwrap_or(16384),
         max_concurrent_requests: req.max_concurrent_requests.unwrap_or(512),
         pooling: req.pooling,
         gpu_id: req.gpu_id,
@@ -93,6 +97,10 @@ pub async fn create_instance(
         log_level: req.log_level,
         created_at: Some(chrono::Utc::now()),
     };
+    config.resolve_auto_max_batch_tokens(
+        crate::gpu::get_or_init(),
+        state.auto_max_batch_tokens_per_gib,
+    );
 
     let instance = state
         .registry

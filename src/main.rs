@@ -75,6 +75,21 @@ async fn main() -> Result<()> {
     // Load configuration
     let mut config = ManagerConfig::load(cli.config)?;
 
+    // Compute-capability preflight: does the bundled TEI run on these GPUs?
+    if config.gpu_preflight != tei_manager::config::GpuPreflight::Off {
+        let variant = std::env::var(tei_manager::gpu::TEI_VARIANT_ENV).ok();
+        let problems = tei_manager::gpu::preflight(gpu_info, variant.as_deref());
+        for problem in &problems {
+            tracing::error!(%problem, "GPU compute capability mismatch");
+        }
+        if !problems.is_empty() && config.gpu_preflight == tei_manager::config::GpuPreflight::Fail {
+            anyhow::bail!(
+                "GPU preflight failed (gpu_preflight = \"fail\"): {}",
+                problems.join("; ")
+            );
+        }
+    }
+
     // CLI overrides
     if let Some(port) = cli.port {
         config.api_port = port;
@@ -132,6 +147,9 @@ async fn main() -> Result<()> {
             "Seeding instances from config"
         );
         for instance_config in &config.instances {
+            let mut instance_config = instance_config.clone();
+            instance_config
+                .resolve_auto_max_batch_tokens(gpu_info, config.auto_max_batch_tokens_per_gib);
             match registry.add(instance_config.clone()).await {
                 Ok(instance) => {
                     if let Err(e) = instance.start(&config.tei_binary_path).await {
@@ -179,6 +197,7 @@ async fn main() -> Result<()> {
         require_cert_headers: config.auth.require_cert_headers,
         model_registry,
         model_loader,
+        auto_max_batch_tokens_per_gib: config.auto_max_batch_tokens_per_gib,
     };
 
     let app = api::create_router(app_state);
@@ -198,6 +217,7 @@ async fn main() -> Result<()> {
         let grpc_max_message_size_mb = config.grpc_max_message_size_mb;
         let grpc_max_parallel_streams = config.grpc_max_parallel_streams;
         let grpc_request_timeout_secs = config.grpc_request_timeout_secs;
+        let grpc_output_dtype = config.arrow_output_dtype;
         let mut grpc_shutdown_rx = shutdown_tx.subscribe();
 
         // Build gRPC TLS config if mTLS is enabled
@@ -224,9 +244,12 @@ async fn main() -> Result<()> {
                 grpc_addr,
                 grpc_registry,
                 grpc_tls_config,
-                grpc_max_message_size_mb,
-                grpc_max_parallel_streams,
-                grpc_request_timeout_secs,
+                tei_manager::grpc::server::GrpcOptions {
+                    max_message_size_mb: grpc_max_message_size_mb,
+                    max_parallel_streams: grpc_max_parallel_streams,
+                    request_timeout_secs: grpc_request_timeout_secs,
+                    default_output_dtype: grpc_output_dtype,
+                },
                 async move {
                     let _ = grpc_shutdown_rx.recv().await;
                     tracing::info!("gRPC server received shutdown signal");

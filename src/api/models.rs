@@ -22,8 +22,9 @@ pub struct CreateInstanceRequest {
     #[serde(default)]
     pub port: Option<u16>,
 
+    /// Number of tokens, or "auto" to derive from free VRAM at creation
     #[serde(default)]
-    pub max_batch_tokens: Option<u32>,
+    pub max_batch_tokens: Option<MaxBatchTokens>,
 
     #[serde(default)]
     pub max_concurrent_requests: Option<u32>,
@@ -51,12 +52,40 @@ pub struct CreateInstanceRequest {
     pub log_level: Option<String>,
 }
 
+/// `max_batch_tokens` as accepted by the create API: a number or "auto"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MaxBatchTokens {
+    Tokens(u32),
+    Auto(AutoKeyword),
+}
+
+/// The literal string "auto"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoKeyword {
+    Auto,
+}
+
+impl MaxBatchTokens {
+    /// Config representation: explicit tokens, or 0 for auto
+    pub fn to_config_value(self) -> u32 {
+        match self {
+            MaxBatchTokens::Tokens(n) => n,
+            MaxBatchTokens::Auto(_) => 0,
+        }
+    }
+}
+
 /// Instance information response
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstanceInfo {
     pub name: String,
     pub model_id: String,
     pub port: u16,
+    /// Effective batch token budget (auto values are resolved at creation)
+    #[serde(default)]
+    pub max_batch_tokens: u32,
     pub status: InstanceStatus,
     pub pid: Option<u32>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -86,6 +115,7 @@ impl InstanceInfo {
             name: instance.config.name.clone(),
             model_id: instance.config.model_id.clone(),
             port: instance.config.port,
+            max_batch_tokens: instance.config.max_batch_tokens,
             status,
             pid,
             created_at: instance.config.created_at,

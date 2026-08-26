@@ -367,12 +367,28 @@ pub struct InstanceConfig {
     #[serde(default)]
     pub extra_args: Vec<String>,
 
+    /// `RUST_LOG` filter for the text-embeddings-router child (default: "warn")
+    ///
+    /// TEI logs one JSON line per embedded input at `info`, which at batch
+    /// throughput writes tens of MB/s to the instance log. Raise to "info" only
+    /// when debugging an instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+
     /// Auto-generated timestamp when instance was created (internal use)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Default `RUST_LOG` filter for TEI child processes
+pub const DEFAULT_TEI_LOG_LEVEL: &str = "warn";
+
 impl InstanceConfig {
+    /// Effective `RUST_LOG` filter for this instance's TEI process
+    pub fn log_level(&self) -> &str {
+        self.log_level.as_deref().unwrap_or(DEFAULT_TEI_LOG_LEVEL)
+    }
+
     /// Effective startup timeout: the per-instance override, else `default`
     pub fn startup_timeout(&self, default: std::time::Duration) -> std::time::Duration {
         self.startup_timeout_secs
@@ -666,6 +682,24 @@ health_check_interval_secs = 60
 
         // Now it should exist
         assert!(state_file.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn test_instance_log_level_defaults_to_warn() {
+        let instance = InstanceConfig::default();
+        assert_eq!(instance.log_level(), DEFAULT_TEI_LOG_LEVEL);
+        assert_eq!(instance.log_level(), "warn");
+        let custom = InstanceConfig {
+            log_level: Some("info".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(custom.log_level(), "info");
+        // Absent from serialized form when unset (state file stays clean)
+        let json = serde_json::to_string(&instance).unwrap();
+        assert!(!json.contains("log_level"));
+        let parsed: InstanceConfig =
+            toml::from_str("name = \"x\"\nmodel_id = \"m\"\nlog_level = \"debug\"").unwrap();
+        assert_eq!(parsed.log_level(), "debug");
     }
 
     #[test]

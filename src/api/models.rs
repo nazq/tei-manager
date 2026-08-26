@@ -45,6 +45,10 @@ pub struct CreateInstanceRequest {
 
     #[serde(default)]
     pub extra_args: Option<Vec<String>>,
+
+    /// `RUST_LOG` filter for the TEI child process (default: "warn")
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 /// Instance information response

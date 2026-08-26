@@ -34,6 +34,7 @@ fn arb_instance_config() -> impl Strategy<Value = InstanceConfig> {
                     prometheus_port: None,
                     startup_timeout_secs: None,
                     extra_args: Vec::new(),
+                    log_level: None,
                     created_at: None,
                 }
             },

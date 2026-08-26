@@ -1,8 +1,7 @@
 //! TeiMultiplexer service implementation - routes requests to backend TEI instances
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeListArray, Float32Array, ListArray, StringArray, StructArray,
-    UInt32Array,
+    ArrayRef, FixedSizeListArray, Float32Array, ListArray, StringArray, StructArray, UInt32Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -594,130 +593,38 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     ) -> Result<Response<mux::EmbedArrowResponse>, Status> {
         let req = request.into_inner();
         let instance_name = Self::extract_target(req.target)?;
-
         Span::current().record("instance", instance_name.as_str());
 
-        // Deserialize Arrow RecordBatch
-        let cursor = Cursor::new(&req.arrow_ipc);
-        let mut reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| Status::invalid_argument(format!("Invalid Arrow IPC: {}", e)))?;
+        let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
+        Span::current().record("num_rows", rows.len());
 
-        let batch = reader
-            .next()
-            .ok_or_else(|| Status::invalid_argument("No RecordBatch in stream"))?
-            .map_err(|e| Status::invalid_argument(format!("Failed to read RecordBatch: {}", e)))?;
-
-        Span::current().record("num_rows", batch.num_rows());
-
-        // Extract text column
-        let text_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Status::invalid_argument("First column must be StringArray"))?;
-
-        // Check if noop mode (for round-trip testing)
-        let num_rows = text_array.len();
-        let (embedding_len, flat_embeddings): (i32, Vec<f32>) = if req.noop {
-            // Noop mode: return dummy embeddings instantly
-            let emb_len = 384i32; // Standard BGE-small embedding size
-            let flat = vec![0.0f32; num_rows * emb_len as usize];
-            (emb_len, flat)
+        let outcome: RowOutcomes<Vec<f32>> = if req.noop {
+            RowOutcomes::noop(rows.len(), || vec![0.0f32; NOOP_EMBEDDING_DIM])
         } else {
-            // Normal mode: use gRPC streaming for efficiency
             let clients = self.pool.get_clients(&instance_name).await?;
-
-            // Build requests directly from Arrow array - single allocation per row
             let truncate = req.truncate;
             let normalize = Some(req.normalize);
-
-            let requests: Vec<tei::EmbedRequest> = (0..num_rows)
-                .filter(|&i| !text_array.is_null(i))
-                .map(|i| tei::EmbedRequest {
-                    inputs: text_array.value(i).to_string(),
-                    truncate,
-                    normalize,
-                    truncation_direction: 0,
-                    prompt_name: None,
-                    dimensions: None,
-                })
-                .collect();
-
-            let request_stream = tokio_stream::iter(requests);
-
-            // Call TEI's embed_stream (batched streaming)
-            let mut response_stream = clients
-                .embed
-                .clone()
-                .embed_stream(request_stream)
-                .await
-                .map_err(|e| Status::internal(format!("embed_stream failed: {}", e)))?
-                .into_inner();
-
-            // Collect responses directly into flat buffer - avoid intermediate Vec<Vec<f32>>
-            let mut flat_embeddings: Vec<f32> = Vec::new();
-            let mut emb_len: Option<i32> = None;
-
-            while let Some(result) = response_stream.next().await {
-                let response = result
-                    .map_err(|e| Status::internal(format!("Stream response error: {}", e)))?;
-
-                if emb_len.is_none() {
-                    let len = response.embeddings.len() as i32;
-                    emb_len = Some(len);
-                    // Pre-allocate for expected total size
-                    flat_embeddings.reserve(num_rows * len as usize);
-                }
-
-                flat_embeddings.extend(response.embeddings);
-            }
-
-            (emb_len.unwrap_or(384), flat_embeddings)
+            let truncation_direction = req.truncation_direction;
+            let prompt_name = req.prompt_name.clone();
+            let dimensions = req.dimensions;
+            let build = |text: &str| tei::EmbedRequest {
+                inputs: text.to_string(),
+                truncate,
+                normalize,
+                truncation_direction,
+                prompt_name: prompt_name.clone(),
+                dimensions,
+            };
+            let embed = clients.embed.clone();
+            self.with_timeout(embed_rows(rows, build, embed, |mut c, s| {
+                Box::pin(async move { c.embed_stream(s).await.map(Response::into_inner) })
+            }))
+            .await?
+            .map(|r| r.embeddings)
         };
-        let values = Arc::new(Float32Array::from(flat_embeddings)) as ArrayRef;
 
-        let field = Arc::new(Field::new("item", DataType::Float32, false));
-        let embeddings_array = FixedSizeListArray::new(field, embedding_len, values, None);
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "embeddings",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, false)),
-                embedding_len,
-            ),
-            false,
-        )]));
-
-        let result_batch =
-            RecordBatch::try_new(schema, vec![Arc::new(embeddings_array) as ArrayRef])
-                .map_err(|e| Status::internal(format!("Failed to create RecordBatch: {}", e)))?;
-
-        // Serialize to Arrow IPC with LZ4 compression
-        let mut buffer = Vec::new();
-        {
-            use arrow::ipc::CompressionType;
-            use arrow::ipc::writer::IpcWriteOptions;
-
-            let write_options = IpcWriteOptions::default()
-                .try_with_compression(Some(CompressionType::LZ4_FRAME))
-                .map_err(|e| Status::internal(format!("Failed to set compression: {}", e)))?;
-
-            let mut writer = StreamWriter::try_new_with_options(
-                &mut buffer,
-                &result_batch.schema(),
-                write_options,
-            )
-            .map_err(|e| Status::internal(format!("Failed to create IPC writer: {}", e)))?;
-
-            writer
-                .write(&result_batch)
-                .map_err(|e| Status::internal(format!("Failed to write RecordBatch: {}", e)))?;
-
-            writer
-                .finish()
-                .map_err(|e| Status::internal(format!("Failed to finish IPC writer: {}", e)))?;
-        }
-
+        let batch = arrow_batch::dense_batch(&outcome)?;
+        let buffer = arrow_batch::serialize(&batch, req.compression)?;
         Ok(Response::new(mux::EmbedArrowResponse { arrow_ipc: buffer }))
     }
 
@@ -728,171 +635,394 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     ) -> Result<Response<mux::EmbedSparseArrowResponse>, Status> {
         let req = request.into_inner();
         let instance_name = Self::extract_target(req.target)?;
-
         Span::current().record("instance", instance_name.as_str());
 
-        // Deserialize Arrow RecordBatch
-        let cursor = Cursor::new(&req.arrow_ipc);
-        let mut reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| Status::invalid_argument(format!("Invalid Arrow IPC: {}", e)))?;
+        let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
+        Span::current().record("num_rows", rows.len());
 
+        let outcome: RowOutcomes<Vec<(u32, f32)>> = if req.noop {
+            let mut i = 0u32;
+            RowOutcomes::noop(rows.len(), || {
+                let row = vec![(i, 1.0), (i + 100, 0.5), (i + 200, 0.25)];
+                i += 1;
+                row
+            })
+        } else {
+            let clients = self.pool.get_clients(&instance_name).await?;
+            let truncate = req.truncate;
+            let truncation_direction = req.truncation_direction;
+            let prompt_name = req.prompt_name.clone();
+            let build = |text: &str| tei::EmbedSparseRequest {
+                inputs: text.to_string(),
+                truncate,
+                truncation_direction,
+                prompt_name: prompt_name.clone(),
+            };
+            let embed = clients.embed.clone();
+            self.with_timeout(embed_rows(rows, build, embed, |mut c, s| {
+                Box::pin(async move { c.embed_sparse_stream(s).await.map(Response::into_inner) })
+            }))
+            .await?
+            .map(|r| {
+                r.sparse_embeddings
+                    .into_iter()
+                    .map(|sv| (sv.index, sv.value))
+                    .collect()
+            })
+        };
+
+        let batch = arrow_batch::sparse_batch(&outcome)?;
+        let buffer = arrow_batch::serialize(&batch, req.compression)?;
+        Ok(Response::new(mux::EmbedSparseArrowResponse {
+            arrow_ipc: buffer,
+        }))
+    }
+}
+
+/// Embedding dimension used by `noop` mode (BGE-small).
+const NOOP_EMBEDDING_DIM: usize = 384;
+
+/// Per-row results of a batch, aligned 1:1 with the input rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowOutcomes<T> {
+    pub rows: Vec<Result<T, String>>,
+}
+
+impl<T> RowOutcomes<T> {
+    fn noop(n: usize, mut make: impl FnMut() -> T) -> Self {
+        Self {
+            rows: (0..n).map(|_| Ok(make())).collect(),
+        }
+    }
+
+    fn map<U>(self, f: impl Fn(T) -> U) -> RowOutcomes<U> {
+        RowOutcomes {
+            rows: self.rows.into_iter().map(|r| r.map(&f)).collect(),
+        }
+    }
+
+    pub fn ok_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.is_ok()).count()
+    }
+}
+
+/// Error reported for a null input text.
+const NULL_INPUT_ERROR: &str = "input text is null";
+
+/// Stream `rows` through a TEI streaming RPC, tolerating per-row failures.
+///
+/// TEI preserves request order on its streaming RPCs, but tonic terminates a
+/// response stream at the first `Err(Status)` — and the client may receive
+/// that error *before* the successful responses buffered ahead of it, so the
+/// number of responses received does not identify the failing row. After a
+/// stream fails with `InvalidArgument` (bad input: empty, too long without
+/// `truncate`, ...), the unanswered rows are therefore probed one at a time —
+/// a single-row stream can only fail because of that row — until the culprit
+/// is found and recorded; bulk streaming then resumes with the rows after it.
+///
+/// Any other status aborts the whole batch, since it indicates a backend
+/// problem rather than a bad row.
+async fn embed_rows<Req, Res, C, B, Open, S>(
+    rows: Vec<Option<String>>,
+    build: B,
+    client: C,
+    open: Open,
+) -> Result<RowOutcomes<Res>, Status>
+where
+    Req: Send + 'static,
+    Res: Send + 'static,
+    C: Clone,
+    B: Fn(&str) -> Req,
+    S: futures::Stream<Item = Result<Res, Status>> + Unpin + Send,
+    Open: Fn(
+        C,
+        tokio_stream::Iter<std::vec::IntoIter<Req>>,
+    ) -> futures::future::BoxFuture<'static, Result<S, Status>>,
+{
+    let mut out: Vec<Option<Result<Res, String>>> = (0..rows.len()).map(|_| None).collect();
+
+    // Indices of rows that actually go to the backend (nulls are pre-failed).
+    let mut pending: Vec<usize> = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        match row {
+            Some(_) => pending.push(i),
+            None => out[i] = Some(Err(NULL_INPUT_ERROR.to_string())),
+        }
+    }
+
+    let mut cursor = 0usize;
+    // After a row-level failure, send rows singly until the bad row is found.
+    let mut probing = false;
+    while cursor < pending.len() {
+        let chunk: &[usize] = if probing {
+            &pending[cursor..cursor + 1]
+        } else {
+            &pending[cursor..]
+        };
+        let requests: Vec<Req> = chunk
+            .iter()
+            .map(|&i| build(rows[i].as_deref().unwrap_or_default()))
+            .collect();
+
+        let mut stream = open(client.clone(), tokio_stream::iter(requests))
+            .await
+            .map_err(|e| {
+                Status::new(e.code(), format!("backend stream failed: {}", e.message()))
+            })?;
+
+        let mut received = 0usize;
+        let mut failure: Option<Status> = None;
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(res) if received < chunk.len() => {
+                    out[chunk[received]] = Some(Ok(res));
+                    received += 1;
+                }
+                Ok(_) => {
+                    return Err(Status::internal(format!(
+                        "backend stream returned more than {} responses",
+                        chunk.len()
+                    )));
+                }
+                Err(status) => {
+                    failure = Some(status);
+                    break;
+                }
+            }
+        }
+
+        match failure {
+            None if received == chunk.len() => {
+                // A successful probe means the bad row is still ahead: keep
+                // probing. A successful bulk stream finishes the batch.
+                cursor += received;
+            }
+            None => {
+                return Err(Status::internal(format!(
+                    "backend stream ended early: expected {} responses, got {}",
+                    chunk.len(),
+                    received
+                )));
+            }
+            Some(status) if status.code() == tonic::Code::InvalidArgument => {
+                if probing {
+                    let idx = pending[cursor];
+                    tracing::debug!(
+                        row = idx,
+                        error = status.message(),
+                        "row rejected by backend"
+                    );
+                    out[idx] = Some(Err(status.message().to_string()));
+                    cursor += 1;
+                    probing = false;
+                } else {
+                    // Keep whatever arrived; re-probe from the first unanswered row.
+                    cursor += received;
+                    probing = true;
+                }
+            }
+            Some(status) => {
+                return Err(Status::new(
+                    status.code(),
+                    format!(
+                        "backend stream failed after {} of {} rows: {}",
+                        cursor + received,
+                        pending.len(),
+                        status.message()
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(RowOutcomes {
+        rows: out
+            .into_iter()
+            .map(|r| r.expect("every row is resolved"))
+            .collect(),
+    })
+}
+
+/// Arrow IPC parsing and construction for the batch RPCs.
+mod arrow_batch {
+    use super::*;
+    use arrow::array::{Array, BooleanBufferBuilder};
+    use arrow::buffer::NullBuffer;
+    use arrow::ipc::CompressionType;
+    use arrow::ipc::writer::IpcWriteOptions;
+
+    /// Read the first column of the first RecordBatch as text rows (`None` = null).
+    pub fn parse_text_rows(ipc: &[u8]) -> Result<Vec<Option<String>>, Status> {
+        let mut reader = StreamReader::try_new(Cursor::new(ipc), None)
+            .map_err(|e| Status::invalid_argument(format!("Invalid Arrow IPC: {}", e)))?;
         let batch = reader
             .next()
             .ok_or_else(|| Status::invalid_argument("No RecordBatch in stream"))?
             .map_err(|e| Status::invalid_argument(format!("Failed to read RecordBatch: {}", e)))?;
-
-        Span::current().record("num_rows", batch.num_rows());
-
-        // Extract text column
-        let text_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| Status::invalid_argument("First column must be StringArray"))?;
-
-        let num_rows = text_array.len();
-
-        // Collect sparse embeddings: Vec<Vec<(index, value)>>
-        let sparse_embeddings: Vec<Vec<(u32, f32)>> = if req.noop {
-            // Noop mode: return dummy sparse embeddings (3 non-zero values per row)
-            (0..num_rows)
-                .map(|i| {
-                    vec![
-                        (i as u32, 1.0),
-                        (i as u32 + 100, 0.5),
-                        (i as u32 + 200, 0.25),
-                    ]
-                })
-                .collect()
-        } else {
-            let clients = self.pool.get_clients(&instance_name).await?;
-
-            let truncate = req.truncate;
-            let requests: Vec<tei::EmbedSparseRequest> = (0..num_rows)
-                .filter(|&i| !text_array.is_null(i))
-                .map(|i| tei::EmbedSparseRequest {
-                    inputs: text_array.value(i).to_string(),
-                    truncate,
-                    truncation_direction: 0,
-                    prompt_name: None,
-                })
-                .collect();
-
-            let request_stream = tokio_stream::iter(requests);
-
-            let mut response_stream = clients
-                .embed
-                .clone()
-                .embed_sparse_stream(request_stream)
-                .await
-                .map_err(|e| Status::internal(format!("embed_sparse_stream failed: {}", e)))?
-                .into_inner();
-
-            let mut results = Vec::with_capacity(num_rows);
-            while let Some(result) = response_stream.next().await {
-                let response = result
-                    .map_err(|e| Status::internal(format!("Stream response error: {}", e)))?;
-
-                let sparse: Vec<(u32, f32)> = response
-                    .sparse_embeddings
-                    .into_iter()
-                    .map(|sv| (sv.index, sv.value))
-                    .collect();
-                results.push(sparse);
-            }
-            results
+        if batch.num_columns() == 0 {
+            return Err(Status::invalid_argument("RecordBatch has no columns"));
+        }
+        let column = batch.column(0);
+        let text = match column.data_type() {
+            DataType::Utf8 => column.as_any().downcast_ref::<StringArray>().map(|a| {
+                (0..a.len())
+                    .map(|i| a.is_valid(i).then(|| a.value(i).to_string()))
+                    .collect()
+            }),
+            DataType::LargeUtf8 => column
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .map(|a| {
+                    (0..a.len())
+                        .map(|i| a.is_valid(i).then(|| a.value(i).to_string()))
+                        .collect()
+                }),
+            DataType::Utf8View => column
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .map(|a| {
+                    (0..a.len())
+                        .map(|i| a.is_valid(i).then(|| a.value(i).to_string()))
+                        .collect()
+                }),
+            _ => None,
         };
+        text.ok_or_else(|| Status::invalid_argument("First column must be StringArray"))
+    }
 
-        // Build Arrow List<Struct<index: u32, value: f32>> array
+    fn error_column<T>(outcome: &RowOutcomes<T>) -> ArrayRef {
+        Arc::new(StringArray::from_iter(
+            outcome
+                .rows
+                .iter()
+                .map(|r| r.as_ref().err().map(String::as_str)),
+        ))
+    }
+
+    fn validity<T>(outcome: &RowOutcomes<T>) -> Option<NullBuffer> {
+        if outcome.rows.iter().all(|r| r.is_ok()) {
+            return None;
+        }
+        let mut b = BooleanBufferBuilder::new(outcome.rows.len());
+        for r in &outcome.rows {
+            b.append(r.is_ok());
+        }
+        Some(NullBuffer::new(b.finish()))
+    }
+
+    /// `embeddings: FixedSizeList<f32>[dim]?`, `error: Utf8?`
+    pub fn dense_batch(outcome: &RowOutcomes<Vec<f32>>) -> Result<RecordBatch, Status> {
+        let dim = outcome
+            .rows
+            .iter()
+            .find_map(|r| r.as_ref().ok().map(Vec::len))
+            .unwrap_or(0);
+        let mut flat: Vec<f32> = Vec::with_capacity(outcome.rows.len() * dim);
+        for r in &outcome.rows {
+            match r {
+                Ok(v) if v.len() == dim => flat.extend_from_slice(v),
+                Ok(v) => {
+                    return Err(Status::internal(format!(
+                        "inconsistent embedding dimensions: {} vs {}",
+                        v.len(),
+                        dim
+                    )));
+                }
+                Err(_) => flat.extend(std::iter::repeat_n(0.0f32, dim)),
+            }
+        }
+        let item = Arc::new(Field::new("item", DataType::Float32, false));
+        let values = Arc::new(Float32Array::from(flat)) as ArrayRef;
+        let embeddings =
+            FixedSizeListArray::try_new(item.clone(), dim as i32, values, validity(outcome))
+                .map_err(|e| {
+                    Status::internal(format!("Failed to build embeddings column: {}", e))
+                })?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "embeddings",
+                DataType::FixedSizeList(item, dim as i32),
+                true,
+            ),
+            Field::new("error", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(embeddings) as ArrayRef, error_column(outcome)],
+        )
+        .map_err(|e| Status::internal(format!("Failed to create RecordBatch: {}", e)))
+    }
+
+    /// `sparse_embeddings: List<Struct<index:u32, value:f32>>?`, `error: Utf8?`
+    pub fn sparse_batch(outcome: &RowOutcomes<Vec<(u32, f32)>>) -> Result<RecordBatch, Status> {
         let struct_fields = Fields::from(vec![
             Field::new("index", DataType::UInt32, false),
             Field::new("value", DataType::Float32, false),
         ]);
-
-        // Given `sparse_embeddings: Vec<Vec<(u32, f32)>>`, where each inner vector
-        // contains `(index, value)` pairs, this computes a cumulative offset list
-        // indicating where each embedding would start if all of them were flattened
-        // into one contiguous buffer.
-        //
-        // The code starts with 0, then uses `scan` to accumulate each vector’s length
-        // into a running total. The result is suitable for prefix-indexing into a
-        // flattened sparse buffer.
-        let offsets: Vec<i32> = std::iter::once(0)
-            .chain(sparse_embeddings.iter().scan(0i32, |acc, sparse| {
-                *acc += sparse.len() as i32;
-                Some(*acc)
-            }))
-            .collect();
-
-        // Flatten indices and values in parallel using unzip
-        let (all_indices, all_values): (Vec<u32>, Vec<f32>) = sparse_embeddings
-            .iter()
-            .flat_map(|sparse| sparse.iter().copied())
-            .unzip();
-
-        let indices_array = Arc::new(UInt32Array::from(all_indices)) as ArrayRef;
-        let values_array = Arc::new(Float32Array::from(all_values)) as ArrayRef;
-
+        let mut offsets: Vec<i32> = Vec::with_capacity(outcome.rows.len() + 1);
+        offsets.push(0);
+        let mut indices: Vec<u32> = Vec::new();
+        let mut values: Vec<f32> = Vec::new();
+        for r in &outcome.rows {
+            if let Ok(sparse) = r {
+                for &(i, v) in sparse {
+                    indices.push(i);
+                    values.push(v);
+                }
+            }
+            offsets.push(indices.len() as i32);
+        }
         let struct_array = StructArray::new(
             struct_fields.clone(),
-            vec![indices_array, values_array],
+            vec![
+                Arc::new(UInt32Array::from(indices)) as ArrayRef,
+                Arc::new(Float32Array::from(values)) as ArrayRef,
+            ],
             None,
         );
-
-        let list_field = Arc::new(Field::new(
-            "item",
-            DataType::Struct(struct_fields.clone()),
-            false,
-        ));
-        let list_array = ListArray::new(
-            list_field,
+        let item = Arc::new(Field::new("item", DataType::Struct(struct_fields), false));
+        let list = ListArray::try_new(
+            item.clone(),
             OffsetBuffer::new(offsets.into()),
             Arc::new(struct_array),
-            None,
-        );
+            validity(outcome),
+        )
+        .map_err(|e| Status::internal(format!("Failed to build sparse column: {}", e)))?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sparse_embeddings", DataType::List(item), true),
+            Field::new("error", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(list) as ArrayRef, error_column(outcome)],
+        )
+        .map_err(|e| Status::internal(format!("Failed to create RecordBatch: {}", e)))
+    }
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "sparse_embeddings",
-            DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Struct(struct_fields),
-                false,
-            ))),
-            false,
-        )]));
-
-        let result_batch = RecordBatch::try_new(schema, vec![Arc::new(list_array) as ArrayRef])
-            .map_err(|e| Status::internal(format!("Failed to create RecordBatch: {}", e)))?;
-
-        // Serialize to Arrow IPC with LZ4 compression
+    /// Serialize to Arrow IPC stream format with the requested compression.
+    pub fn serialize(batch: &RecordBatch, compression: i32) -> Result<Vec<u8>, Status> {
+        let compression = match mux::ArrowCompression::try_from(compression) {
+            Ok(mux::ArrowCompression::Lz4) => Some(CompressionType::LZ4_FRAME),
+            Ok(mux::ArrowCompression::None) => None,
+            Err(_) => {
+                return Err(Status::invalid_argument(format!(
+                    "unknown compression value {compression}"
+                )));
+            }
+        };
+        let options = IpcWriteOptions::default()
+            .try_with_compression(compression)
+            .map_err(|e| Status::internal(format!("Failed to set compression: {}", e)))?;
         let mut buffer = Vec::new();
-        {
-            use arrow::ipc::CompressionType;
-            use arrow::ipc::writer::IpcWriteOptions;
-
-            let write_options = IpcWriteOptions::default()
-                .try_with_compression(Some(CompressionType::LZ4_FRAME))
-                .map_err(|e| Status::internal(format!("Failed to set compression: {}", e)))?;
-
-            let mut writer = StreamWriter::try_new_with_options(
-                &mut buffer,
-                &result_batch.schema(),
-                write_options,
-            )
+        let mut writer = StreamWriter::try_new_with_options(&mut buffer, &batch.schema(), options)
             .map_err(|e| Status::internal(format!("Failed to create IPC writer: {}", e)))?;
-
-            writer
-                .write(&result_batch)
-                .map_err(|e| Status::internal(format!("Failed to write RecordBatch: {}", e)))?;
-
-            writer
-                .finish()
-                .map_err(|e| Status::internal(format!("Failed to finish IPC writer: {}", e)))?;
-        }
-
-        Ok(Response::new(mux::EmbedSparseArrowResponse {
-            arrow_ipc: buffer,
-        }))
+        writer
+            .write(batch)
+            .map_err(|e| Status::internal(format!("Failed to write RecordBatch: {}", e)))?;
+        writer
+            .finish()
+            .map_err(|e| Status::internal(format!("Failed to finish IPC writer: {}", e)))?;
+        Ok(buffer)
     }
 }
 
@@ -901,6 +1031,7 @@ mod tests {
     use super::*;
     use crate::config::InstanceConfig;
     use crate::registry::Registry;
+    use arrow::array::Array;
     use std::sync::Arc;
     use tonic::Code;
 
@@ -1459,6 +1590,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: false,
+            ..Default::default()
         });
         let result = service.embed_arrow(request).await;
         assert!(result.is_err());
@@ -1476,6 +1608,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: false,
+            ..Default::default()
         });
         let result = service.embed_arrow(request).await;
         assert!(result.is_err());
@@ -1495,6 +1628,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: false,
+            ..Default::default()
         });
         let result = service.embed_arrow(request).await;
         assert!(result.is_err());
@@ -1532,6 +1666,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: true, // Noop mode - returns dummy embeddings
+            ..Default::default()
         });
 
         let result = service.embed_arrow(request).await;
@@ -1582,6 +1717,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: true,
+            ..Default::default()
         });
 
         let result = service.embed_arrow(request).await;
@@ -1623,6 +1759,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: false, // Not noop, so it will try to find instance
+            ..Default::default()
         });
 
         let result = service.embed_arrow(request).await;
@@ -1660,6 +1797,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: true,
+            ..Default::default()
         });
 
         let result = service.embed_arrow(request).await;
@@ -1704,6 +1842,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: true,
+            ..Default::default()
         });
 
         let result = service.embed_arrow(request).await;
@@ -1747,6 +1886,7 @@ mod tests {
             truncate: true,
             normalize: true,
             noop: true,
+            ..Default::default()
         });
 
         let result = service.embed_arrow(request).await;
@@ -1780,6 +1920,421 @@ mod tests {
     }
 
     // ========================================================================
+    // Per-row error handling (embed_rows) Tests
+    // ========================================================================
+
+    /// Fake backend: `script[k]` is what the k-th opened stream yields,
+    /// regardless of how many requests it received (mirrors tonic, where a
+    /// mid-stream error can hide the OK responses buffered ahead of it).
+    /// Each opened stream also records how many requests it was sent.
+    type Script = Arc<std::sync::Mutex<Vec<Vec<Result<u32, Status>>>>>;
+    type Sent = Arc<std::sync::Mutex<Vec<usize>>>;
+
+    async fn run_rows(
+        rows: Vec<Option<&str>>,
+        script: Vec<Vec<Result<u32, Status>>>,
+    ) -> (Result<RowOutcomes<u32>, Status>, Vec<usize>) {
+        let script: Script = Arc::new(std::sync::Mutex::new(script));
+        let sent: Sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sent_c = sent.clone();
+        let result = embed_rows(
+            rows.into_iter().map(|r| r.map(str::to_string)).collect(),
+            |text: &str| text.to_string(),
+            (),
+            move |(), reqs: tokio_stream::Iter<std::vec::IntoIter<String>>| {
+                let script = script.clone();
+                let sent = sent_c.clone();
+                Box::pin(async move {
+                    let n = reqs.collect::<Vec<_>>().await.len();
+                    sent.lock().unwrap().push(n);
+                    let mut script = script.lock().unwrap();
+                    assert!(
+                        !script.is_empty(),
+                        "backend opened more streams than scripted"
+                    );
+                    Ok(tokio_stream::iter(script.remove(0)))
+                })
+            },
+        )
+        .await;
+        let sent = sent.lock().unwrap().clone();
+        (result, sent)
+    }
+
+    fn bad(msg: &str) -> Result<u32, Status> {
+        Err(Status::invalid_argument(msg))
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_all_ok_single_stream() {
+        let (res, sent) = run_rows(
+            vec![Some("a"), Some("b"), Some("c")],
+            vec![vec![Ok(1), Ok(2), Ok(3)]],
+        )
+        .await;
+        assert_eq!(res.unwrap().rows, vec![Ok(1), Ok(2), Ok(3)]);
+        assert_eq!(sent, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_probes_after_failure_with_buffered_ok_delivered() {
+        // Stream 1 delivers row0 then fails (row1 bad). Probe row1 → fails →
+        // recorded. Bulk resumes with rows 2..4.
+        let (res, sent) = run_rows(
+            vec![Some("a"), Some("b"), Some("c"), Some("d")],
+            vec![
+                vec![Ok(1), bad("too long")],
+                vec![bad("too long")],
+                vec![Ok(3), Ok(4)],
+            ],
+        )
+        .await;
+        let out = res.unwrap();
+        assert_eq!(
+            out.rows,
+            vec![Ok(1), Err("too long".to_string()), Ok(3), Ok(4)]
+        );
+        assert_eq!(sent, vec![4, 1, 2]);
+        assert_eq!(out.ok_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_probes_after_failure_with_buffered_ok_lost() {
+        // Stream 1 fails immediately even though row0 was fine (tonic hid the
+        // buffered OK). Probes continue past the OK row until the bad one is
+        // found; bulk resumes at row2.
+        let (res, sent) = run_rows(
+            vec![Some("a"), Some("b"), Some("c")],
+            vec![
+                vec![bad("too long")],
+                vec![Ok(1)],
+                vec![bad("too long")],
+                vec![Ok(3)],
+            ],
+        )
+        .await;
+        let out = res.unwrap();
+        assert_eq!(out.rows, vec![Ok(1), Err("too long".to_string()), Ok(3)]);
+        assert_eq!(sent, vec![3, 1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_consecutive_bad_rows() {
+        let (res, sent) = run_rows(
+            vec![Some("a"), Some("b"), Some("c")],
+            vec![
+                vec![bad("e1")], // bulk [a,b,c] fails
+                vec![bad("e1")], // probe a → recorded
+                vec![bad("e2")], // bulk [b,c] fails
+                vec![bad("e2")], // probe b → recorded
+                vec![Ok(3)],     // bulk [c]
+            ],
+        )
+        .await;
+        let out = res.unwrap();
+        assert_eq!(
+            out.rows,
+            vec![Err("e1".to_string()), Err("e2".to_string()), Ok(3)]
+        );
+        assert_eq!(sent, vec![3, 1, 2, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_last_row_bad() {
+        let (res, sent) = run_rows(
+            vec![Some("a"), Some("b")],
+            vec![vec![Ok(1), bad("e")], vec![bad("e")]],
+        )
+        .await;
+        assert_eq!(res.unwrap().rows, vec![Ok(1), Err("e".to_string())]);
+        assert_eq!(sent, vec![2, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_null_inputs_never_sent() {
+        let (res, sent) = run_rows(vec![None, Some("b"), None], vec![vec![Ok(2)]]).await;
+        assert_eq!(
+            res.unwrap().rows,
+            vec![
+                Err(NULL_INPUT_ERROR.to_string()),
+                Ok(2),
+                Err(NULL_INPUT_ERROR.to_string())
+            ]
+        );
+        assert_eq!(sent, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_all_null_opens_no_stream() {
+        let (res, sent) = run_rows(vec![None, None], vec![]).await;
+        assert_eq!(res.unwrap().ok_count(), 0);
+        assert!(sent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_backend_error_aborts_batch() {
+        let (res, _) = run_rows(
+            vec![Some("a"), Some("b"), Some("c")],
+            vec![vec![Ok(1), Err(Status::unavailable("gpu gone"))]],
+        )
+        .await;
+        let err = res.unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert!(
+            err.message().contains("after 1 of 3 rows"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("gpu gone"));
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_short_stream_is_internal_error() {
+        let (res, _) = run_rows(vec![Some("a"), Some("b")], vec![vec![Ok(1)]]).await;
+        let err = res.unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert!(err.message().contains("expected 2 responses, got 1"));
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_extra_responses_is_internal_error() {
+        let (res, _) = run_rows(vec![Some("a")], vec![vec![Ok(1), Ok(2)]]).await;
+        let err = res.unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert!(err.message().contains("more than 1 responses"));
+    }
+
+    #[tokio::test]
+    async fn test_embed_rows_open_failure_propagates_code() {
+        let result: Result<RowOutcomes<u32>, Status> = embed_rows(
+            vec![Some("a".to_string())],
+            |t: &str| t.to_string(),
+            (),
+            |(), _reqs: tokio_stream::Iter<std::vec::IntoIter<String>>| {
+                Box::pin(async {
+                    Err::<tokio_stream::Iter<std::vec::IntoIter<Result<u32, Status>>>, _>(
+                        Status::unavailable("connect refused"),
+                    )
+                })
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert!(err.message().starts_with("backend stream failed"));
+    }
+
+    // ========================================================================
+    // Arrow batch construction Tests
+    // ========================================================================
+
+    fn dense_outcome() -> RowOutcomes<Vec<f32>> {
+        RowOutcomes {
+            rows: vec![
+                Ok(vec![1.0, 2.0]),
+                Err("bad row".to_string()),
+                Ok(vec![3.0, 4.0]),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_dense_batch_aligns_rows_and_errors() {
+        use arrow::array::FixedSizeListArray;
+        let batch = arrow_batch::dense_batch(&dense_outcome()).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.schema().field(0).name(), "embeddings");
+        assert_eq!(batch.schema().field(1).name(), "error");
+
+        let emb = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(emb.value_length(), 2);
+        assert!(emb.is_valid(0));
+        assert!(emb.is_null(1));
+        assert!(emb.is_valid(2));
+        let row2 = emb.value(2);
+        let row2 = row2.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(row2.values(), &[3.0, 4.0]);
+
+        let err = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(err.is_null(0));
+        assert_eq!(err.value(1), "bad row");
+        assert!(err.is_null(2));
+    }
+
+    #[test]
+    fn test_dense_batch_all_ok_has_no_null_buffer() {
+        let outcome = RowOutcomes {
+            rows: vec![Ok(vec![1.0f32]), Ok(vec![2.0])],
+        };
+        let batch = arrow_batch::dense_batch(&outcome).unwrap();
+        assert_eq!(batch.column(0).null_count(), 0);
+        assert_eq!(batch.column(1).null_count(), 2);
+    }
+
+    #[test]
+    fn test_dense_batch_all_failed_has_zero_dim() {
+        use arrow::array::FixedSizeListArray;
+        let outcome: RowOutcomes<Vec<f32>> = RowOutcomes {
+            rows: vec![Err("x".to_string()), Err("y".to_string())],
+        };
+        let batch = arrow_batch::dense_batch(&outcome).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let emb = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(emb.value_length(), 0);
+        assert_eq!(emb.null_count(), 2);
+    }
+
+    #[test]
+    fn test_dense_batch_rejects_mixed_dimensions() {
+        let outcome = RowOutcomes {
+            rows: vec![Ok(vec![1.0f32, 2.0]), Ok(vec![3.0])],
+        };
+        let err = arrow_batch::dense_batch(&outcome).unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert!(err.message().contains("inconsistent embedding dimensions"));
+    }
+
+    #[test]
+    fn test_sparse_batch_aligns_rows_and_errors() {
+        let outcome: RowOutcomes<Vec<(u32, f32)>> = RowOutcomes {
+            rows: vec![
+                Ok(vec![(1, 0.5), (7, 0.25)]),
+                Err("nope".to_string()),
+                Ok(vec![]),
+                Ok(vec![(3, 1.0)]),
+            ],
+        };
+        let batch = arrow_batch::sparse_batch(&outcome).unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(list.value_offsets(), &[0, 2, 2, 2, 3]);
+        assert!(list.is_null(1));
+        assert!(list.is_valid(2)); // empty but present
+        let err = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(err.value(1), "nope");
+        assert_eq!(err.null_count(), 3);
+    }
+
+    fn ipc_from_array(array: ArrayRef, name: &str) -> Vec<u8> {
+        use arrow::ipc::writer::StreamWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            name,
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let mut buf = Vec::new();
+        let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+        buf
+    }
+
+    #[test]
+    fn test_parse_text_rows_preserves_nulls() {
+        let ipc = ipc_from_array(
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+            "text",
+        );
+        let rows = arrow_batch::parse_text_rows(&ipc).unwrap();
+        assert_eq!(
+            rows,
+            vec![Some("a".to_string()), None, Some("c".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_text_rows_accepts_large_and_view_utf8() {
+        let ipc = ipc_from_array(
+            Arc::new(arrow::array::LargeStringArray::from(vec!["x", "y"])),
+            "text",
+        );
+        assert_eq!(arrow_batch::parse_text_rows(&ipc).unwrap().len(), 2);
+        let ipc = ipc_from_array(
+            Arc::new(arrow::array::StringViewArray::from(vec!["x"])),
+            "text",
+        );
+        assert_eq!(arrow_batch::parse_text_rows(&ipc).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_text_rows_rejects_no_columns() {
+        use arrow::ipc::writer::StreamWriter;
+        let schema = Arc::new(Schema::empty());
+        let mut buf = Vec::new();
+        let mut w = StreamWriter::try_new(&mut buf, &schema).unwrap();
+        let batch = RecordBatch::try_new_with_options(
+            schema,
+            vec![],
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(0)),
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+        let err = arrow_batch::parse_text_rows(&buf).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("no columns"));
+    }
+
+    #[test]
+    fn test_serialize_compression_modes() {
+        let batch = arrow_batch::dense_batch(&dense_outcome()).unwrap();
+        let plain = arrow_batch::serialize(&batch, mux::ArrowCompression::None as i32).unwrap();
+        let lz4 = arrow_batch::serialize(&batch, mux::ArrowCompression::Lz4 as i32).unwrap();
+        for buf in [&plain, &lz4] {
+            let mut reader = StreamReader::try_new(Cursor::new(buf), None).unwrap();
+            let rt = reader.next().unwrap().unwrap();
+            assert_eq!(rt.num_rows(), 3);
+            assert_eq!(rt.column(0).null_count(), 1);
+        }
+        let err = arrow_batch::serialize(&batch, 42).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_noop_null_row_reports_error() {
+        let service = create_test_service();
+        let arrow_ipc = ipc_from_array(Arc::new(StringArray::from(vec![Some("a"), None])), "text");
+        let request = Request::new(mux::EmbedArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc,
+            truncate: true,
+            normalize: true,
+            noop: true,
+            ..Default::default()
+        });
+        // noop mode short-circuits the backend entirely, so both rows succeed;
+        // this pins that noop never touches the pool and keeps row count.
+        let response = service.embed_arrow(request).await.unwrap().into_inner();
+        let mut reader = StreamReader::try_new(Cursor::new(response.arrow_ipc), None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 2);
+    }
+
+    // ========================================================================
     // EmbedSparseArrow RPC Tests
     // ========================================================================
 
@@ -1791,6 +2346,7 @@ mod tests {
             arrow_ipc: vec![],
             truncate: true,
             noop: false,
+            ..Default::default()
         });
         let result = service.embed_sparse_arrow(request).await;
         assert!(result.is_err());
@@ -1807,6 +2363,7 @@ mod tests {
             arrow_ipc: vec![1, 2, 3, 4], // Invalid Arrow IPC bytes
             truncate: true,
             noop: false,
+            ..Default::default()
         });
         let result = service.embed_sparse_arrow(request).await;
         assert!(result.is_err());
@@ -1825,6 +2382,7 @@ mod tests {
             arrow_ipc: vec![], // Empty Arrow IPC
             truncate: true,
             noop: false,
+            ..Default::default()
         });
         let result = service.embed_sparse_arrow(request).await;
         assert!(result.is_err());
@@ -1861,6 +2419,7 @@ mod tests {
             arrow_ipc,
             truncate: true,
             noop: true, // Noop mode - returns dummy sparse embeddings
+            ..Default::default()
         });
 
         let result = service.embed_sparse_arrow(request).await;
@@ -1910,6 +2469,7 @@ mod tests {
             arrow_ipc,
             truncate: true,
             noop: true,
+            ..Default::default()
         });
 
         let result = service.embed_sparse_arrow(request).await;
@@ -1950,6 +2510,7 @@ mod tests {
             arrow_ipc,
             truncate: true,
             noop: false, // Not noop, so it will try to find instance
+            ..Default::default()
         });
 
         let result = service.embed_sparse_arrow(request).await;
@@ -1986,6 +2547,7 @@ mod tests {
             arrow_ipc,
             truncate: true,
             noop: true,
+            ..Default::default()
         });
 
         let result = service.embed_sparse_arrow(request).await;
@@ -2028,6 +2590,7 @@ mod tests {
             arrow_ipc,
             truncate: true,
             noop: true,
+            ..Default::default()
         });
 
         let result = service.embed_sparse_arrow(request).await;

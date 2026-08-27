@@ -113,6 +113,20 @@ gpu_preflight = "warn"
 auto_max_batch_tokens_per_gib = 2048
 
 # =============================================================================
+# OpenTelemetry (Optional)
+# =============================================================================
+# Every request span (gRPC and REST) is parented on the caller's W3C
+# `traceparent`, and the hop to text-embeddings-router forwards it. Export is
+# OTLP/gRPC; leave endpoint empty to disable export (context is still
+# propagated and trace_id/span_id still appear in JSON logs).
+#
+# [otel]
+# endpoint = "http://otel-collector:4317"   # Override via: TEI_MANAGER_OTEL_ENDPOINT
+# service_name = "tei-manager"
+# sample_ratio = 1.0                        # head-based sampling, 0.0–1.0
+# deployment_environment = "dev"            # empty = unset
+
+# =============================================================================
 # Authentication Configuration (Optional)
 # =============================================================================
 

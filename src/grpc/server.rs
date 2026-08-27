@@ -53,8 +53,9 @@ where
     let max_message_size_mb = options.max_message_size_mb;
     let (service, reflection_service, max_message_size) = build_services(registry, options)?;
 
-    // Build server with optional TLS
-    let mut builder = Server::builder();
+    // Build server with optional TLS; one span per RPC, parented on the
+    // caller's traceparent
+    let mut builder = Server::builder().layer(crate::otel::grpc_trace_layer());
 
     if let Some((cert_pem, key_pem, ca_pem)) = tls_config {
         tracing::info!(
@@ -105,8 +106,9 @@ pub async fn start_grpc_server(
     let max_message_size_mb = options.max_message_size_mb;
     let (service, reflection_service, max_message_size) = build_services(registry, options)?;
 
-    // Build server with optional TLS
-    let mut builder = Server::builder();
+    // Build server with optional TLS; one span per RPC, parented on the
+    // caller's traceparent
+    let mut builder = Server::builder().layer(crate::otel::grpc_trace_layer());
 
     if let Some((cert_pem, key_pem, ca_pem)) = tls_config {
         tracing::info!(

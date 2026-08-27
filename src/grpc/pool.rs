@@ -5,7 +5,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 use tonic::Status;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Channel, Endpoint};
+
+use crate::otel::TraceContextInterceptor;
+
+/// Backend channel that forwards the current trace context to TEI
+pub type BackendChannel = InterceptedService<Channel, TraceContextInterceptor>;
 
 use super::proto::tei::v1::{
     embed_client::EmbedClient, info_client::InfoClient, predict_client::PredictClient,
@@ -17,11 +23,11 @@ use crate::registry::Registry;
 /// Cheap to clone (all fields are Arc internally)
 #[derive(Clone, Debug)]
 pub struct BackendClients {
-    pub embed: EmbedClient<Channel>,
-    pub predict: PredictClient<Channel>,
-    pub rerank: RerankClient<Channel>,
-    pub tokenize: TokenizeClient<Channel>,
-    pub info: InfoClient<Channel>,
+    pub embed: EmbedClient<BackendChannel>,
+    pub predict: PredictClient<BackendChannel>,
+    pub rerank: RerankClient<BackendChannel>,
+    pub tokenize: TokenizeClient<BackendChannel>,
+    pub info: InfoClient<BackendChannel>,
 }
 
 /// Connection entry with metadata for pruning
@@ -290,11 +296,11 @@ impl BackendPool {
 
         // Create all clients (they share the channel internally via HTTP/2 multiplexing)
         let clients = BackendClients {
-            embed: EmbedClient::new(channel.clone()),
-            predict: PredictClient::new(channel.clone()),
-            rerank: RerankClient::new(channel.clone()),
-            tokenize: TokenizeClient::new(channel.clone()),
-            info: InfoClient::new(channel),
+            embed: EmbedClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            predict: PredictClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            rerank: RerankClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            tokenize: TokenizeClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            info: InfoClient::with_interceptor(channel, TraceContextInterceptor),
         };
 
         tracing::debug!(

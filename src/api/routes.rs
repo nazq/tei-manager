@@ -10,7 +10,7 @@ use axum::{
 };
 use std::sync::Arc;
 use tower::ServiceBuilder;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::cors::CorsLayer;
 
 use super::handlers;
 
@@ -97,11 +97,13 @@ pub fn create_router(state: AppState) -> Router {
 
     router = router.merge(protected_routes);
 
-    router.with_state(state).layer(
-        ServiceBuilder::new()
-            .layer(TraceLayer::new_for_http())
-            .layer(CorsLayer::permissive()),
-    )
+    // OtelAxumLayer (outermost) extracts `traceparent` and opens the request
+    // span; OtelInResponseLayer echoes the trace context back to the caller.
+    router
+        .with_state(state)
+        .layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
+        .layer(axum_tracing_opentelemetry::middleware::OtelInResponseLayer)
+        .layer(axum_tracing_opentelemetry::middleware::OtelAxumLayer::default())
 }
 
 #[cfg(test)]

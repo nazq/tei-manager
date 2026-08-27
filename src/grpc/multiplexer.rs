@@ -95,7 +95,7 @@ macro_rules! impl_stream_rpc {
             .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
 
         let instance_name = Self::extract_target(first_req.target)?;
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         // Get backend client
         let clients = $self.pool.get_clients(&instance_name).await?;
@@ -246,7 +246,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Info Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn info(
         &self,
         request: Request<mux::InfoRequest>,
@@ -255,7 +255,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         let instance_name = Self::extract_target(req.target)?;
 
         // Record instance name in span for tracing
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         // Get backend client (lock-free lookup)
         let clients = self.pool.get_clients(&instance_name).await?;
@@ -272,7 +272,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Embed Service - Unary RPCs
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(instance, inputs_len))]
+    #[instrument(skip(self, request), fields(tei.instance, tei.inputs_len))]
     async fn embed(
         &self,
         request: Request<mux::EmbedRequest>,
@@ -287,8 +287,8 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
 
         // Record metrics
         Span::current()
-            .record("instance", instance_name.as_str())
-            .record("inputs_len", embed_req.inputs.len());
+            .record("tei.instance", instance_name.as_str())
+            .record("tei.inputs_len", embed_req.inputs.len());
 
         // Get backend client
         let clients = self.pool.get_clients(&instance_name).await?;
@@ -301,7 +301,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn embed_sparse(
         &self,
         request: Request<mux::EmbedSparseRequest>,
@@ -313,7 +313,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .request
             .ok_or_else(|| Status::invalid_argument("Missing embed_sparse request"))?;
 
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
         let response = self
@@ -323,7 +323,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn embed_all(
         &self,
         request: Request<mux::EmbedAllRequest>,
@@ -335,7 +335,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .request
             .ok_or_else(|| Status::invalid_argument("Missing embed_all request"))?;
 
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
         let response = self
@@ -352,7 +352,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type EmbedStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EmbedResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn embed_stream(
         &self,
         request: Request<Streaming<mux::EmbedRequest>>,
@@ -363,7 +363,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type EmbedSparseStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EmbedSparseResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn embed_sparse_stream(
         &self,
         request: Request<Streaming<mux::EmbedSparseRequest>>,
@@ -380,7 +380,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type EmbedAllStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EmbedAllResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn embed_all_stream(
         &self,
         request: Request<Streaming<mux::EmbedAllRequest>>,
@@ -392,7 +392,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Predict Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn predict(
         &self,
         request: Request<mux::PredictRequest>,
@@ -404,7 +404,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .request
             .ok_or_else(|| Status::invalid_argument("Missing predict request"))?;
 
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
         let response = self
@@ -414,7 +414,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn predict_pair(
         &self,
         request: Request<mux::PredictPairRequest>,
@@ -426,7 +426,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .request
             .ok_or_else(|| Status::invalid_argument("Missing predict_pair request"))?;
 
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
         let response = self
@@ -439,7 +439,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type PredictStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::PredictResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn predict_stream(
         &self,
         request: Request<Streaming<mux::PredictRequest>>,
@@ -450,7 +450,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type PredictPairStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::PredictResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn predict_pair_stream(
         &self,
         request: Request<Streaming<mux::PredictPairRequest>>,
@@ -468,7 +468,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Rerank Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn rerank(
         &self,
         request: Request<mux::RerankRequest>,
@@ -480,7 +480,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .request
             .ok_or_else(|| Status::invalid_argument("Missing rerank request"))?;
 
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
         let response = self
@@ -490,7 +490,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn rerank_stream(
         &self,
         request: Request<Streaming<mux::RerankStreamRequest>>,
@@ -504,7 +504,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
 
         let instance_name = Self::extract_target(first_req.target)?;
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
 
@@ -538,7 +538,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Tokenize Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn tokenize(
         &self,
         request: Request<mux::EncodeRequest>,
@@ -550,7 +550,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .request
             .ok_or_else(|| Status::invalid_argument("Missing tokenize request"))?;
 
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
         let response = self
@@ -563,7 +563,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type TokenizeStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EncodeResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn tokenize_stream(
         &self,
         request: Request<Streaming<mux::EncodeRequest>>,
@@ -571,7 +571,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         impl_stream_rpc!(self, request, mux::EncodeRequest, tokenize, tokenize_stream)
     }
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn decode(
         &self,
         request: Request<mux::DecodeRequest>,
@@ -583,7 +583,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .request
             .ok_or_else(|| Status::invalid_argument("Missing decode request"))?;
 
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
         let response = self
@@ -596,7 +596,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type DecodeStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::DecodeResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(instance))]
+    #[instrument(skip(self, request), fields(tei.instance))]
     async fn decode_stream(
         &self,
         request: Request<Streaming<mux::DecodeRequest>>,
@@ -608,18 +608,28 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Arrow Batch Embedding
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(instance, num_rows))]
+    #[instrument(
+        name = "tei.embed_arrow",
+        skip(self, request),
+        fields(tei.instance, tei.rows, tei.rows_failed, tei.output_dtype, tei.noop)
+    )]
     async fn embed_arrow(
         &self,
         request: Request<mux::EmbedArrowRequest>,
     ) -> Result<Response<mux::EmbedArrowResponse>, Status> {
         let req = request.into_inner();
         let instance_name = Self::extract_target(req.target)?;
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
-        Span::current().record("num_rows", rows.len());
         let output_dtype = self.output_dtype(req.output_dtype)?;
+        Span::current()
+            .record("tei.rows", rows.len())
+            .record(
+                "tei.output_dtype",
+                format!("{output_dtype:?}").to_lowercase(),
+            )
+            .record("tei.noop", req.noop);
 
         let outcome: RowOutcomes<Vec<f32>> = if req.noop {
             RowOutcomes::noop(rows.len(), || vec![0.0f32; NOOP_EMBEDDING_DIM])
@@ -646,22 +656,29 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .map(|r| r.embeddings)
         };
 
+        Span::current().record("tei.rows_failed", outcome.rows.len() - outcome.ok_count());
         let batch = arrow_batch::dense_batch(&outcome, output_dtype)?;
         let buffer = arrow_batch::serialize(&batch, req.compression)?;
         Ok(Response::new(mux::EmbedArrowResponse { arrow_ipc: buffer }))
     }
 
-    #[instrument(skip(self, request), fields(instance, num_rows))]
+    #[instrument(
+        name = "tei.embed_sparse_arrow",
+        skip(self, request),
+        fields(tei.instance, tei.rows, tei.rows_failed, tei.noop)
+    )]
     async fn embed_sparse_arrow(
         &self,
         request: Request<mux::EmbedSparseArrowRequest>,
     ) -> Result<Response<mux::EmbedSparseArrowResponse>, Status> {
         let req = request.into_inner();
         let instance_name = Self::extract_target(req.target)?;
-        Span::current().record("instance", instance_name.as_str());
+        Span::current().record("tei.instance", instance_name.as_str());
 
         let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
-        Span::current().record("num_rows", rows.len());
+        Span::current()
+            .record("tei.rows", rows.len())
+            .record("tei.noop", req.noop);
 
         let outcome: RowOutcomes<Vec<(u32, f32)>> = if req.noop {
             let mut i = 0u32;
@@ -694,6 +711,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             })
         };
 
+        Span::current().record("tei.rows_failed", outcome.rows.len() - outcome.ok_count());
         let batch = arrow_batch::sparse_batch(&outcome)?;
         let buffer = arrow_batch::serialize(&batch, req.compression)?;
         Ok(Response::new(mux::EmbedSparseArrowResponse {
@@ -745,6 +763,11 @@ const NULL_INPUT_ERROR: &str = "input text is null";
 ///
 /// Any other status aborts the whole batch, since it indicates a backend
 /// problem rather than a bad row.
+#[instrument(
+    name = "tei.embed_stream",
+    skip_all,
+    fields(tei.rows = rows.len(), tei.batches, tei.errors)
+)]
 async fn embed_rows<Req, Res, C, B, Open, S>(
     rows: Vec<Option<String>>,
     build: B,
@@ -776,7 +799,9 @@ where
     let mut cursor = 0usize;
     // After a row-level failure, send rows singly until the bad row is found.
     let mut probing = false;
+    let mut batches = 0usize;
     while cursor < pending.len() {
+        batches += 1;
         let chunk: &[usize] = if probing {
             &pending[cursor..cursor + 1]
         } else {
@@ -858,12 +883,14 @@ where
         }
     }
 
-    Ok(RowOutcomes {
-        rows: out
-            .into_iter()
-            .map(|r| r.expect("every row is resolved"))
-            .collect(),
-    })
+    let rows: Vec<Result<Res, String>> = out
+        .into_iter()
+        .map(|r| r.expect("every row is resolved"))
+        .collect();
+    Span::current()
+        .record("tei.batches", batches)
+        .record("tei.errors", rows.iter().filter(|r| r.is_err()).count());
+    Ok(RowOutcomes { rows })
 }
 
 /// Arrow IPC parsing and construction for the batch RPCs.

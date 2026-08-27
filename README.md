@@ -388,6 +388,20 @@ auto_max_batch_tokens_per_gib = 2048
 arrow_output_dtype = "f32"      # or "f16" to halve EmbedArrow payloads by default
 ```
 
+### Tracing (OpenTelemetry)
+
+tei-manager honours W3C `traceparent`/`tracestate` on inbound gRPC metadata and HTTP headers, so its spans appear as children of the caller's trace, and forwards the context to text-embeddings-router (which joins the trace if started with `--otlp-endpoint` via `extra_args`). Spans follow OTel RPC semantic conventions (`rpc.system`, `rpc.service`, `rpc.method`) plus `tei.instance`, `tei.rows`, `tei.rows_failed`, `tei.output_dtype`; each backend stream is a `tei.embed_stream` child with `tei.batches` / `tei.errors`. JSON log lines inside a request carry `trace_id` / `span_id` in their span context.
+
+```toml
+[otel]
+endpoint = "http://otel-collector:4317"   # OTLP/gRPC; empty = no export (propagation still on)
+service_name = "tei-manager"
+sample_ratio = 1.0
+deployment_environment = "dev"
+```
+
+`TEI_MANAGER_OTEL_ENDPOINT` overrides `endpoint`.
+
 ### Running on rented GPUs (vast.ai, RunPod)
 
 - Pick the image for the card (see [Docker Images](#docker-images)). On start, tei-manager compares every visible GPU's compute capability with the TEI build in the image and logs a mismatch with the tag to use instead (`gpu_preflight = "fail"` turns that into a hard stop).

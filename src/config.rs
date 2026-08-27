@@ -138,6 +138,10 @@ pub struct ManagerConfig {
     /// See [auth] section in config file
     #[serde(default)]
     pub auth: AuthConfig,
+
+    /// OpenTelemetry tracing — see [otel] section in config file
+    #[serde(default)]
+    pub otel: crate::otel::OtelConfig,
 }
 
 /// GPU compute-capability preflight policy
@@ -208,6 +212,7 @@ impl Default for ManagerConfig {
             auto_max_batch_tokens_per_gib: default_auto_max_batch_tokens_per_gib(),
             arrow_output_dtype: ArrowOutputDtype::default(),
             auth: AuthConfig::default(),
+            otel: crate::otel::OtelConfig::default(),
         }
     }
 }
@@ -243,6 +248,10 @@ impl ManagerConfig {
                 .parse()
                 .context("Invalid TEI_MANAGER_GRPC_PORT value")?;
         }
+        if let Ok(endpoint) = std::env::var("TEI_MANAGER_OTEL_ENDPOINT") {
+            config.otel.endpoint = endpoint;
+        }
+
         if let Ok(enabled) = std::env::var("TEI_MANAGER_GRPC_ENABLED") {
             config.grpc_enabled = enabled
                 .parse()

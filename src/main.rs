@@ -43,20 +43,17 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Setup logging
-    match cli.log_format.as_str() {
-        "pretty" => {
-            tracing_subscriber::fmt()
-                .with_env_filter(&cli.log_level)
-                .init();
-        }
-        _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(&cli.log_level)
-                .json()
-                .init();
-        }
-    }
+    // Load configuration before logging so the tracing subscriber can be
+    // built with the [otel] block. Nothing before this point logs.
+    let mut config = ManagerConfig::load(cli.config)?;
+
+    // Tracing subscriber + OTLP export (when configured). The guard flushes
+    // spans on shutdown; it must outlive everything below.
+    let _otel_guard = tei_manager::otel::init(
+        &config.otel,
+        tei_manager::otel::LogFormat::parse(&cli.log_format),
+        &cli.log_level,
+    )?;
 
     tracing::info!("Starting TEI Manager");
 
@@ -71,9 +68,6 @@ async fn main() -> Result<()> {
             "GPU detection complete"
         );
     }
-
-    // Load configuration
-    let mut config = ManagerConfig::load(cli.config)?;
 
     // Compute-capability preflight: does the bundled TEI run on these GPUs?
     if config.gpu_preflight != tei_manager::config::GpuPreflight::Off {

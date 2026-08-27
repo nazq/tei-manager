@@ -13,6 +13,7 @@ pub mod health;
 pub mod instance;
 pub mod metrics;
 pub mod models;
+pub mod otel;
 pub mod registry;
 pub mod state;
 

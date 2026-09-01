@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 # Web framework
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -99,7 +99,7 @@ axum-test = "21"
 http-body-util = "0.1"
 serial_test = "3.2"
 futures = "0.3"
-testcontainers = "0.27"
+testcontainers = "0.28"
 proptest = "1.6"
 
 [lib]

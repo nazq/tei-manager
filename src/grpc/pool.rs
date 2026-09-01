@@ -79,6 +79,11 @@ impl Drop for BackendPool {
 }
 
 impl BackendPool {
+    /// The instance registry backing this pool
+    pub fn registry(&self) -> &Arc<Registry> {
+        &self.registry
+    }
+
     /// Create a new connection pool with default pruning settings
     pub fn new(registry: Arc<Registry>) -> Self {
         Self::with_pruning_config(

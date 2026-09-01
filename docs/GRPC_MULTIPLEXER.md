@@ -97,6 +97,12 @@ grpcurl -plaintext -d '{
   "request": {"inputs": "Information retrieval"}
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparse
 
+# Route by model instead of instance name (any running instance of the model; round-robin)
+grpcurl -plaintext -d '{
+  "target": {"model_id": "BAAI/bge-m3"},
+  "request": {"inputs": "Hello"}
+}' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/Embed
+
 # Batch dense embeddings via Arrow IPC
 # Response: one row per input row — `embeddings` (nullable) + `error` (nullable, per-row failure reason)
 grpcurl -plaintext -d '{

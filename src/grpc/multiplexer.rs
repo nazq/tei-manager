@@ -94,7 +94,7 @@ macro_rules! impl_stream_rpc {
             .ok_or_else(|| Status::invalid_argument("Empty stream"))?
             .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
 
-        let instance_name = Self::extract_target(first_req.target)?;
+        let instance_name = $self.resolve_target(first_req.target).await?;
         Span::current().record("tei.instance", instance_name.as_str());
 
         // Get backend client
@@ -160,6 +160,8 @@ pub struct TeiMultiplexerService {
     request_timeout: Option<Duration>,
     /// Element type for EmbedArrow responses when the request says UNSPECIFIED
     default_output_dtype: ArrowOutputDtype,
+    /// Round-robin cursor for model-based routing
+    route_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TeiMultiplexerService {
@@ -178,6 +180,7 @@ impl TeiMultiplexerService {
                 None
             },
             default_output_dtype: ArrowOutputDtype::F32,
+            route_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -212,8 +215,14 @@ impl TeiMultiplexerService {
         }
     }
 
-    /// Extract target instance from request
-    fn extract_target(target: Option<mux::Target>) -> Result<String, Status> {
+    /// Resolve a request's target to one instance name.
+    ///
+    /// `instance_name` routes to that instance verbatim. `model_id` picks one
+    /// RUNNING instance serving that model — round-robin across matches, one
+    /// instance per RPC (a batch is never split). An instance that dies is
+    /// simply no longer `Running`, so subsequent RPCs route around it; the
+    /// in-flight one fails to the caller.
+    async fn resolve_target(&self, target: Option<mux::Target>) -> Result<String, Status> {
         let target = target.ok_or_else(|| Status::invalid_argument("Missing target"))?;
 
         match target.routing {
@@ -223,20 +232,41 @@ impl TeiMultiplexerService {
                 }
                 Ok(name)
             }
-            Some(mux::target::Routing::ModelId(_)) => {
-                // TODO: Auto-select instance by model
-                Err(Status::unimplemented(
-                    "Model-based routing not yet implemented",
-                ))
+            Some(mux::target::Routing::ModelId(model_id)) => {
+                if model_id.is_empty() {
+                    return Err(Status::invalid_argument("Model id cannot be empty"));
+                }
+                self.pick_running_instance(&model_id).await
             }
-            Some(mux::target::Routing::InstanceIndex(_)) => {
-                // TODO: Index-based routing
-                Err(Status::unimplemented(
-                    "Index-based routing not yet implemented",
-                ))
-            }
+            Some(mux::target::Routing::InstanceIndex(_)) => Err(Status::unimplemented(
+                "Index-based routing not yet implemented",
+            )),
             None => Err(Status::invalid_argument("No routing specified")),
         }
+    }
+
+    /// Round-robin over the running instances of `model_id`
+    async fn pick_running_instance(&self, model_id: &str) -> Result<String, Status> {
+        let mut matches: Vec<String> = Vec::new();
+        for instance in self.pool.registry().list().await {
+            if instance.config.model_id == model_id
+                && *instance.status.read().await == crate::instance::InstanceStatus::Running
+            {
+                matches.push(instance.config.name.clone());
+            }
+        }
+        if matches.is_empty() {
+            return Err(Status::not_found(format!(
+                "No running instance for model '{}'",
+                model_id
+            )));
+        }
+        // Registry order is stable enough for fairness; sort for determinism
+        matches.sort();
+        let i = self
+            .route_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(matches[i % matches.len()].clone())
     }
 }
 
@@ -252,7 +282,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::InfoRequest>,
     ) -> Result<Response<tei::InfoResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         // Record instance name in span for tracing
         Span::current().record("tei.instance", instance_name.as_str());
@@ -278,7 +308,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::EmbedRequest>,
     ) -> Result<Response<tei::EmbedResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         // Extract inner request
         let embed_req = req
@@ -307,7 +337,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::EmbedSparseRequest>,
     ) -> Result<Response<tei::EmbedSparseResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         let inner_req = req
             .request
@@ -329,7 +359,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::EmbedAllRequest>,
     ) -> Result<Response<tei::EmbedAllResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         let inner_req = req
             .request
@@ -398,7 +428,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::PredictRequest>,
     ) -> Result<Response<tei::PredictResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         let inner_req = req
             .request
@@ -420,7 +450,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::PredictPairRequest>,
     ) -> Result<Response<tei::PredictResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         let inner_req = req
             .request
@@ -474,7 +504,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::RerankRequest>,
     ) -> Result<Response<tei::RerankResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         let inner_req = req
             .request
@@ -503,7 +533,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .ok_or_else(|| Status::invalid_argument("Empty stream"))?
             .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
 
-        let instance_name = Self::extract_target(first_req.target)?;
+        let instance_name = self.resolve_target(first_req.target).await?;
         Span::current().record("tei.instance", instance_name.as_str());
 
         let clients = self.pool.get_clients(&instance_name).await?;
@@ -544,7 +574,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::EncodeRequest>,
     ) -> Result<Response<tei::EncodeResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         let inner_req = req
             .request
@@ -577,7 +607,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::DecodeRequest>,
     ) -> Result<Response<tei::DecodeResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
 
         let inner_req = req
             .request
@@ -618,7 +648,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::EmbedArrowRequest>,
     ) -> Result<Response<mux::EmbedArrowResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
         Span::current().record("tei.instance", instance_name.as_str());
 
         let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
@@ -672,7 +702,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::EmbedSparseArrowRequest>,
     ) -> Result<Response<mux::EmbedSparseArrowResponse>, Status> {
         let req = request.into_inner();
-        let instance_name = Self::extract_target(req.target)?;
+        let instance_name = self.resolve_target(req.target).await?;
         Span::current().record("tei.instance", instance_name.as_str());
 
         let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
@@ -1129,77 +1159,196 @@ mod tests {
     // Target Extraction Tests
     // ========================================================================
 
-    #[test]
-    fn test_extract_target_valid_instance_name() {
-        let target = Some(mux::Target {
-            routing: Some(mux::target::Routing::InstanceName(
+    fn target(routing: mux::target::Routing) -> Option<mux::Target> {
+        Some(mux::Target {
+            routing: Some(routing),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_resolve_target_valid_instance_name() {
+        let service = create_test_service();
+        let result = service
+            .resolve_target(target(mux::target::Routing::InstanceName(
                 "test-instance".to_string(),
-            )),
-        });
-        let result = TeiMultiplexerService::extract_target(target);
-        assert!(result.is_ok());
+            )))
+            .await;
         assert_eq!(result.unwrap(), "test-instance");
     }
 
-    #[test]
-    fn test_extract_target_empty_instance_name() {
-        let target = Some(mux::Target {
-            routing: Some(mux::target::Routing::InstanceName("".to_string())),
-        });
-        let result = TeiMultiplexerService::extract_target(target);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+    #[tokio::test]
+    async fn test_resolve_target_empty_instance_name() {
+        let service = create_test_service();
+        let err = service
+            .resolve_target(target(mux::target::Routing::InstanceName(String::new())))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("cannot be empty"));
     }
 
-    #[test]
-    fn test_extract_target_missing() {
-        let result = TeiMultiplexerService::extract_target(None);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+    #[tokio::test]
+    async fn test_resolve_target_missing() {
+        let service = create_test_service();
+        let err = service.resolve_target(None).await.unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("Missing target"));
     }
 
-    #[test]
-    fn test_extract_target_no_routing() {
-        let target = Some(mux::Target { routing: None });
-        let result = TeiMultiplexerService::extract_target(target);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+    #[tokio::test]
+    async fn test_resolve_target_no_routing() {
+        let service = create_test_service();
+        let err = service
+            .resolve_target(Some(mux::Target { routing: None }))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("No routing specified"));
     }
 
-    #[test]
-    fn test_extract_target_model_routing_unimplemented() {
-        let target = Some(mux::Target {
-            routing: Some(mux::target::Routing::ModelId("bert-base".to_string())),
-        });
-        let result = TeiMultiplexerService::extract_target(target);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
+    #[tokio::test]
+    async fn test_resolve_target_index_routing_unimplemented() {
+        let service = create_test_service();
+        let err = service
+            .resolve_target(target(mux::target::Routing::InstanceIndex(0)))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Code::Unimplemented);
-        assert!(
-            err.message()
-                .contains("Model-based routing not yet implemented")
-        );
     }
 
-    #[test]
-    fn test_extract_target_index_routing_unimplemented() {
-        let target = Some(mux::Target {
-            routing: Some(mux::target::Routing::InstanceIndex(0)),
+    // ========================================================================
+    // Model-based routing
+    // ========================================================================
+
+    /// Registry with named instances of a model, each started on a mock
+    /// process manager (status controllable per instance)
+    async fn service_with_model_instances(
+        names: &[&str],
+        model: &str,
+    ) -> (TeiMultiplexerService, Arc<Registry>) {
+        use crate::instance::mocks::MockProcessManager;
+        let registry = Arc::new(Registry::new(
+            None,
+            "text-embeddings-router".to_string(),
+            8080,
+            8180,
+        ));
+        for (i, name) in names.iter().enumerate() {
+            let config = InstanceConfig {
+                name: name.to_string(),
+                model_id: model.to_string(),
+                port: 58000 + i as u16,
+                ..Default::default()
+            };
+            // Build directly so the instance uses a mock manager
+            let instance = Arc::new(crate::instance::TeiInstance::new_with_manager(
+                config,
+                Arc::new(MockProcessManager::new()),
+            ));
+            instance.start("mock").await.unwrap();
+            *instance.status.write().await = crate::instance::InstanceStatus::Running;
+            registry.insert_for_tests(instance).await;
+        }
+        let pool = BackendPool::new(registry.clone());
+        (TeiMultiplexerService::new(pool, 1024, 30), registry)
+    }
+
+    #[tokio::test]
+    async fn test_model_routing_round_robins_running_instances() {
+        let (service, _r) = service_with_model_instances(&["m3-a", "m3-b"], "BAAI/bge-m3").await;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(
+                service
+                    .resolve_target(target(mux::target::Routing::ModelId(
+                        "BAAI/bge-m3".to_string(),
+                    )))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(seen, vec!["m3-a", "m3-b", "m3-a", "m3-b"]);
+    }
+
+    #[tokio::test]
+    async fn test_model_routing_skips_non_running() {
+        let (service, registry) =
+            service_with_model_instances(&["m3-a", "m3-b"], "BAAI/bge-m3").await;
+        let b = registry.get("m3-b").await.unwrap();
+        *b.status.write().await = crate::instance::InstanceStatus::Failed;
+        for _ in 0..3 {
+            let picked = service
+                .resolve_target(target(mux::target::Routing::ModelId(
+                    "BAAI/bge-m3".to_string(),
+                )))
+                .await
+                .unwrap();
+            assert_eq!(picked, "m3-a");
+        }
+        // Recovery: back to Running → back in rotation
+        *b.status.write().await = crate::instance::InstanceStatus::Running;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..4 {
+            seen.insert(
+                service
+                    .resolve_target(target(mux::target::Routing::ModelId(
+                        "BAAI/bge-m3".to_string(),
+                    )))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_model_routing_no_match_is_not_found_naming_model() {
+        let (service, _r) = service_with_model_instances(&["m3-a"], "BAAI/bge-m3").await;
+        let err = service
+            .resolve_target(target(mux::target::Routing::ModelId("other/model".into())))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(err.message().contains("other/model"), "{}", err.message());
+        // Same shape when the only instance is not running
+        let (service, registry) = service_with_model_instances(&["m3-a"], "BAAI/bge-m3").await;
+        let a = registry.get("m3-a").await.unwrap();
+        *a.status.write().await = crate::instance::InstanceStatus::Starting;
+        let err = service
+            .resolve_target(target(mux::target::Routing::ModelId("BAAI/bge-m3".into())))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_model_routing_empty_model_id() {
+        let service = create_test_service();
+        let err = service
+            .resolve_target(target(mux::target::Routing::ModelId(String::new())))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_embed_via_model_routing_reaches_backend_path() {
+        // Full RPC through model routing: resolves to the (unreachable) mock
+        // instance and fails at connect — proving routing picked it.
+        let (service, _r) = service_with_model_instances(&["m3-a"], "BAAI/bge-m3").await;
+        let request = Request::new(mux::EmbedRequest {
+            target: target(mux::target::Routing::ModelId("BAAI/bge-m3".to_string())),
+            request: Some(tei::EmbedRequest {
+                inputs: "hi".to_string(),
+                truncate: true,
+                normalize: Some(true),
+                truncation_direction: 0,
+                prompt_name: None,
+                dimensions: None,
+            }),
         });
-        let result = TeiMultiplexerService::extract_target(target);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), Code::Unimplemented);
-        assert!(
-            err.message()
-                .contains("Index-based routing not yet implemented")
-        );
+        let err = service.embed(request).await.unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
     }
 
     // ========================================================================

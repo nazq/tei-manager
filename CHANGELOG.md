@@ -5,6 +5,18 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0](https://github.com/nazq/tei-manager/compare/v0.16.0...v0.17.0) (2026-09-01)
+
+
+### Features
+
+* **grpc:** route by model_id across running instances ([#95](https://github.com/nazq/tei-manager/issues/95)) ([600193b](https://github.com/nazq/tei-manager/commit/600193ba4798935a35934d6c8d3a37681b999f33))
+
+
+### Bug Fixes
+
+* seed config instances alongside restore; don't fail a loading instance with an active log ([#97](https://github.com/nazq/tei-manager/issues/97)) ([f3a3e6f](https://github.com/nazq/tei-manager/commit/f3a3e6f6d48ef0ae68aadce58561b60212130c7a))
+
 ## [0.16.0](https://github.com/nazq/tei-manager/compare/v0.15.0...v0.16.0) (2026-08-27)
 
 

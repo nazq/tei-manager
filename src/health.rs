@@ -287,6 +287,10 @@ pub struct HealthMonitorConfig {
     pub startup_timeout: Duration,
     pub max_failures_before_restart: u32,
     pub auto_restart: bool,
+    /// At the startup timeout, a live process whose log was written within
+    /// this window is treated as still loading and given more time; only a
+    /// dead process or a stalled log fails the instance.
+    pub startup_log_stall: Duration,
 }
 
 impl Default for HealthMonitorConfig {
@@ -297,7 +301,16 @@ impl Default for HealthMonitorConfig {
             startup_timeout: Duration::from_secs(crate::config::DEFAULT_STARTUP_TIMEOUT_SECS),
             max_failures_before_restart: 3,
             auto_restart: true,
+            startup_log_stall: Duration::from_secs(crate::config::DEFAULT_STARTUP_LOG_STALL_SECS),
         }
+    }
+}
+
+impl HealthMonitor {
+    /// Override the startup log-stall window (builder-style, used by main)
+    pub fn with_startup_log_stall(mut self, window: Duration) -> Self {
+        self.config.startup_log_stall = window;
+        self
     }
 }
 
@@ -315,6 +328,7 @@ pub struct HealthMonitorConfigBuilder {
     startup_timeout: Option<Duration>,
     max_failures_before_restart: Option<u32>,
     auto_restart: Option<bool>,
+    startup_log_stall: Option<Duration>,
 }
 
 impl HealthMonitorConfigBuilder {
@@ -343,6 +357,11 @@ impl HealthMonitorConfigBuilder {
         self
     }
 
+    pub fn startup_log_stall(mut self, window: Duration) -> Self {
+        self.startup_log_stall = Some(window);
+        self
+    }
+
     pub fn build(self) -> HealthMonitorConfig {
         let defaults = HealthMonitorConfig::default();
         HealthMonitorConfig {
@@ -353,6 +372,7 @@ impl HealthMonitorConfigBuilder {
                 .max_failures_before_restart
                 .unwrap_or(defaults.max_failures_before_restart),
             auto_restart: self.auto_restart.unwrap_or(defaults.auto_restart),
+            startup_log_stall: self.startup_log_stall.unwrap_or(defaults.startup_log_stall),
         }
     }
 }
@@ -390,6 +410,7 @@ impl HealthMonitor {
             startup_timeout: Duration::from_secs(startup_timeout_secs),
             max_failures_before_restart,
             auto_restart,
+            ..Default::default()
         };
 
         Self {
@@ -497,12 +518,31 @@ impl HealthMonitor {
         let elapsed = (chrono::Utc::now() - started_at)
             .to_std()
             .unwrap_or_default();
-        (elapsed > timeout).then(|| {
-            format!(
-                "did not become ready within {}s (last check: {reason})",
-                timeout.as_secs()
-            )
-        })
+        if elapsed <= timeout {
+            return None;
+        }
+
+        // Past the timeout — but a live process still writing its log is
+        // loading (weight download/conversion), not hung. Give it more time
+        // rather than restarting it and losing the progress.
+        if let Some(written) = instance.last_log_write().await
+            && let Ok(idle) = std::time::SystemTime::now().duration_since(written)
+            && idle < self.config.startup_log_stall
+        {
+            tracing::warn!(
+                instance = %instance.config.name,
+                elapsed_secs = elapsed.as_secs(),
+                timeout_secs = timeout.as_secs(),
+                log_idle_secs = idle.as_secs(),
+                "Startup timeout exceeded but process is alive and its log is active; still loading"
+            );
+            return None;
+        }
+
+        Some(format!(
+            "did not become ready within {}s (last check: {reason})",
+            timeout.as_secs()
+        ))
     }
 
     async fn handle_failure(&self, instance: &TeiInstance, reason: String) {
@@ -1269,6 +1309,79 @@ mod tests {
             .restart_strategy(restart)
             .event_handler(events)
             .build("mock".to_string())
+    }
+
+    #[tokio::test]
+    async fn test_starting_instance_with_active_log_survives_timeout() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        // 1s startup timeout, already elapsed — but the log is fresh
+        let (instance, manager) = starting_instance_with_mock("loading", Some(1)).await;
+        instance.stats.write().await.started_at =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        manager
+            .set_last_log_write(Some(std::time::SystemTime::now()))
+            .await;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        checker.set_unhealthy("not ready".to_string());
+        let monitor = monitor_with(
+            checker,
+            Arc::new(MockRestartStrategy::new()),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::default(),
+        );
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(
+            *instance.status.read().await,
+            InstanceStatus::Starting,
+            "live process with active log must keep loading"
+        );
+
+        // Log goes stale → now it fails
+        manager
+            .set_last_log_write(Some(
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            ))
+            .await;
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+        let stats = instance.stats.read().await;
+        assert!(
+            stats
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("did not become ready"),
+            "{:?}",
+            stats.last_error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_starting_instance_stall_window_configurable() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, manager) = starting_instance_with_mock("stall-cfg", Some(1)).await;
+        instance.stats.write().await.started_at =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        // Log written 10s ago: inside the default 60s window, outside a 5s one
+        manager
+            .set_last_log_write(Some(std::time::SystemTime::now() - Duration::from_secs(10)))
+            .await;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        checker.set_unhealthy("not ready".to_string());
+        let monitor = monitor_with(
+            checker,
+            Arc::new(MockRestartStrategy::new()),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::builder()
+                .startup_log_stall(Duration::from_secs(5))
+                .build(),
+        );
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
     }
 
     #[tokio::test]

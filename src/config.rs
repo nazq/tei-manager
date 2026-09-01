@@ -112,6 +112,13 @@ pub struct ManagerConfig {
     #[serde(default = "default_grpc_request_timeout_secs")]
     pub grpc_request_timeout_secs: u64,
 
+    /// At the startup timeout, an instance whose TEI process is alive and has
+    /// written to its log within this many seconds is treated as still
+    /// loading (weight download/conversion) and given more time; only a dead
+    /// process or a stalled log marks it Failed. (default: 60)
+    #[serde(default = "default_startup_log_stall_secs")]
+    pub startup_log_stall_secs: u64,
+
     /// What to do when a visible GPU's compute capability does not match the
     /// TEI build bundled in this image (default: "warn")
     /// - "warn": log and continue (instances on that GPU will fail at start)
@@ -168,6 +175,10 @@ pub const AUTO_MAX_BATCH_TOKENS_MIN: u32 = 4096;
 /// Upper clamp for auto-derived `max_batch_tokens`
 pub const AUTO_MAX_BATCH_TOKENS_MAX: u32 = 262_144;
 
+fn default_startup_log_stall_secs() -> u64 {
+    DEFAULT_STARTUP_LOG_STALL_SECS
+}
+
 fn default_auto_max_batch_tokens_per_gib() -> u32 {
     2048
 }
@@ -208,6 +219,7 @@ impl Default for ManagerConfig {
             grpc_max_message_size_mb: default_grpc_max_message_size_mb(),
             grpc_max_parallel_streams: default_grpc_max_parallel_streams(),
             grpc_request_timeout_secs: default_grpc_request_timeout_secs(),
+            startup_log_stall_secs: default_startup_log_stall_secs(),
             gpu_preflight: GpuPreflight::default(),
             auto_max_batch_tokens_per_gib: default_auto_max_batch_tokens_per_gib(),
             arrow_output_dtype: ArrowOutputDtype::default(),
@@ -461,6 +473,9 @@ pub struct InstanceConfig {
 
 /// Default `RUST_LOG` filter for TEI child processes
 pub const DEFAULT_TEI_LOG_LEVEL: &str = "warn";
+
+/// Default window for [`ManagerConfig::startup_log_stall_secs`]
+pub const DEFAULT_STARTUP_LOG_STALL_SECS: u64 = 60;
 
 impl InstanceConfig {
     /// Effective `RUST_LOG` filter for this instance's TEI process

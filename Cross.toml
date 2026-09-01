@@ -1,0 +1,2 @@
+[build]
+# aarch64 musl static build for DGX Spark (GB10); cross uses a docker toolchain image

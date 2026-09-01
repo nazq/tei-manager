@@ -95,6 +95,9 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 | Ada | `-ada` | `text-embeddings-inference:89-{tei}-grpc` | RTX 40xx, L4, L40, L40S |
 | Hopper | `-hopper` | `text-embeddings-inference:hopper-{tei}-grpc` | H100, H200 |
 | Blackwell | `-blackwell` | `text-embeddings-inference:120-{tei}-grpc` | RTX 50xx (5090, 5080) |
+| Spark† | *(build locally)* | `text-embeddings-inference:121-latest-grpc` | DGX Spark GB10 (sm_121, arm64) |
+
+† No published Spark tag yet: upstream TEI has merged sm_121 support but not tagged a release, so the base is the rolling arm64 `121-latest-grpc` image. Build locally on an arm64 host with the `TEI_IMAGE` (pinned digest) + `RUST_TARGET=aarch64-unknown-linux-musl` build args — see the Dockerfile header.
 
 ---
 

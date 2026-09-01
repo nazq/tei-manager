@@ -45,11 +45,30 @@
 #     --build-arg VARIANT_DESC=" - Optimized for RTX 5090/5080 (sm_120)" \
 #     -t tei-manager:latest-blackwell .
 #
+#   # DGX Spark (GB10, sm_121, arm64) — upstream publishes no tagged sm_121
+#   # release yet, only the rolling 121-latest-grpc image; pin it by digest
+#   # and build ON an arm64 host (or with buildx --platform linux/arm64):
+#   docker build \
+#     --build-arg TEI_IMAGE=ghcr.io/huggingface/text-embeddings-inference@sha256:<digest of 121-latest-grpc> \
+#     --build-arg TEI_VARIANT=121- \
+#     --build-arg RUST_TARGET=aarch64-unknown-linux-musl \
+#     --build-arg VARIANT_SUFFIX=spark \
+#     --build-arg VARIANT_NAME="Spark" \
+#     --build-arg VARIANT_DESC=" - DGX Spark GB10 (sm_121, arm64)" \
+#     -t tei-manager:latest-spark .
+#
 # ============================================================================
 
 # Build arguments
 ARG TEI_VARIANT=
 ARG TEI_VERSION=1.9.2
+# Full TEI base image override. When empty, defaults to the upstream
+# ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-grpc.
+# Use for bases without a tagged release, e.g. the rolling arm64 image for
+# DGX Spark (sm_121): TEI_IMAGE=ghcr.io/huggingface/text-embeddings-inference@sha256:...
+ARG TEI_IMAGE=
+# Rust target triple for the static tei-manager build (arch of the runtime image)
+ARG RUST_TARGET=x86_64-unknown-linux-musl
 ARG VARIANT_SUFFIX=
 ARG VARIANT_NAME=
 ARG VARIANT_DESC=
@@ -89,14 +108,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Add musl target for static linking (works on any Linux distro)
-RUN rustup target add x86_64-unknown-linux-musl
+ARG RUST_TARGET
+RUN rustup target add ${RUST_TARGET}
 
 # Copy recipe from planner stage
 COPY --from=planner /build/recipe.json recipe.json
 
 # Build dependencies only - this layer is cached unless Cargo.toml/Cargo.lock change
 # This is the key optimization: dependencies are built in a separate layer
-RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+RUN cargo chef cook --release --target ${RUST_TARGET} --recipe-path recipe.json
 
 # Copy build script and proto files for gRPC compilation
 COPY build.rs ./
@@ -110,24 +130,26 @@ COPY src ./src
 COPY benches ./benches
 
 # Build the actual binaries - only recompiles if source changed
-RUN cargo build --release --target x86_64-unknown-linux-musl --locked && \
-    cargo build --release --target x86_64-unknown-linux-musl --bin bench-client --locked && \
-    cp target/x86_64-unknown-linux-musl/release/tei-manager /tmp/tei-manager && \
-    cp target/x86_64-unknown-linux-musl/release/bench-client /tmp/bench-client
+RUN cargo build --release --target ${RUST_TARGET} --locked && \
+    cargo build --release --target ${RUST_TARGET} --bin bench-client --locked && \
+    cp target/${RUST_TARGET}/release/tei-manager /tmp/tei-manager && \
+    cp target/${RUST_TARGET}/release/bench-client /tmp/bench-client
 
 # ============================================================================
 # TEI stage - Extract text-embeddings-router binary
 # ============================================================================
 ARG TEI_VARIANT
 ARG TEI_VERSION
-FROM ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-grpc AS tei
+ARG TEI_IMAGE
+FROM ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-grpc} AS tei
 
 # ============================================================================
 # Runtime stage - Use TEI image as base (has CUDA support)
 # ============================================================================
 ARG TEI_VARIANT
 ARG TEI_VERSION
-FROM ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-grpc
+ARG TEI_IMAGE
+FROM ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-grpc}
 
 ARG VARIANT_NAME
 ARG VARIANT_DESC

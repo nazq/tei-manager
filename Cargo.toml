@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 # Web framework
 axum = "0.8"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -76,11 +76,11 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1.14"
 tokio-rustls = "0.26"
 half = "2"
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-tracing-opentelemetry = "0.32"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
-axum-tracing-opentelemetry = { version = "0.33", features = ["tracing_level_info"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+tracing-opentelemetry = "0.33"
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
+axum-tracing-opentelemetry = { version = "0.38", features = ["tracing_level_info"] }
 http = "1"
 
 [profile.dev]
@@ -99,7 +99,7 @@ axum-test = "21"
 http-body-util = "0.1"
 serial_test = "3.2"
 futures = "0.3"
-testcontainers = "0.27"
+testcontainers = "0.28"
 proptest = "1.6"
 
 [lib]

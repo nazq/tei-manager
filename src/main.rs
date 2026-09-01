@@ -131,49 +131,34 @@ async fn main() -> Result<()> {
     // Initialize model loader for smoke tests
     let model_loader = Arc::new(ModelLoader::from_tei_binary(config.tei_binary_path.clone()));
 
-    // Restore instances or seed from config
+    // Restore persisted instances (when enabled), then seed any config
+    // instance not already present — [[instances]] applies in both modes.
     if config.auto_restore_on_restart {
         tracing::info!("Auto-restore enabled, restoring instances from state");
         state_manager.restore().await?;
-    } else if !config.instances.is_empty() {
-        tracing::info!(
-            count = config.instances.len(),
-            "Seeding instances from config"
-        );
-        for instance_config in &config.instances {
-            let mut instance_config = instance_config.clone();
-            instance_config
-                .resolve_auto_max_batch_tokens(gpu_info, config.auto_max_batch_tokens_per_gib);
-            match registry.add(instance_config.clone()).await {
-                Ok(instance) => {
-                    if let Err(e) = instance.start(&config.tei_binary_path).await {
-                        tracing::error!(
-                            error = %e,
-                            instance = %instance_config.name,
-                            "Failed to start seeded instance"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        instance = %instance_config.name,
-                        "Failed to add seeded instance"
-                    );
-                }
-            }
+    }
+    if !config.instances.is_empty() {
+        let mut seed_configs = config.instances.clone();
+        for seed in &mut seed_configs {
+            seed.resolve_auto_max_batch_tokens(gpu_info, config.auto_max_batch_tokens_per_gib);
         }
+        state_manager.seed_missing_instances(&seed_configs).await;
     }
 
     // Start health monitor
-    let health_monitor = Arc::new(HealthMonitor::new(
-        registry.clone(),
-        config.health_check_interval_secs,
-        config.startup_timeout_secs,
-        config.max_failures_before_restart,
-        true, // auto_restart
-        config.tei_binary_path.clone(),
-    ));
+    let health_monitor = Arc::new(
+        HealthMonitor::new(
+            registry.clone(),
+            config.health_check_interval_secs,
+            config.startup_timeout_secs,
+            config.max_failures_before_restart,
+            true, // auto_restart
+            config.tei_binary_path.clone(),
+        )
+        .with_startup_log_stall(std::time::Duration::from_secs(
+            config.startup_log_stall_secs,
+        )),
+    );
 
     let monitor_handle = tokio::spawn({
         let monitor = health_monitor.clone();

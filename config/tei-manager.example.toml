@@ -27,6 +27,7 @@ health_check_interval_secs = 10
 # If exceeded, instance is marked as hung/failed
 # Set high enough for large models to download and load into VRAM
 startup_timeout_secs = 300
+startup_log_stall_secs = 60          # At the timeout, keep waiting while the TEI log is still active (still loading)
 
 # Number of consecutive health check failures before auto-restart (default: 3)
 # Only applies to instances that have successfully started (status = Running)

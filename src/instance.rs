@@ -83,6 +83,14 @@ pub trait ProcessManager: Send + Sync {
 
     /// How the process terminated, if it has been observed to exit
     async fn exit_status(&self, handle: &ProcessHandle) -> Option<ProcessExit>;
+
+    /// When the process last wrote to its log, if known.
+    ///
+    /// Used to distinguish a live process that is still making progress
+    /// (e.g. converting model weights) from one that has hung.
+    async fn last_log_write(&self, _handle: &ProcessHandle) -> Option<std::time::SystemTime> {
+        None
+    }
 }
 
 /// Read the last error-level line from a TEI log file.
@@ -362,6 +370,11 @@ impl ProcessManager for SystemProcessManager {
     async fn exit_status(&self, handle: &ProcessHandle) -> Option<ProcessExit> {
         self.exited.read().await.get(&handle.id).cloned()
     }
+
+    async fn last_log_write(&self, handle: &ProcessHandle) -> Option<std::time::SystemTime> {
+        let path = self.log_paths.read().await.get(&handle.id).cloned()?;
+        std::fs::metadata(path).and_then(|m| m.modified()).ok()
+    }
 }
 
 // ============================================================================
@@ -498,6 +511,12 @@ impl TeiInstance {
     }
 
     /// How the process terminated, if it has exited
+    /// When this instance's TEI process last wrote to its log, if known
+    pub async fn last_log_write(&self) -> Option<std::time::SystemTime> {
+        let handle = self.process_handle.read().await.clone()?;
+        self.process_manager.last_log_write(&handle).await
+    }
+
     pub async fn exit_status(&self) -> Option<ProcessExit> {
         let handle_guard = self.process_handle.read().await;
         match handle_guard.as_ref() {
@@ -538,6 +557,7 @@ pub mod mocks {
     pub struct MockProcessManager {
         processes: Arc<RwLock<HashMap<String, ProcessState>>>,
         next_id: Arc<RwLock<u32>>,
+        log_write: Arc<RwLock<Option<std::time::SystemTime>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -559,6 +579,7 @@ pub mod mocks {
             Self {
                 processes: Arc::new(RwLock::new(HashMap::new())),
                 next_id: Arc::new(RwLock::new(1000)),
+                log_write: Arc::new(RwLock::new(None)),
             }
         }
 
@@ -579,6 +600,11 @@ pub mod mocks {
         pub async fn get_config(&self, handle: &ProcessHandle) -> Option<SpawnConfig> {
             let processes = self.processes.read().await;
             processes.get(&handle.id).map(|p| p.config.clone())
+        }
+
+        /// Set what `last_log_write` reports for every process
+        pub async fn set_last_log_write(&self, when: Option<std::time::SystemTime>) {
+            *self.log_write.write().await = when;
         }
 
         /// Simulate every spawned process having exited with `exit`
@@ -631,6 +657,10 @@ pub mod mocks {
         async fn pid(&self, handle: &ProcessHandle) -> Option<u32> {
             let processes = self.processes.read().await;
             processes.get(&handle.id).map(|p| p.pid)
+        }
+
+        async fn last_log_write(&self, _handle: &ProcessHandle) -> Option<std::time::SystemTime> {
+            *self.log_write.read().await
         }
 
         async fn exit_status(&self, handle: &ProcessHandle) -> Option<ProcessExit> {

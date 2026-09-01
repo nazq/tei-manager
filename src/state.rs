@@ -192,6 +192,44 @@ impl StateManager {
     ///
     /// Set `wait_for_ready` to false to skip waiting for instances to become ready
     /// (useful for tests where mock instances don't respond to health checks).
+    /// Start every config-file instance that is not already in the registry
+    /// (e.g. not present in the restored state). Failures are logged per
+    /// instance; returns how many were seeded.
+    pub async fn seed_missing_instances(&self, configs: &[crate::config::InstanceConfig]) -> usize {
+        let mut seeded = 0;
+        for config in configs {
+            if self.registry.get(&config.name).await.is_some() {
+                tracing::debug!(
+                    instance = %config.name,
+                    "Config instance already present (restored); not seeding"
+                );
+                continue;
+            }
+            tracing::info!(instance = %config.name, "Seeding instance from config");
+            match self.registry.add(config.clone()).await {
+                Ok(instance) => {
+                    if let Err(e) = instance.start(&self.tei_binary_path).await {
+                        tracing::error!(
+                            instance = %config.name,
+                            error = %e,
+                            "Failed to start seeded instance"
+                        );
+                    } else {
+                        seeded += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        instance = %config.name,
+                        error = %e,
+                        "Failed to add seeded instance"
+                    );
+                }
+            }
+        }
+        seeded
+    }
+
     pub async fn restore(&self) -> Result<()> {
         self.restore_with_options(true).await
     }
@@ -1028,6 +1066,57 @@ max_concurrent_requests = 10
         let instances = registry.list().await;
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].config.name, "no-wait-instance");
+    }
+
+    #[tokio::test]
+    async fn test_seed_missing_instances_after_restore() {
+        let state_file = PathBuf::from("/test/seed.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(None, "/bin/sleep".to_string(), 8080, 8180));
+
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "restored"
+model_id = "model-a"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+        storage.save(&state_file, state_content).await.unwrap();
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry.clone(),
+            "/bin/sleep".to_string(),
+            storage,
+        );
+        state_manager.restore_with_options(false).await.unwrap();
+        assert!(registry.get("restored").await.is_some());
+
+        // Config lists the restored instance plus a new one: only the new
+        // one is seeded, the restored one is not duplicated or restarted.
+        let configs = vec![
+            crate::config::InstanceConfig {
+                name: "restored".to_string(),
+                model_id: "model-a".to_string(),
+                port: 8080,
+                ..Default::default()
+            },
+            crate::config::InstanceConfig {
+                name: "from-config".to_string(),
+                model_id: "model-b".to_string(),
+                port: 8081,
+                ..Default::default()
+            },
+        ];
+        let seeded = state_manager.seed_missing_instances(&configs).await;
+        assert_eq!(seeded, 1);
+        assert!(registry.get("from-config").await.is_some());
+        assert_eq!(registry.count().await, 2);
+
+        // Idempotent: nothing new on a second pass
+        assert_eq!(state_manager.seed_missing_instances(&configs).await, 0);
     }
 
     #[tokio::test]

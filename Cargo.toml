@@ -76,11 +76,11 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1.14"
 tokio-rustls = "0.26"
 half = "2"
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-tracing-opentelemetry = "0.32"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
-axum-tracing-opentelemetry = { version = "0.33", features = ["tracing_level_info"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+tracing-opentelemetry = "0.33"
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace"] }
+axum-tracing-opentelemetry = { version = "0.38", features = ["tracing_level_info"] }
 http = "1"
 
 [profile.dev]

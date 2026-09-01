@@ -222,6 +222,16 @@ impl Registry {
     }
 
     /// List all instances
+    /// Insert a pre-built instance (test support: lets tests register an
+    /// instance backed by a mock process manager)
+    #[doc(hidden)]
+    pub async fn insert_for_tests(&self, instance: Arc<TeiInstance>) {
+        self.instances
+            .write()
+            .await
+            .insert(instance.config.name.clone(), instance);
+    }
+
     pub async fn list(&self) -> Vec<Arc<TeiInstance>> {
         let instances = self.instances.read().await;
         instances.values().cloned().collect()

@@ -192,6 +192,8 @@ grpcurl -plaintext -d '{
 }' localhost:9001 tei_multiplexer.v1.TeiMultiplexer/EmbedSparseArrow
 ```
 
+**Routing:** `target` takes `instance_name`, or `model_id` to route to any *running* instance serving that model — round-robin across matches, each RPC pinned wholly to one instance (a batch is never split). No running match → `NotFound` naming the model. On a multi-GPU box, create one instance per GPU with the same `model_id` and clients simply target the model.
+
 **Request:** the first column of the first RecordBatch is the text (`Utf8`, `LargeUtf8` or `Utf8View`). Optional fields: `truncation_direction`, `prompt_name`, `dimensions` (dense only, Matryoshka truncation), `compression` for the *response* (`ARROW_COMPRESSION_NONE` default — vectors don't compress; `ARROW_COMPRESSION_LZ4` available) and `output_dtype` (`F32` default via server config, `F16` halves the payload).
 
 **Response:** exactly one row per input row, in input order, with two columns:

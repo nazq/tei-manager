@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use testcontainers::ImageExt;
 use testcontainers::core::{ContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, Image};
@@ -138,7 +139,12 @@ impl TeiContainer {
 
         println!("Starting TEI container with model {}...", image.model_id);
 
-        let container = image.start().await?;
+        // Label so leaked containers (test process killed before Drop) are
+        // identifiable and reapable: scripts/reap-e2e-containers.sh
+        let container = image
+            .with_labels([("tei-manager.e2e", "true")])
+            .start()
+            .await?;
         let grpc_port = container.get_host_port_ipv4(GRPC_PORT).await?;
 
         // Wait for gRPC to be actually accepting connections AND model to be loaded

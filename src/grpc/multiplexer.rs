@@ -468,8 +468,11 @@ impl TeiMultiplexerService {
                 }
                 // Fail fast when the model has no running instance right now;
                 // afterwards every batch re-resolves on its own.
-                let running = self.running_model_instances(&model_id).await?;
-                let label = running[0].clone();
+                self.running_model_instances(&model_id).await?;
+                // Stream-level attribution names the MODEL: batches fan out
+                // across instances, so no single instance label is truthful
+                // here — per-batch spans/metrics carry the real instance.
+                let label = format!("model:{model_id}");
                 (StreamRouting::Model { model_id }, label)
             }
             Some(mux::target::Routing::InstanceIndex(_)) => {

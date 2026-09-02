@@ -5,6 +5,22 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0](https://github.com/nazq/tei-manager/compare/v0.17.1...v0.18.0) (2026-09-02)
+
+
+### Features
+
+* **gpu:** CUDA runtime-compat preflight and silent CPU-fallback detection ([#102](https://github.com/nazq/tei-manager/issues/102)) ([d4be9b3](https://github.com/nazq/tei-manager/commit/d4be9b32f9236923eaf908734dd9167670a74f38))
+* **grpc:** EmbedArrowStream bidirectional streaming Arrow batch embedding ([#109](https://github.com/nazq/tei-manager/issues/109)) ([e1aae09](https://github.com/nazq/tei-manager/commit/e1aae092fd5dd041e6c780b1cab5aad8ac0a5e9e))
+* **health:** restart backoff with give-up, unified-memory auto max_batch_tokens ([#106](https://github.com/nazq/tei-manager/issues/106)) ([b4e07e4](https://github.com/nazq/tei-manager/commit/b4e07e441fdc1d5111805d2bce0416cc8c482fb8))
+* **observability:** add tei.* span names and gRPC-path Prometheus metrics ([#103](https://github.com/nazq/tei-manager/issues/103)) ([137b917](https://github.com/nazq/tei-manager/commit/137b917069700c5327c841bad2398ba03fc565a1))
+* **state:** fix seed-time auto resolution, warn on drift, add POST /state/reset ([#104](https://github.com/nazq/tei-manager/issues/104)) ([9ca94f8](https://github.com/nazq/tei-manager/commit/9ca94f82db7ec65d420115407ff9706eb8c650d1))
+
+
+### Bug Fixes
+
+* **gpu:** scan only the current process's log region for CPU-fallback evidence ([#110](https://github.com/nazq/tei-manager/issues/110)) ([735ec23](https://github.com/nazq/tei-manager/commit/735ec23bfd803d262827c25479f395f9a7e1ea6d))
+
 ## [0.17.1](https://github.com/nazq/tei-manager/compare/v0.17.0...v0.17.1) (2026-09-01)
 
 

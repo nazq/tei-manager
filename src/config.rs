@@ -119,13 +119,27 @@ pub struct ManagerConfig {
     #[serde(default = "default_startup_log_stall_secs")]
     pub startup_log_stall_secs: u64,
 
-    /// What to do when a visible GPU's compute capability does not match the
-    /// TEI build bundled in this image (default: "warn")
-    /// - "warn": log and continue (instances on that GPU will fail at start)
+    /// What to do when a startup GPU preflight check fails: a visible GPU's
+    /// compute capability does not match the TEI build bundled in this image,
+    /// or the host driver supports an older CUDA version than this image's
+    /// userspace requires (default: "warn")
+    /// - "warn": log and continue (instances on that GPU will fail at start
+    ///   or silently fall back to CPU)
     /// - "fail": refuse to start tei-manager
-    /// - "off": skip the check
+    /// - "off": skip the checks
     #[serde(default)]
     pub gpu_preflight: GpuPreflight,
+
+    /// What to do when an instance that just became healthy shows CPU-fallback
+    /// evidence in its TEI log ("Using CPU instead" — e.g. the host driver is
+    /// older than the image's CUDA userspace, so embeddings are served on CPU
+    /// ~50x slower behind green health) (default: "fail")
+    /// - "fail": mark the instance Failed with the log line as the reason
+    /// - "warn": log and record the line in the instance's last_error, but
+    ///   keep it running
+    /// - "off": skip the check
+    #[serde(default)]
+    pub gpu_fallback: GpuFallback,
 
     /// Tokens of `max_batch_tokens` granted per GiB of free VRAM when an
     /// instance asks for `max_batch_tokens = 0` / "auto" (default: 2048,
@@ -158,6 +172,16 @@ pub enum GpuPreflight {
     #[default]
     Warn,
     Fail,
+    Off,
+}
+
+/// Policy for instances whose TEI log shows a silent CPU fallback
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuFallback {
+    #[default]
+    Fail,
+    Warn,
     Off,
 }
 
@@ -221,6 +245,7 @@ impl Default for ManagerConfig {
             grpc_request_timeout_secs: default_grpc_request_timeout_secs(),
             startup_log_stall_secs: default_startup_log_stall_secs(),
             gpu_preflight: GpuPreflight::default(),
+            gpu_fallback: GpuFallback::default(),
             auto_max_batch_tokens_per_gib: default_auto_max_batch_tokens_per_gib(),
             arrow_output_dtype: ArrowOutputDtype::default(),
             auth: AuthConfig::default(),
@@ -848,17 +873,20 @@ health_check_interval_secs = 60
     #[test]
     fn test_new_manager_config_knobs_parse() {
         let cfg: ManagerConfig = toml::from_str(
-            "gpu_preflight = \"fail\"\nauto_max_batch_tokens_per_gib = 1024\narrow_output_dtype = \"f16\"\n",
+            "gpu_preflight = \"fail\"\ngpu_fallback = \"warn\"\nauto_max_batch_tokens_per_gib = 1024\narrow_output_dtype = \"f16\"\n",
         )
         .unwrap();
         assert_eq!(cfg.gpu_preflight, GpuPreflight::Fail);
+        assert_eq!(cfg.gpu_fallback, GpuFallback::Warn);
         assert_eq!(cfg.auto_max_batch_tokens_per_gib, 1024);
         assert_eq!(cfg.arrow_output_dtype, ArrowOutputDtype::F16);
         let cfg: ManagerConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.gpu_preflight, GpuPreflight::Warn);
+        assert_eq!(cfg.gpu_fallback, GpuFallback::Fail);
         assert_eq!(cfg.auto_max_batch_tokens_per_gib, 2048);
         assert_eq!(cfg.arrow_output_dtype, ArrowOutputDtype::F32);
         assert!(toml::from_str::<ManagerConfig>("gpu_preflight = \"maybe\"").is_err());
+        assert!(toml::from_str::<ManagerConfig>("gpu_fallback = \"maybe\"").is_err());
     }
 
     #[test]

@@ -185,29 +185,146 @@ pub fn compute_cap_compatible(compiled: u32, runtime: (u32, u32)) -> bool {
     major == compiled / 10 && major * 10 + minor >= compiled
 }
 
-/// Check every visible GPU against the compiled compute capability.
-/// Returns one message per incompatible GPU (empty = all good or nothing to check).
-pub fn preflight(info: &GpuInfo, variant: Option<&str>) -> Vec<String> {
-    let Some(compiled) = variant.and_then(compiled_compute_cap) else {
-        return Vec::new();
-    };
-    info.devices
-        .iter()
-        .filter_map(|d| {
-            let cap = d.compute_cap?;
-            (!compute_cap_compatible(compiled, cap)).then(|| {
-                format!(
-                    "GPU {} ({}) is compute capability {}.{} but this image's TEI is compiled for sm_{}; use the {} image",
-                    d.index,
-                    d.name,
-                    cap.0,
-                    cap.1,
-                    compiled,
-                    suggested_variant(cap)
-                )
+/// Check every visible GPU against the compiled compute capability, and the
+/// host driver against the CUDA version this image's userspace requires.
+/// Returns one message per problem (empty = all good or nothing to check).
+pub fn preflight(
+    info: &GpuInfo,
+    variant: Option<&str>,
+    host: &HostDriver,
+    required_cuda: Option<(u32, u32)>,
+) -> Vec<String> {
+    let mut msgs: Vec<String> = match variant.and_then(compiled_compute_cap) {
+        Some(compiled) => info
+            .devices
+            .iter()
+            .filter_map(|d| {
+                let cap = d.compute_cap?;
+                (!compute_cap_compatible(compiled, cap)).then(|| {
+                    format!(
+                        "GPU {} ({}) is compute capability {}.{} but this image's TEI is compiled for sm_{}; use the {} image",
+                        d.index,
+                        d.name,
+                        cap.0,
+                        cap.1,
+                        compiled,
+                        suggested_variant(cap)
+                    )
+                })
             })
-        })
-        .collect()
+            .collect(),
+        None => Vec::new(),
+    };
+    msgs.extend(cuda_runtime_preflight(host, required_cuda));
+    msgs
+}
+
+// ============================================================================
+// Driver / CUDA runtime-compat preflight
+// ============================================================================
+
+/// Environment variable baked into CUDA base images describing what the
+/// image's CUDA userspace requires from the host driver, e.g.
+/// `cuda>=12.9 brand=unknown,driver>=535,driver<536 ...`
+pub const NVIDIA_REQUIRE_CUDA_ENV: &str = "NVIDIA_REQUIRE_CUDA";
+
+/// Host NVIDIA driver info as reported by the `nvidia-smi` banner
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostDriver {
+    /// Driver version string, e.g. "570.195.03"
+    pub driver_version: Option<String>,
+    /// Highest CUDA version the driver supports, e.g. (12, 8)
+    pub cuda_version: Option<(u32, u32)>,
+}
+
+/// Parse a `major.minor` version like "12.8"
+fn parse_version(s: &str) -> Option<(u32, u32)> {
+    let (major, minor) = s.trim().split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Extract the `cuda>=X.Y` term from an `NVIDIA_REQUIRE_CUDA` value
+pub fn parse_required_cuda(require: &str) -> Option<(u32, u32)> {
+    require
+        .split([' ', ','])
+        .find_map(|term| parse_version(term.strip_prefix("cuda>=")?))
+}
+
+/// Value following a `label` in nvidia-smi output: handles both the banner
+/// (`Driver Version: 570.195.03`) and `nvidia-smi -q` (`Driver Version : ...`)
+fn labeled_value(output: &str, label: &str) -> Option<String> {
+    let rest = &output[output.find(label)? + label.len()..];
+    let value: String = rest
+        .trim_start_matches([' ', ':'])
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '|')
+        .collect();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Parse the driver version and its supported CUDA version out of plain
+/// `nvidia-smi` (or `nvidia-smi -q`) output. Missing or `[N/A]` fields
+/// become `None`; `--query-gpu` does not expose the CUDA version, which is
+/// why the banner is used.
+pub fn parse_host_driver(output: &str) -> HostDriver {
+    HostDriver {
+        driver_version: labeled_value(output, "Driver Version"),
+        cuda_version: labeled_value(output, "CUDA Version")
+            .as_deref()
+            .and_then(parse_version),
+    }
+}
+
+/// Query the host driver by running plain `nvidia-smi` (its banner carries
+/// both the driver version and the CUDA version the driver supports)
+pub fn detect_host_driver() -> HostDriver {
+    match Command::new("nvidia-smi").output() {
+        Ok(output) if output.status.success() => {
+            let host = parse_host_driver(&String::from_utf8_lossy(&output.stdout));
+            tracing::info!(
+                driver_version = ?host.driver_version,
+                cuda_version = ?host.cuda_version,
+                "Detected host driver"
+            );
+            host
+        }
+        Ok(output) => {
+            tracing::warn!(
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "nvidia-smi failed, host driver CUDA version unknown"
+            );
+            HostDriver::default()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to run nvidia-smi, host driver CUDA version unknown");
+            HostDriver::default()
+        }
+    }
+}
+
+/// Whether the image's CUDA userspace can run on the host driver.
+///
+/// GeForce cards have no forward compatibility: when the host driver supports
+/// an older CUDA than the image's userspace requires, TEI gets
+/// `CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE` and silently falls back to
+/// CPU. Returns the preflight message when incompatible; `None` when
+/// compatible or when either side is unknown (no nvidia-smi, `[N/A]`, or no
+/// `NVIDIA_REQUIRE_CUDA` in the environment).
+pub fn cuda_runtime_preflight(host: &HostDriver, required: Option<(u32, u32)>) -> Option<String> {
+    let host_cuda = host.cuda_version?;
+    let (req_major, req_minor) = required?;
+    (host_cuda < (req_major, req_minor)).then(|| {
+        let driver = host
+            .driver_version
+            .as_deref()
+            .unwrap_or("(unknown version)");
+        format!(
+            "host driver {driver} supports CUDA {}.{} but this image's CUDA userspace requires \
+             {req_major}.{req_minor}; GeForce GPUs have no forward compatibility — TEI will \
+             silently fall back to CPU. Use a host with driver CUDA >= {req_major}.{req_minor}",
+            host_cuda.0, host_cuda.1
+        )
+    })
 }
 
 /// Initialize GPU detection (call once at startup)
@@ -319,20 +436,120 @@ mod tests {
 
     #[test]
     fn test_preflight_messages() {
+        let no_host = HostDriver::default();
         let info = parse_nvidia_smi(SMI);
-        let msgs = preflight(&info, Some(""));
+        let msgs = preflight(&info, Some(""), &no_host, None);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].contains("GPU 0"));
         assert!(msgs[0].contains("12.0"));
         assert!(msgs[0].contains("sm_80"));
         assert!(msgs[0].contains("-blackwell"));
 
-        let msgs = preflight(&info, Some("120-"));
+        let msgs = preflight(&info, Some("120-"), &no_host, None);
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].contains("GPU 1"));
 
-        assert!(preflight(&info, Some("cpu-")).is_empty());
-        assert!(preflight(&info, None).is_empty());
-        assert!(preflight(&GpuInfo::default(), Some("")).is_empty());
+        assert!(preflight(&info, Some("cpu-"), &no_host, None).is_empty());
+        assert!(preflight(&info, None, &no_host, None).is_empty());
+        assert!(preflight(&GpuInfo::default(), Some(""), &no_host, None).is_empty());
+    }
+
+    const BANNER: &str = "\
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.195.03             Driver Version: 570.195.03     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+";
+
+    #[test]
+    fn test_parse_host_driver_banner() {
+        let host = parse_host_driver(BANNER);
+        assert_eq!(host.driver_version.as_deref(), Some("570.195.03"));
+        assert_eq!(host.cuda_version, Some((12, 8)));
+    }
+
+    #[test]
+    fn test_parse_host_driver_query_format() {
+        // `nvidia-smi -q` uses `label : value` lines
+        let host = parse_host_driver(
+            "Driver Version                            : 570.195.03\n\
+             CUDA Version                              : 12.8\n",
+        );
+        assert_eq!(host.driver_version.as_deref(), Some("570.195.03"));
+        assert_eq!(host.cuda_version, Some((12, 8)));
+    }
+
+    #[test]
+    fn test_parse_host_driver_missing_or_na() {
+        let host = parse_host_driver("");
+        assert_eq!(host, HostDriver::default());
+
+        let host = parse_host_driver("| Driver Version: 570.195.03  CUDA Version: [N/A]  |");
+        assert_eq!(host.driver_version.as_deref(), Some("570.195.03"));
+        assert_eq!(host.cuda_version, None);
+
+        assert_eq!(parse_host_driver("total garbage"), HostDriver::default());
+    }
+
+    #[test]
+    fn test_parse_required_cuda() {
+        // Real-world multi-clause value from a CUDA base image
+        let require = "cuda>=12.9 brand=unknown,driver>=470,driver<471 \
+                       brand=tesla,driver>=535,driver<536 brand=nvidia,driver>=550,driver<551";
+        assert_eq!(parse_required_cuda(require), Some((12, 9)));
+        // The cuda term does not have to come first
+        assert_eq!(
+            parse_required_cuda("brand=tesla,driver>=535,cuda>=13.0"),
+            Some((13, 0))
+        );
+        assert_eq!(parse_required_cuda(""), None);
+        assert_eq!(parse_required_cuda("brand=unknown,driver>=535"), None);
+        assert_eq!(parse_required_cuda("cuda>=garbage"), None);
+    }
+
+    #[test]
+    fn test_cuda_version_ordering() {
+        // Tuple ordering matches CUDA version semantics
+        assert!((12, 8) < (12, 9));
+        assert!((12, 9) == (12, 9));
+        assert!((13, 0) > (12, 9));
+        assert!((12, 10) < (13, 0));
+    }
+
+    #[test]
+    fn test_cuda_runtime_preflight_messages() {
+        let host = parse_host_driver(BANNER);
+
+        // The real incident: driver 570 (CUDA 12.8) under a CUDA 12.9 image
+        let msg = cuda_runtime_preflight(&host, Some((12, 9))).expect("must flag mismatch");
+        assert!(msg.contains("570.195.03"), "{msg}");
+        assert!(msg.contains("supports CUDA 12.8"), "{msg}");
+        assert!(msg.contains("requires 12.9"), "{msg}");
+        assert!(msg.contains("fall back to CPU"), "{msg}");
+        assert!(msg.contains("driver CUDA >= 12.9"), "{msg}");
+
+        // Exact match and newer host are fine
+        assert_eq!(cuda_runtime_preflight(&host, Some((12, 8))), None);
+        assert_eq!(cuda_runtime_preflight(&host, Some((12, 7))), None);
+
+        // Unknown on either side → no check
+        assert_eq!(cuda_runtime_preflight(&host, None), None);
+        assert_eq!(
+            cuda_runtime_preflight(&HostDriver::default(), Some((12, 9))),
+            None
+        );
+
+        // Driver version unknown but CUDA version known: still flagged
+        let cuda_only = HostDriver {
+            driver_version: None,
+            cuda_version: Some((12, 8)),
+        };
+        let msg = cuda_runtime_preflight(&cuda_only, Some((12, 9))).unwrap();
+        assert!(msg.contains("(unknown version)"), "{msg}");
+
+        // Wired into preflight(): compute-cap and CUDA problems both reported
+        let info = parse_nvidia_smi(SMI);
+        let msgs = preflight(&info, Some(""), &host, Some((12, 9)));
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(msgs[1].contains("fall back to CPU"));
     }
 }

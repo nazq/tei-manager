@@ -33,6 +33,19 @@ startup_log_stall_secs = 60          # At the timeout, keep waiting while the TE
 # Only applies to instances that have successfully started (status = Running)
 max_failures_before_restart = 3
 
+# Backoff between consecutive automatic restarts of a failing instance.
+# The first restart is immediate; the delay before restart N+1 is
+# restart_backoff_base_secs * 2^(N-1), capped at restart_backoff_max_secs.
+# The backoff resets when the instance passes a health check or is manually
+# restarted via the API.
+restart_backoff_base_secs = 30       # delay before the 2nd restart (default: 30)
+restart_backoff_max_secs = 900       # cap on the backoff delay (default: 900 = 15 min)
+
+# Give up after this many consecutive automatic restarts: the instance is
+# marked Failed permanently ("gave up after N restarts") and auto-restart
+# stops until an operator restarts it. 0 = never give up (default: 0)
+max_restarts = 0
+
 # =============================================================================
 # Lifecycle Configuration
 # =============================================================================
@@ -128,6 +141,9 @@ gpu_fallback = "fail"
 # max_batch_tokens = 0 / "auto" on an instance derives the value from the
 # free VRAM of its GPU: this many tokens per GiB (default 2048, so 32 GiB free
 # → 65536), clamped to [4096, 262144]. Without a GPU the auto value is 16384.
+# Unified-memory platforms (Grace / DGX Spark GB10), where nvidia-smi reports
+# [N/A] for VRAM: 25% of the system's MemAvailable (/proc/meminfo) is used as
+# the free-VRAM figure instead; the same per-GiB formula and clamps apply.
 auto_max_batch_tokens_per_gib = 2048
 
 # =============================================================================

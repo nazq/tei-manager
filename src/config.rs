@@ -43,6 +43,27 @@ pub struct ManagerConfig {
     /// failure marking - use `startup_timeout_secs` to control startup failure behavior.
     pub max_failures_before_restart: u32,
 
+    /// Base delay in seconds before the health monitor's second consecutive
+    /// automatic restart of an instance (default: 30). The first restart is
+    /// immediate; each further consecutive restart doubles the delay
+    /// (exponential backoff), capped by `restart_backoff_max_secs`. The
+    /// backoff resets when the instance passes a health check or is manually
+    /// restarted via the API.
+    #[serde(default = "default_restart_backoff_base_secs")]
+    pub restart_backoff_base_secs: u64,
+
+    /// Upper bound in seconds on the automatic-restart backoff delay
+    /// (default: 900 = 15 min)
+    #[serde(default = "default_restart_backoff_max_secs")]
+    pub restart_backoff_max_secs: u64,
+
+    /// Give up after this many consecutive automatic restarts: the instance is
+    /// marked Failed permanently ("gave up after N restarts") and auto-restart
+    /// stops for it until an operator intervenes (default: 0 = never give up).
+    /// The counter resets on a successful health check or a manual restart.
+    #[serde(default)]
+    pub max_restarts: u32,
+
     /// Graceful shutdown timeout in seconds (default: 30)
     /// Time to wait for instances to stop cleanly before force-killing
     pub graceful_shutdown_timeout_secs: u64,
@@ -230,6 +251,9 @@ impl Default for ManagerConfig {
             health_check_interval_secs: default_health_check_interval(),
             startup_timeout_secs: default_startup_timeout(),
             max_failures_before_restart: default_max_failures_before_restart(),
+            restart_backoff_base_secs: default_restart_backoff_base_secs(),
+            restart_backoff_max_secs: default_restart_backoff_max_secs(),
+            max_restarts: 0,
             graceful_shutdown_timeout_secs: default_graceful_shutdown_timeout(),
             auto_restore_on_restart: false,
             max_instances: None,
@@ -510,13 +534,32 @@ impl InstanceConfig {
 
     /// Replace `max_batch_tokens = 0` (auto) with a value derived from the
     /// free VRAM of the GPU this instance targets. Returns the resolved value.
+    ///
+    /// On unified-memory platforms (e.g. Grace / DGX Spark GB10) nvidia-smi
+    /// reports `[N/A]` for VRAM; a conservative fraction of the system's
+    /// `MemAvailable` is used instead (see `GpuInfo::free_vram_mib_or_unified`).
     pub fn resolve_auto_max_batch_tokens(
         &mut self,
         gpu: &crate::gpu::GpuInfo,
         per_gib: u32,
     ) -> u32 {
+        self.resolve_auto_max_batch_tokens_with(
+            gpu,
+            per_gib,
+            crate::gpu::read_proc_meminfo().as_deref(),
+        )
+    }
+
+    /// Same as [`Self::resolve_auto_max_batch_tokens`] with `/proc/meminfo`
+    /// content injected, for deterministic tests.
+    pub(crate) fn resolve_auto_max_batch_tokens_with(
+        &mut self,
+        gpu: &crate::gpu::GpuInfo,
+        per_gib: u32,
+        meminfo: Option<&str>,
+    ) -> u32 {
         if self.max_batch_tokens == 0 {
-            let free = gpu.free_vram_mib(self.gpu_id);
+            let free = gpu.free_vram_mib_with_meminfo(self.gpu_id, meminfo);
             self.max_batch_tokens = auto_max_batch_tokens(free, per_gib);
             tracing::info!(
                 instance = %self.name,
@@ -637,6 +680,12 @@ fn default_startup_timeout() -> u64 {
 }
 fn default_max_failures_before_restart() -> u32 {
     3
+}
+fn default_restart_backoff_base_secs() -> u64 {
+    30
+}
+fn default_restart_backoff_max_secs() -> u64 {
+    900
 }
 fn default_instance_port_start() -> u16 {
     8080
@@ -868,6 +917,74 @@ health_check_interval_secs = 60
             no_gpu.resolve_auto_max_batch_tokens(&crate::gpu::GpuInfo::default(), 2048),
             16384
         );
+    }
+
+    #[test]
+    fn test_resolve_auto_max_batch_tokens_unified_memory() {
+        // Grace / DGX Spark: GPU visible but nvidia-smi reports [N/A] memory.
+        // 41943040 KiB MemAvailable → 40960 MiB → 25% = 10240 MiB = 10 GiB
+        // → 10 * 2048 = 20480 tokens.
+        let gpu = crate::gpu::parse_nvidia_smi("0, NVIDIA GB10, 12.1, [N/A], [N/A]\n");
+        let meminfo = "MemTotal: 131072000 kB\nMemAvailable:   41943040 kB\n";
+        let mut auto = InstanceConfig {
+            max_batch_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            auto.resolve_auto_max_batch_tokens_with(&gpu, 2048, Some(meminfo)),
+            20480
+        );
+
+        // GPU-less host: unchanged default even with meminfo available
+        let mut no_gpu = InstanceConfig {
+            max_batch_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_gpu.resolve_auto_max_batch_tokens_with(
+                &crate::gpu::GpuInfo::default(),
+                2048,
+                Some(meminfo)
+            ),
+            16384
+        );
+
+        // GPU with real VRAM: meminfo ignored, unchanged behavior
+        let discrete = crate::gpu::parse_nvidia_smi("0, X, 8.0, 16384, 8192\n");
+        let mut with_vram = InstanceConfig {
+            max_batch_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            with_vram.resolve_auto_max_batch_tokens_with(&discrete, 2048, Some(meminfo)),
+            16384 // 8 GiB free * 2048
+        );
+
+        // Unified path with unusable meminfo: falls back to the default
+        let mut no_meminfo = InstanceConfig {
+            max_batch_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            no_meminfo.resolve_auto_max_batch_tokens_with(&gpu, 2048, None),
+            16384
+        );
+    }
+
+    #[test]
+    fn test_restart_backoff_knobs_parse() {
+        let cfg: ManagerConfig = toml::from_str(
+            "restart_backoff_base_secs = 10\nrestart_backoff_max_secs = 120\nmax_restarts = 5\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.restart_backoff_base_secs, 10);
+        assert_eq!(cfg.restart_backoff_max_secs, 120);
+        assert_eq!(cfg.max_restarts, 5);
+
+        let cfg: ManagerConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.restart_backoff_base_secs, 30);
+        assert_eq!(cfg.restart_backoff_max_secs, 900);
+        assert_eq!(cfg.max_restarts, 0);
     }
 
     #[test]

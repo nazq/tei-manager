@@ -295,6 +295,15 @@ pub struct HealthMonitorConfig {
     /// What to do when an instance that just became healthy shows
     /// CPU-fallback evidence in its TEI log.
     pub gpu_fallback: GpuFallback,
+    /// Delay before the second consecutive automatic restart (the first is
+    /// immediate); doubled for each further restart, capped by
+    /// `restart_backoff_max`.
+    pub restart_backoff_base: Duration,
+    /// Cap on the automatic-restart backoff delay
+    pub restart_backoff_max: Duration,
+    /// Give up (mark Failed permanently) after this many consecutive
+    /// automatic restarts; 0 = never give up
+    pub max_restarts: u32,
 }
 
 impl Default for HealthMonitorConfig {
@@ -307,6 +316,9 @@ impl Default for HealthMonitorConfig {
             auto_restart: true,
             startup_log_stall: Duration::from_secs(crate::config::DEFAULT_STARTUP_LOG_STALL_SECS),
             gpu_fallback: GpuFallback::default(),
+            restart_backoff_base: Duration::from_secs(30),
+            restart_backoff_max: Duration::from_secs(900),
+            max_restarts: 0,
         }
     }
 }
@@ -323,6 +335,31 @@ impl HealthMonitor {
         self.config.gpu_fallback = policy;
         self
     }
+    /// Override the automatic-restart backoff knobs (builder-style, used by main)
+    pub fn with_restart_backoff(
+        mut self,
+        base: Duration,
+        max: Duration,
+        max_restarts: u32,
+    ) -> Self {
+        self.config.restart_backoff_base = base;
+        self.config.restart_backoff_max = max;
+        self.config.max_restarts = max_restarts;
+        self
+    }
+}
+
+/// Delay required before automatic restart attempt number `backoff_restarts + 1`:
+/// zero for the first attempt, then `base * 2^(backoff_restarts - 1)` capped at
+/// `max` (saturating, so large counts cannot overflow).
+pub fn required_backoff(backoff_restarts: u32, base: Duration, max: Duration) -> Duration {
+    if backoff_restarts == 0 {
+        return Duration::ZERO;
+    }
+    // 2^exp with exp clamped so the shift is always defined; the cap below
+    // makes any larger exponent irrelevant anyway.
+    let factor = 1u64 << u64::from(backoff_restarts - 1).min(62);
+    Duration::from_secs(base.as_secs().saturating_mul(factor).min(max.as_secs()))
 }
 
 impl HealthMonitorConfig {
@@ -341,6 +378,9 @@ pub struct HealthMonitorConfigBuilder {
     auto_restart: Option<bool>,
     startup_log_stall: Option<Duration>,
     gpu_fallback: Option<GpuFallback>,
+    restart_backoff_base: Option<Duration>,
+    restart_backoff_max: Option<Duration>,
+    max_restarts: Option<u32>,
 }
 
 impl HealthMonitorConfigBuilder {
@@ -379,6 +419,21 @@ impl HealthMonitorConfigBuilder {
         self
     }
 
+    pub fn restart_backoff_base(mut self, base: Duration) -> Self {
+        self.restart_backoff_base = Some(base);
+        self
+    }
+
+    pub fn restart_backoff_max(mut self, max: Duration) -> Self {
+        self.restart_backoff_max = Some(max);
+        self
+    }
+
+    pub fn max_restarts(mut self, max: u32) -> Self {
+        self.max_restarts = Some(max);
+        self
+    }
+
     pub fn build(self) -> HealthMonitorConfig {
         let defaults = HealthMonitorConfig::default();
         HealthMonitorConfig {
@@ -391,6 +446,13 @@ impl HealthMonitorConfigBuilder {
             auto_restart: self.auto_restart.unwrap_or(defaults.auto_restart),
             startup_log_stall: self.startup_log_stall.unwrap_or(defaults.startup_log_stall),
             gpu_fallback: self.gpu_fallback.unwrap_or(defaults.gpu_fallback),
+            restart_backoff_base: self
+                .restart_backoff_base
+                .unwrap_or(defaults.restart_backoff_base),
+            restart_backoff_max: self
+                .restart_backoff_max
+                .unwrap_or(defaults.restart_backoff_max),
+            max_restarts: self.max_restarts.unwrap_or(defaults.max_restarts),
         }
     }
 }
@@ -501,6 +563,9 @@ impl HealthMonitor {
             let mut stats = instance.stats.write().await;
             stats.health_check_failures = 0;
             stats.last_health_check = Some(chrono::Utc::now());
+            // A passing check means the instance recovered: the consecutive
+            // automatic-restart counter (backoff / give-up budget) starts over.
+            stats.backoff_restarts = 0;
         }
 
         // Update status to Running if it was Starting
@@ -655,6 +720,62 @@ impl HealthMonitor {
             .await;
 
         if self.config.auto_restart && failures >= self.config.max_failures_before_restart {
+            let backoff_restarts = stats.backoff_restarts;
+            let last_restart_at = stats.last_restart_at;
+            drop(stats); // Release lock before restart / mark_failed
+
+            // Give up permanently once the consecutive-restart budget is
+            // exhausted. The counter only resets on a passing health check or
+            // a manual restart, so a Failed instance in this state stays
+            // Failed instead of being restarted forever.
+            if self.config.max_restarts > 0 && backoff_restarts >= self.config.max_restarts {
+                let previous = *instance.status.read().await;
+                if previous == InstanceStatus::Failed {
+                    tracing::debug!(
+                        instance = %instance.config.name,
+                        restarts = backoff_restarts,
+                        "Restart budget exhausted; leaving instance Failed"
+                    );
+                } else {
+                    instance
+                        .mark_failed(format!(
+                            "gave up after {backoff_restarts} restarts (last check: {reason})"
+                        ))
+                        .await;
+                    self.event_handler
+                        .handle(HealthEvent::StatusTransition {
+                            instance_name: instance.config.name.clone(),
+                            from: previous,
+                            to: InstanceStatus::Failed,
+                        })
+                        .await;
+                }
+                return;
+            }
+
+            // Exponential backoff between consecutive automatic restarts. The
+            // failure count is deliberately left as-is: every subsequent check
+            // re-enters this branch, so the restart happens on the first check
+            // after the window elapses.
+            let required = required_backoff(
+                backoff_restarts,
+                self.config.restart_backoff_base,
+                self.config.restart_backoff_max,
+            );
+            if let Some(last) = last_restart_at {
+                let since = (chrono::Utc::now() - last).to_std().unwrap_or_default();
+                if since < required {
+                    tracing::debug!(
+                        instance = %instance.config.name,
+                        restarts = backoff_restarts,
+                        since_last_restart_secs = since.as_secs(),
+                        required_backoff_secs = required.as_secs(),
+                        "Deferring restart: still inside the backoff window"
+                    );
+                    return;
+                }
+            }
+
             self.event_handler
                 .handle(HealthEvent::RestartTriggered {
                     instance_name: instance.config.name.clone(),
@@ -662,7 +783,14 @@ impl HealthMonitor {
                 })
                 .await;
 
-            drop(stats); // Release lock before restart
+            // Record the attempt before restarting so a failed restart still
+            // counts toward backoff and the give-up budget (a restart that
+            // keeps failing is exactly the churn being throttled).
+            {
+                let mut stats = instance.stats.write().await;
+                stats.backoff_restarts += 1;
+                stats.last_restart_at = Some(chrono::Utc::now());
+            }
 
             match self
                 .restart_strategy
@@ -1922,5 +2050,221 @@ mod tests {
 
         assert_eq!(*instance.status.read().await, InstanceStatus::Running);
         assert!(instance.stats.read().await.last_error.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Restart backoff
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_required_backoff_math() {
+        let base = Duration::from_secs(30);
+        let max = Duration::from_secs(900);
+
+        // First restart is immediate
+        assert_eq!(required_backoff(0, base, max), Duration::ZERO);
+        // Then base * 2^(n-1)
+        assert_eq!(required_backoff(1, base, max), Duration::from_secs(30));
+        assert_eq!(required_backoff(2, base, max), Duration::from_secs(60));
+        assert_eq!(required_backoff(3, base, max), Duration::from_secs(120));
+        assert_eq!(required_backoff(5, base, max), Duration::from_secs(480));
+        // Capped at max (30 * 2^5 = 960 > 900)
+        assert_eq!(required_backoff(6, base, max), max);
+        assert_eq!(required_backoff(100, base, max), max);
+        // Huge counts must not overflow, even with an absurd cap
+        assert_eq!(
+            required_backoff(u32::MAX, base, Duration::from_secs(u64::MAX)),
+            Duration::from_secs(u64::MAX)
+        );
+        // Zero base: always immediate
+        assert_eq!(required_backoff(4, Duration::ZERO, max), Duration::ZERO);
+    }
+
+    /// A Running instance wired to always-failing checks, with a restart
+    /// threshold of 1 so every check reaches the restart decision.
+    async fn failing_running_instance(
+        name: &str,
+        config: HealthMonitorConfig,
+    ) -> (
+        Arc<TeiInstance>,
+        Arc<mocks::MockRestartStrategy>,
+        Arc<mocks::RecordingEventHandler>,
+        HealthMonitor,
+    ) {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, _manager) = starting_instance_with_mock(name, None).await;
+        *instance.status.write().await = InstanceStatus::Running;
+
+        let checker = Arc::new(MockHealthChecker::new());
+        checker.set_unhealthy("Info RPC failed".to_string());
+        let restart = Arc::new(MockRestartStrategy::new());
+        let events = Arc::new(RecordingEventHandler::new());
+        let monitor = monitor_with(checker, restart.clone(), events.clone(), config);
+        (instance, restart, events, monitor)
+    }
+
+    #[tokio::test]
+    async fn test_restart_deferred_within_backoff_window() {
+        let config = HealthMonitorConfig::builder()
+            .max_failures_before_restart(1)
+            .auto_restart(true)
+            .restart_backoff_base(Duration::from_secs(30))
+            .restart_backoff_max(Duration::from_secs(900))
+            .build();
+        let (instance, restart, events, monitor) =
+            failing_running_instance("backoff-defer", config).await;
+
+        // One automatic restart already happened 5s ago → 30s window applies
+        {
+            let mut stats = instance.stats.write().await;
+            stats.backoff_restarts = 1;
+            stats.last_restart_at = Some(chrono::Utc::now() - chrono::Duration::seconds(5));
+        }
+
+        monitor.check_single_instance(&instance).await;
+
+        // Deferred: no restart, no RestartTriggered, instance untouched
+        assert_eq!(restart.restart_count(), 0);
+        assert!(
+            !events
+                .has_event_type(|e| matches!(e, HealthEvent::RestartTriggered { .. }))
+                .await
+        );
+        assert_eq!(*instance.status.read().await, InstanceStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn test_restart_proceeds_after_backoff_window() {
+        let config = HealthMonitorConfig::builder()
+            .max_failures_before_restart(1)
+            .auto_restart(true)
+            .restart_backoff_base(Duration::from_secs(30))
+            .restart_backoff_max(Duration::from_secs(900))
+            .build();
+        let (instance, restart, _events, monitor) =
+            failing_running_instance("backoff-elapsed", config).await;
+
+        // Last automatic restart 31s ago → the 30s window has elapsed
+        {
+            let mut stats = instance.stats.write().await;
+            stats.backoff_restarts = 1;
+            stats.last_restart_at = Some(chrono::Utc::now() - chrono::Duration::seconds(31));
+        }
+
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(restart.restart_count(), 1);
+        // Attempt bookkeeping advanced
+        let stats = instance.stats.read().await;
+        assert_eq!(stats.backoff_restarts, 2);
+        let since = chrono::Utc::now() - stats.last_restart_at.unwrap();
+        assert!(since < chrono::Duration::seconds(5));
+    }
+
+    #[tokio::test]
+    async fn test_give_up_at_max_restarts() {
+        let config = HealthMonitorConfig::builder()
+            .max_failures_before_restart(1)
+            .auto_restart(true)
+            .restart_backoff_base(Duration::ZERO) // no deferral in this test
+            .max_restarts(2)
+            .build();
+        let (instance, restart, events, monitor) =
+            failing_running_instance("give-up", config).await;
+
+        // Restarts 1 and 2 are within budget; the 3rd check gives up
+        for _ in 0..3 {
+            monitor.check_single_instance(&instance).await;
+        }
+        assert_eq!(restart.restart_count(), 2);
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+        let err = instance.stats.read().await.last_error.clone().unwrap();
+        assert!(err.contains("gave up after 2 restarts"), "{err}");
+        assert!(err.contains("Info RPC failed"), "{err}");
+        assert!(
+            events
+                .has_event_type(|e| matches!(
+                    e,
+                    HealthEvent::StatusTransition {
+                        from: InstanceStatus::Running,
+                        to: InstanceStatus::Failed,
+                        ..
+                    }
+                ))
+                .await
+        );
+
+        // Further checks must not restart the permanently-Failed instance
+        for _ in 0..3 {
+            monitor.check_single_instance(&instance).await;
+        }
+        assert_eq!(restart.restart_count(), 2);
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_max_restarts_zero_never_gives_up() {
+        let config = HealthMonitorConfig::builder()
+            .max_failures_before_restart(1)
+            .auto_restart(true)
+            .restart_backoff_base(Duration::ZERO)
+            .max_restarts(0) // unlimited
+            .build();
+        let (instance, restart, _events, monitor) =
+            failing_running_instance("never-give-up", config).await;
+
+        for _ in 0..6 {
+            monitor.check_single_instance(&instance).await;
+        }
+        assert_eq!(restart.restart_count(), 6);
+        assert_eq!(*instance.status.read().await, InstanceStatus::Running);
+        assert!(instance.stats.read().await.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_successful_check_resets_backoff_counter() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, _manager) = starting_instance_with_mock("backoff-reset", None).await;
+        *instance.status.write().await = InstanceStatus::Running;
+        instance.stats.write().await.backoff_restarts = 5;
+
+        let checker = Arc::new(MockHealthChecker::new()); // healthy
+        let monitor = monitor_with(
+            checker,
+            Arc::new(MockRestartStrategy::new()),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::default(),
+        );
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(instance.stats.read().await.backoff_restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_manual_reset_restores_restart_budget() {
+        let config = HealthMonitorConfig::builder()
+            .max_failures_before_restart(1)
+            .auto_restart(true)
+            .restart_backoff_base(Duration::ZERO)
+            .max_restarts(1)
+            .build();
+        let (instance, restart, _events, monitor) =
+            failing_running_instance("manual-reset", config).await;
+
+        // Exhaust the budget: 1 restart, then give up
+        monitor.check_single_instance(&instance).await;
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(restart.restart_count(), 1);
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+
+        // Operator intervenes (what the REST restart handler does)
+        instance.reset_restart_backoff().await;
+        *instance.status.write().await = InstanceStatus::Running;
+
+        // The monitor restarts it again instead of staying given-up
+        monitor.check_single_instance(&instance).await;
+        assert_eq!(restart.restart_count(), 2);
     }
 }

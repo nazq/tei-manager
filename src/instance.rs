@@ -106,14 +106,17 @@ pub trait ProcessManager: Send + Sync {
 ///
 /// TEI writes JSON lines with `"level":"ERROR"`; anyhow's final report is a plain
 /// `Error: ...` line. Only the tail of the file is scanned.
-pub(crate) fn last_log_error(path: &std::path::Path) -> Option<String> {
+pub(crate) fn last_log_error(path: &std::path::Path, offset: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
 
     const TAIL_BYTES: u64 = 16 * 1024;
 
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+    // Never read before `offset` (the file length at spawn): the tail of an
+    // appended log can otherwise blame a previous run's ERROR line for a
+    // fresh exit that wrote little or nothing.
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES).max(offset)))
         .ok()?;
     let mut buf = String::new();
     file.read_to_string(&mut buf).ok()?;
@@ -148,12 +151,15 @@ pub(crate) fn last_log_error(path: &std::path::Path) -> Option<String> {
 /// message of the last matching line. A later `... on Cuda(...)` line clears
 /// earlier evidence: instance logs are opened in append mode across
 /// restarts, and only the latest run's backend choice counts.
-pub(crate) fn gpu_fallback_evidence(path: &std::path::Path) -> Option<String> {
-    use std::io::Read;
+pub(crate) fn gpu_fallback_evidence(path: &std::path::Path, offset: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
 
     const HEAD_BYTES: u64 = 64 * 1024;
 
-    let file = std::fs::File::open(path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
+    // Scan only the current process's log region: `offset` is the file
+    // length at spawn time, so everything before it belongs to earlier runs.
+    file.seek(SeekFrom::Start(offset)).ok()?;
     let mut bytes = Vec::new();
     file.take(HEAD_BYTES).read_to_end(&mut bytes).ok()?;
     let buf = String::from_utf8_lossy(&bytes);
@@ -182,6 +188,10 @@ pub struct SystemProcessManager {
     processes: Arc<RwLock<HashMap<String, Child>>>,
     /// Log file per handle, used to surface the failure reason after exit
     log_paths: Arc<RwLock<HashMap<String, PathBuf>>>,
+    /// Byte length of each instance's log file at spawn time: the current
+    /// process's log region starts here (logs append across restarts and
+    /// deployments, so absolute head/tail reads can see stale history)
+    log_offsets: Arc<RwLock<HashMap<String, u64>>>,
     /// Exit status of children that have been reaped
     exited: Arc<RwLock<HashMap<String, ProcessExit>>>,
 }
@@ -191,6 +201,7 @@ impl SystemProcessManager {
         Self {
             processes: Arc::new(RwLock::new(HashMap::new())),
             log_paths: Arc::new(RwLock::new(HashMap::new())),
+            log_offsets: Arc::new(RwLock::new(HashMap::new())),
             exited: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -215,12 +226,19 @@ impl SystemProcessManager {
         #[cfg(not(unix))]
         let signal = None;
 
+        let log_offset = self
+            .log_offsets
+            .read()
+            .await
+            .get(handle_id)
+            .copied()
+            .unwrap_or(0);
         let last_log_error = self
             .log_paths
             .read()
             .await
             .get(handle_id)
-            .and_then(|p| last_log_error(p));
+            .and_then(|p| last_log_error(p, log_offset));
 
         let exit = ProcessExit {
             code: status.code(),
@@ -320,6 +338,13 @@ impl ProcessManager for SystemProcessManager {
             .try_clone()
             .context("Failed to clone log file for stderr")?;
 
+        // The log file appends across restarts and redeployments; remember
+        // where THIS process's output begins so log scans never read a
+        // previous run's history (a stale "Using CPU instead" in an old
+        // region must not condemn a healthy instance). Captured BEFORE the
+        // spawn so the region provably contains every byte the child writes.
+        let log_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
         // Spawn process
         let child = cmd
             .stdout(stdout_file)
@@ -347,6 +372,10 @@ impl ProcessManager for SystemProcessManager {
             .write()
             .await
             .insert(handle_id.clone(), log_path);
+        self.log_offsets
+            .write()
+            .await
+            .insert(handle_id.clone(), log_offset);
         self.exited.write().await.remove(&handle_id);
         self.processes.write().await.insert(handle_id, child);
 
@@ -356,6 +385,7 @@ impl ProcessManager for SystemProcessManager {
     async fn stop(&self, handle: ProcessHandle, timeout: Duration) -> Result<()> {
         let mut processes = self.processes.write().await;
         self.log_paths.write().await.remove(&handle.id);
+        self.log_offsets.write().await.remove(&handle.id);
         self.exited.write().await.remove(&handle.id);
 
         if let Some(mut child) = processes.remove(&handle.id) {
@@ -421,7 +451,14 @@ impl ProcessManager for SystemProcessManager {
 
     async fn gpu_fallback_evidence(&self, handle: &ProcessHandle) -> Option<String> {
         let path = self.log_paths.read().await.get(&handle.id).cloned()?;
-        gpu_fallback_evidence(&path)
+        let offset = self
+            .log_offsets
+            .read()
+            .await
+            .get(&handle.id)
+            .copied()
+            .unwrap_or(0);
+        gpu_fallback_evidence(&path, offset)
     }
 }
 
@@ -784,7 +821,7 @@ mod tests {
         // The structured ERROR line carries the real cause and wins over the
         // trailing plain `Error:` report.
         assert_eq!(
-            last_log_error(&path).as_deref(),
+            last_log_error(&path, 0).as_deref(),
             Some("Could not start Candle backend: compute cap 120")
         );
     }
@@ -801,7 +838,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            last_log_error(&path).as_deref(),
+            last_log_error(&path, 0).as_deref(),
             Some("Error: Could not create backend")
         );
     }
@@ -817,15 +854,15 @@ mod tests {
                 r#"{"level":"INFO","message":"after"}"#,
             ],
         );
-        assert_eq!(last_log_error(&path).as_deref(), Some("boom"));
+        assert_eq!(last_log_error(&path, 0).as_deref(), Some("boom"));
     }
 
     #[test]
     fn test_last_log_error_none_when_no_errors_or_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_log(&dir, &[r#"{"level":"INFO","message":"fine"}"#]);
-        assert_eq!(last_log_error(&path), None);
-        assert_eq!(last_log_error(&dir.path().join("missing.log")), None);
+        assert_eq!(last_log_error(&path, 0), None);
+        assert_eq!(last_log_error(&dir.path().join("missing.log"), 0), None);
     }
 
     #[test]
@@ -843,7 +880,7 @@ mod tests {
         );
         // The last matching line wins and its JSON message is extracted
         assert_eq!(
-            gpu_fallback_evidence(&path).as_deref(),
+            gpu_fallback_evidence(&path, 0).as_deref(),
             Some("Using CPU instead")
         );
     }
@@ -857,7 +894,7 @@ mod tests {
         );
         // Non-JSON line: returned verbatim
         assert_eq!(
-            gpu_fallback_evidence(&path).as_deref(),
+            gpu_fallback_evidence(&path, 0).as_deref(),
             Some("Could not create backend: CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE")
         );
     }
@@ -872,8 +909,11 @@ mod tests {
                 r#"{"level":"INFO","message":"Ready"}"#,
             ],
         );
-        assert_eq!(gpu_fallback_evidence(&path), None);
-        assert_eq!(gpu_fallback_evidence(&dir.path().join("missing.log")), None);
+        assert_eq!(gpu_fallback_evidence(&path, 0), None);
+        assert_eq!(
+            gpu_fallback_evidence(&dir.path().join("missing.log"), 0),
+            None
+        );
     }
 
     #[test]
@@ -889,7 +929,7 @@ mod tests {
                 r#"{"level":"INFO","message":"Starting FlashBert model on Cuda(CudaDevice(DeviceId(0)))"}"#,
             ],
         );
-        assert_eq!(gpu_fallback_evidence(&path), None);
+        assert_eq!(gpu_fallback_evidence(&path, 0), None);
     }
 
     #[test]
@@ -964,6 +1004,92 @@ mod tests {
         }
         let recorded = std::fs::read_to_string(&out).unwrap();
         assert_eq!(recorded.trim(), "rust_log=text_embeddings_router=debug");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_last_log_error_ignores_previous_runs_tail() {
+        // A fresh run that dies writing little: the 16KB tail is mostly the
+        // previous run's lines. Its old ERROR must not be blamed for the new
+        // exit; an ERROR written by the current run still is.
+        let dir = std::env::temp_dir().join(format!("tei-tail-offset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("instance.log");
+        std::fs::write(
+            &path,
+            "{\"level\":\"ERROR\",\"message\":\"old run exploded\"}\n",
+        )
+        .unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(
+            last_log_error(&path, offset),
+            None,
+            "empty current region must not surface the old run's error"
+        );
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"level\":\"ERROR\",\"message\":\"fresh failure\"}\n")
+            .unwrap();
+        assert_eq!(
+            last_log_error(&path, offset).as_deref(),
+            Some("fresh failure")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_gpu_fallback_evidence_ignores_previous_runs_region() {
+        // Log appends across restarts: an old run's CPU fallback followed by
+        // this run's healthy CUDA start. Scanning from the spawn offset must
+        // see only the healthy region; scanning from 0 sees stale evidence.
+        let dir = std::env::temp_dir().join(format!("tei-evidence-offset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("instance.log");
+        // Old region: CPU-fallback evidence followed by enough padding that
+        // the healthy line of the NEXT run falls outside a from-the-start
+        // 64KB scan window (the exact field failure mode).
+        let mut old_run = String::from(
+            "{\"level\":\"WARN\",\"message\":\"Could not create backend\"}\n{\"level\":\"WARN\",\"message\":\"Using CPU instead\"}\n",
+        );
+        let filler = "{\"level\":\"INFO\",\"message\":\"embed ok\"}\n";
+        while old_run.len() < 70 * 1024 {
+            old_run.push_str(filler);
+        }
+        std::fs::write(&path, &old_run).unwrap();
+        let offset = std::fs::metadata(&path).unwrap().len();
+        let new_run = "{\"level\":\"INFO\",\"message\":\"Starting FlashBert model on Cuda(CudaDevice(DeviceId(0)))\"}\n";
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(new_run.as_bytes())
+            .unwrap();
+
+        assert!(
+            gpu_fallback_evidence(&path, 0).is_some(),
+            "sanity: absolute scan still sees the stale evidence"
+        );
+        assert_eq!(
+            gpu_fallback_evidence(&path, offset),
+            None,
+            "offset scan must ignore the previous run's region"
+        );
+        // And a fresh failure IN the current region is still caught
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"level\":\"WARN\",\"message\":\"Using CPU instead\"}\n")
+            .unwrap();
+        assert_eq!(
+            gpu_fallback_evidence(&path, offset).as_deref(),
+            Some("Using CPU instead")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -5,6 +5,36 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{Arc, OnceLock};
 
 // ============================================================================
+// gRPC Multiplexer Metric Names
+// ============================================================================
+
+/// Counter: total gRPC multiplexer requests (`method`, `instance`, `status`)
+pub const MUX_REQUESTS_TOTAL: &str = "tei_mux_requests_total";
+
+/// Histogram: unary gRPC multiplexer request duration (`method`, `instance`)
+pub const MUX_REQUEST_DURATION_SECONDS: &str = "tei_mux_request_duration_seconds";
+
+/// Counter: per-row outcomes of the Arrow batch RPCs (`instance`, `status`)
+pub const MUX_ROWS_TOTAL: &str = "tei_mux_rows_total";
+
+/// Describe the gRPC multiplexer metrics (help texts) on the installed recorder
+pub fn describe_mux_metrics() {
+    metrics::describe_counter!(
+        MUX_REQUESTS_TOTAL,
+        "Total gRPC multiplexer requests by RPC method, backend instance, and status (ok|error)"
+    );
+    metrics::describe_histogram!(
+        MUX_REQUEST_DURATION_SECONDS,
+        metrics::Unit::Seconds,
+        "Duration of unary gRPC multiplexer requests by RPC method and backend instance"
+    );
+    metrics::describe_counter!(
+        MUX_ROWS_TOTAL,
+        "Total rows processed by the Arrow batch RPCs by backend instance and per-row status (ok|failed)"
+    );
+}
+
+// ============================================================================
 // Trait Definitions
 // ============================================================================
 
@@ -133,6 +163,8 @@ pub fn setup_metrics() -> Result<metrics_exporter_prometheus::PrometheusHandle> 
 
     tracing::info!("Prometheus metrics exporter installed");
 
+    describe_mux_metrics();
+
     // Initialize global service with production recorder
     init_service(MetricsService::new(Arc::new(PrometheusRecorder)));
 
@@ -171,6 +203,34 @@ pub fn record_instance_restart(name: &str) {
 pub fn update_instance_count(count: usize) {
     if let Some(service) = METRICS_SERVICE.get() {
         service.update_instance_count(count);
+    }
+}
+
+// ============================================================================
+// Test Support
+// ============================================================================
+
+/// Shared Prometheus recorder for unit tests.
+///
+/// The `metrics` crate allows only one global recorder per process, so every
+/// unit test that needs the rendered output goes through this handle.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use std::sync::OnceLock;
+
+    static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+
+    pub(crate) fn prometheus_handle() -> PrometheusHandle {
+        PROMETHEUS_HANDLE
+            .get_or_init(|| {
+                let handle = PrometheusBuilder::new()
+                    .install_recorder()
+                    .expect("Prometheus recorder should install");
+                super::describe_mux_metrics();
+                handle
+            })
+            .clone()
     }
 }
 

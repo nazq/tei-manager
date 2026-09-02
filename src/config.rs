@@ -133,6 +133,15 @@ pub struct ManagerConfig {
     #[serde(default = "default_grpc_request_timeout_secs")]
     pub grpc_request_timeout_secs: u64,
 
+    /// Max Arrow request batches one EmbedArrowStream call executes
+    /// concurrently (default: 4). A stream's first request can override this
+    /// via its `max_concurrent_batches` field; either way the effective
+    /// value is clamped to 1..=64. Responses are always emitted strictly in
+    /// request order. Worst-case buffered responses per stream are about
+    /// this value x grpc_max_message_size_mb.
+    #[serde(default = "default_grpc_stream_max_concurrent_batches")]
+    pub grpc_stream_max_concurrent_batches: usize,
+
     /// At the startup timeout, an instance whose TEI process is alive and has
     /// written to its log within this many seconds is treated as still
     /// loading (weight download/conversion) and given more time; only a dead
@@ -267,6 +276,7 @@ impl Default for ManagerConfig {
             grpc_max_message_size_mb: default_grpc_max_message_size_mb(),
             grpc_max_parallel_streams: default_grpc_max_parallel_streams(),
             grpc_request_timeout_secs: default_grpc_request_timeout_secs(),
+            grpc_stream_max_concurrent_batches: default_grpc_stream_max_concurrent_batches(),
             startup_log_stall_secs: default_startup_log_stall_secs(),
             gpu_preflight: GpuPreflight::default(),
             gpu_fallback: GpuFallback::default(),
@@ -719,6 +729,9 @@ fn default_grpc_max_parallel_streams() -> usize {
 }
 fn default_grpc_request_timeout_secs() -> u64 {
     30
+}
+fn default_grpc_stream_max_concurrent_batches() -> usize {
+    4
 }
 fn default_verify_subject() -> bool {
     true

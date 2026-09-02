@@ -213,6 +213,7 @@ async fn main() -> Result<()> {
         let grpc_max_message_size_mb = config.grpc_max_message_size_mb;
         let grpc_max_parallel_streams = config.grpc_max_parallel_streams;
         let grpc_request_timeout_secs = config.grpc_request_timeout_secs;
+        let grpc_stream_max_concurrent_batches = config.grpc_stream_max_concurrent_batches;
         let grpc_output_dtype = config.arrow_output_dtype;
         let mut grpc_shutdown_rx = shutdown_tx.subscribe();
 
@@ -245,6 +246,7 @@ async fn main() -> Result<()> {
                     max_parallel_streams: grpc_max_parallel_streams,
                     request_timeout_secs: grpc_request_timeout_secs,
                     default_output_dtype: grpc_output_dtype,
+                    stream_max_concurrent_batches: grpc_stream_max_concurrent_batches,
                 },
                 async move {
                     let _ = grpc_shutdown_rx.recv().await;

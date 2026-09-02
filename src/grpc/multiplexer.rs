@@ -8,9 +8,13 @@ use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use futures::FutureExt;
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -247,6 +251,14 @@ fn record_mux_rows<T>(instance: &str, outcome: &RowOutcomes<T>) {
     .increment(failed_rows);
 }
 
+/// Server default for how many batches one `EmbedArrowStream` call may
+/// execute concurrently (`grpc_stream_max_concurrent_batches`)
+const DEFAULT_STREAM_MAX_CONCURRENT_BATCHES: usize = 4;
+/// Clamp bounds for the effective per-stream batch concurrency, applied to
+/// the server knob and the caller's first-request override alike
+const STREAM_CONCURRENCY_MIN: usize = 1;
+const STREAM_CONCURRENCY_MAX: usize = 64;
+
 /// TeiMultiplexer service implementation
 #[derive(Clone)]
 pub struct TeiMultiplexerService {
@@ -255,6 +267,8 @@ pub struct TeiMultiplexerService {
     request_timeout: Option<Duration>,
     /// Element type for EmbedArrow responses when the request says UNSPECIFIED
     default_output_dtype: ArrowOutputDtype,
+    /// Default concurrent batches per EmbedArrowStream call (clamped 1..=64)
+    stream_max_concurrent_batches: usize,
     /// Round-robin cursor for model-based routing
     route_counter: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -275,6 +289,7 @@ impl TeiMultiplexerService {
                 None
             },
             default_output_dtype: ArrowOutputDtype::F32,
+            stream_max_concurrent_batches: DEFAULT_STREAM_MAX_CONCURRENT_BATCHES,
             route_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -283,6 +298,25 @@ impl TeiMultiplexerService {
     pub fn with_default_output_dtype(mut self, dtype: ArrowOutputDtype) -> Self {
         self.default_output_dtype = dtype;
         self
+    }
+
+    /// Set the default number of batches an `EmbedArrowStream` call may
+    /// execute concurrently. A stream's first request can override this via
+    /// `max_concurrent_batches`; either value is clamped to 1..=64.
+    pub fn with_stream_max_concurrent_batches(mut self, max: usize) -> Self {
+        self.stream_max_concurrent_batches = max;
+        self
+    }
+
+    /// Effective batch concurrency for one stream: the caller's nonzero
+    /// first-request override, else the server default, clamped to 1..=64
+    fn effective_stream_concurrency(&self, requested: u32) -> usize {
+        let k = if requested > 0 {
+            requested as usize
+        } else {
+            self.stream_max_concurrent_batches
+        };
+        k.clamp(STREAM_CONCURRENCY_MIN, STREAM_CONCURRENCY_MAX)
     }
 
     /// Resolve a request's `output_dtype` against the server default
@@ -340,8 +374,9 @@ impl TeiMultiplexerService {
         }
     }
 
-    /// Round-robin over the running instances of `model_id`
-    async fn pick_running_instance(&self, model_id: &str) -> Result<String, Status> {
+    /// The RUNNING instances serving `model_id`, sorted for determinism.
+    /// `NotFound` (naming the model) when there are none.
+    async fn running_model_instances(&self, model_id: &str) -> Result<Vec<String>, Status> {
         let mut matches: Vec<String> = Vec::new();
         for instance in self.pool.registry().list().await {
             if instance.config.model_id == model_id
@@ -358,6 +393,12 @@ impl TeiMultiplexerService {
         }
         // Registry order is stable enough for fairness; sort for determinism
         matches.sort();
+        Ok(matches)
+    }
+
+    /// Round-robin over the running instances of `model_id`
+    async fn pick_running_instance(&self, model_id: &str) -> Result<String, Status> {
+        let matches = self.running_model_instances(model_id).await?;
         let i = self
             .route_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -369,11 +410,17 @@ impl TeiMultiplexerService {
     /// tests (mirroring how `embed_rows` is tested via generic streams).
     ///
     /// The FIRST request establishes the target and all options; subsequent
-    /// requests contribute only their `arrow_ipc` payload. Batches run
-    /// through the same pipeline as the unary `EmbedArrow`, sequentially in
-    /// arrival order, each yielding exactly one response. A batch-level
-    /// failure (invalid IPC, backend death, timeout) is sent as `Err(Status)`
-    /// and terminates the stream; per-row errors ride in the `error` column.
+    /// requests contribute only their `arrow_ipc` payload. Up to K batches
+    /// (`effective_stream_concurrency`) run concurrently through the same
+    /// pipeline as the unary `EmbedArrow`, but responses are emitted strictly
+    /// in request order, 1:1 with request batches. A batch-level failure
+    /// (invalid IPC, backend death, timeout) terminates the stream with the
+    /// status of the LOWEST-sequence failed batch: every batch before it is
+    /// delivered, no batch after it is. Per-row errors ride in the `error`
+    /// column and never end the stream. An `instance_name` target pins the
+    /// whole stream to that instance; a `model_id` target re-resolves per
+    /// batch (round-robin), spreading batches across the model's running
+    /// instances.
     pub async fn embed_arrow_stream_core<S>(
         &self,
         mut stream: S,
@@ -391,57 +438,74 @@ impl TeiMultiplexerService {
             .ok_or_else(|| Status::invalid_argument("Empty stream"))?
             .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
 
-        let instance_name = self.resolve_target(first.target.clone()).await?;
-        Span::current().record("tei.instance", instance_name.as_str());
-        mux_metrics.set_instance(&instance_name);
+        let target = first
+            .target
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("Missing target"))?;
+        let (routing, instance_label) = match target.routing {
+            Some(mux::target::Routing::InstanceName(name)) => {
+                if name.is_empty() {
+                    return Err(Status::invalid_argument("Instance name cannot be empty"));
+                }
+                // Noop mode never dials the backend, exactly like the unary
+                // RPC; otherwise the clients are resolved once and pinned.
+                let embed = if first.noop {
+                    None
+                } else {
+                    Some(self.pool.get_clients(&name).await?.embed.clone())
+                };
+                (
+                    StreamRouting::Instance {
+                        name: name.clone(),
+                        embed,
+                    },
+                    name,
+                )
+            }
+            Some(mux::target::Routing::ModelId(model_id)) => {
+                if model_id.is_empty() {
+                    return Err(Status::invalid_argument("Model id cannot be empty"));
+                }
+                // Fail fast when the model has no running instance right now;
+                // afterwards every batch re-resolves on its own.
+                let running = self.running_model_instances(&model_id).await?;
+                let label = running[0].clone();
+                (StreamRouting::Model { model_id }, label)
+            }
+            Some(mux::target::Routing::InstanceIndex(_)) => {
+                return Err(Status::unimplemented(
+                    "Index-based routing not yet implemented",
+                ));
+            }
+            None => return Err(Status::invalid_argument("No routing specified")),
+        };
+        Span::current().record("tei.instance", instance_label.as_str());
+        mux_metrics.set_instance(&instance_label);
 
-        let job = ArrowStreamJob {
-            instance: instance_name.clone(),
-            // Noop mode never dials the backend, exactly like the unary RPC.
-            embed: if first.noop {
-                None
-            } else {
-                Some(self.pool.get_clients(&instance_name).await?.embed.clone())
-            },
+        let job = Arc::new(ArrowStreamJob {
+            service: self.clone(),
+            routing,
+            noop: first.noop,
             opts: EmbedArrowOptions::from_request(&first),
             output_dtype: self.output_dtype(first.output_dtype)?,
             compression: first.compression,
             timeout: self.request_timeout,
-        };
+        });
+        let max_concurrent = self.effective_stream_concurrency(first.max_concurrent_batches);
+        Span::current().record("tei.max_concurrent_batches", max_concurrent);
 
         let (tx, rx) = tokio::sync::mpsc::channel(self.max_parallel_stream_requests);
+        let span = Span::current();
+        let process = move |seq: u64, ipc: Vec<u8>| {
+            let job = job.clone();
+            async move { job.run_batch(seq, &ipc).await }
+        };
         tokio::spawn(async move {
-            let mut next_ipc = Some(first.arrow_ipc);
-            loop {
-                let ipc = match next_ipc.take() {
-                    Some(ipc) => ipc,
-                    None => match stream.next().await {
-                        None => break,
-                        // Only `arrow_ipc` is read on requests after the
-                        // first; target/options are fixed by the first one.
-                        Some(Ok(req)) => req.arrow_ipc,
-                        Some(Err(e)) => {
-                            let _ = tx
-                                .send(Err(Status::internal(format!("Stream error: {}", e))))
-                                .await;
-                            break;
-                        }
-                    },
-                };
-                match job.run_batch(&ipc).await {
-                    Ok(response) => {
-                        if tx.send(Ok(response)).await.is_err() {
-                            break; // client hung up
-                        }
-                    }
-                    Err(status) => {
-                        // A failure the unary RPC would return as a Status
-                        // terminates the stream, matching tonic semantics.
-                        let _ = tx.send(Err(status)).await;
-                        break;
-                    }
-                }
-            }
+            let stats = run_arrow_stream_pipeline(stream, first, max_concurrent, tx, process).await;
+            span.record(
+                "tei.batches_with_ignored_fields",
+                stats.batches_with_ignored_fields,
+            );
         });
 
         mux_metrics.set_ok();
@@ -892,7 +956,15 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type EmbedArrowStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<mux::EmbedArrowResponse, Status>>;
 
-    #[instrument(name = "tei.embed_arrow_stream_rpc", skip_all, fields(tei.instance))]
+    #[instrument(
+        name = "tei.embed_arrow_stream_rpc",
+        skip_all,
+        fields(
+            tei.instance,
+            tei.max_concurrent_batches,
+            tei.batches_with_ignored_fields
+        )
+    )]
     async fn embed_arrow_stream(
         &self,
         request: Request<Streaming<mux::EmbedArrowRequest>>,
@@ -1041,35 +1113,65 @@ async fn embed_dense_rows(
     .map(|r| r.embeddings))
 }
 
+/// How an `EmbedArrowStream` call routes its batches to backends.
+enum StreamRouting {
+    /// `instance_name` target: the instance (and its clients, unless noop)
+    /// are resolved once at stream open and pinned for the whole stream.
+    Instance {
+        name: String,
+        /// Backend dense-embed client; `None` in noop mode (never dialed).
+        embed: Option<DenseEmbedClient>,
+    },
+    /// `model_id` target: a running instance is picked PER BATCH (round-robin
+    /// via `pick_running_instance`), so a stream's batches spread across all
+    /// running instances of the model and route around instances that die.
+    Model { model_id: String },
+}
+
 /// Everything fixed by the first request of an `EmbedArrowStream` call.
 struct ArrowStreamJob {
-    /// Resolved backend instance name (metrics label)
-    instance: String,
-    /// Backend dense-embed client; `None` in noop mode (backend never dialed).
-    embed: Option<DenseEmbedClient>,
+    /// Handle back to the service for per-batch model routing.
+    service: TeiMultiplexerService,
+    routing: StreamRouting,
+    /// Noop mode never dials the backend, exactly like the unary RPC.
+    noop: bool,
     opts: EmbedArrowOptions,
     output_dtype: ArrowOutputDtype,
     compression: i32,
     /// Per-batch timeout (`None` = no timeout), mirroring the unary RPC.
+    /// A timeout counts as that batch's failure.
     timeout: Option<Duration>,
 }
 
 impl ArrowStreamJob {
     /// Run one request batch through the same pipeline as the unary
-    /// `EmbedArrow`: parse rows, embed (or noop), build the dense batch and
-    /// serialize it.
+    /// `EmbedArrow`: resolve the backend (per batch for model routing), parse
+    /// rows, embed (or noop), build the dense batch and serialize it.
     #[instrument(
         name = "tei.embed_arrow_batch",
         skip_all,
-        fields(tei.rows, tei.rows_failed)
+        fields(tei.seq = seq, tei.instance, tei.rows, tei.rows_failed)
     )]
-    async fn run_batch(&self, ipc: &[u8]) -> Result<mux::EmbedArrowResponse, Status> {
+    async fn run_batch(&self, seq: u64, ipc: &[u8]) -> Result<mux::EmbedArrowResponse, Status> {
+        let (instance, embed) = match &self.routing {
+            StreamRouting::Instance { name, embed } => (name.clone(), embed.clone()),
+            StreamRouting::Model { model_id } => {
+                let name = self.service.pick_running_instance(model_id).await?;
+                let embed = if self.noop {
+                    None
+                } else {
+                    Some(self.service.pool.get_clients(&name).await?.embed.clone())
+                };
+                (name, embed)
+            }
+        };
+        Span::current().record("tei.instance", instance.as_str());
         let rows = arrow_batch::parse_text_rows(ipc)?;
         Span::current().record("tei.rows", rows.len());
-        let outcome: RowOutcomes<Vec<f32>> = match &self.embed {
+        let outcome: RowOutcomes<Vec<f32>> = match embed {
             None => RowOutcomes::noop(rows.len(), || vec![0.0f32; NOOP_EMBEDDING_DIM]),
             Some(embed) => {
-                let fut = embed_dense_rows(rows, self.opts.clone(), embed.clone());
+                let fut = embed_dense_rows(rows, self.opts.clone(), embed);
                 match self.timeout {
                     Some(duration) => timeout(duration, fut)
                         .await
@@ -1078,11 +1180,299 @@ impl ArrowStreamJob {
                 }?
             }
         };
-        record_mux_rows(&self.instance, &outcome);
+        record_mux_rows(&instance, &outcome);
         Span::current().record("tei.rows_failed", outcome.rows.len() - outcome.ok_count());
         let batch = arrow_batch::dense_batch(&outcome, self.output_dtype)?;
         let buffer = arrow_batch::serialize(&batch, self.compression)?;
         Ok(mux::EmbedArrowResponse { arrow_ipc: buffer })
+    }
+}
+
+/// Outcome counters of one `EmbedArrowStream` call, recorded on the
+/// stream-level span when the stream ends.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ArrowStreamStats {
+    /// Requests after the first that set option fields differing from the
+    /// pinned values. Those fields are ignored per the proto contract, so
+    /// they are surfaced via a per-batch debug log plus this counter.
+    batches_with_ignored_fields: u64,
+}
+
+/// One finished (or synthesized) batch result on its way to the collector.
+struct BatchCompletion {
+    seq: u64,
+    /// The batch's admission permit. Carried here instead of being dropped on
+    /// completion so the collector releases it when the response is EMITTED,
+    /// which bounds admitted-but-unemitted work to K and lets a slow client
+    /// apply backpressure. `None` for the reader's synthetic
+    /// transport-failure entry.
+    permit: Option<OwnedSemaphorePermit>,
+    result: Result<mux::EmbedArrowResponse, Status>,
+}
+
+/// Names of the option fields a subsequent stream request set to something
+/// other than the pinned (first-request) value. Proto3 scalars are counted
+/// only when they also differ from their type default — an unset scalar is
+/// indistinguishable from the default and is not "set".
+fn ignored_option_fields(
+    pinned: &mux::EmbedArrowRequest,
+    req: &mux::EmbedArrowRequest,
+) -> Vec<&'static str> {
+    let mut ignored = Vec::new();
+    if req.target.is_some() && req.target != pinned.target {
+        ignored.push("target");
+    }
+    if req.truncate && req.truncate != pinned.truncate {
+        ignored.push("truncate");
+    }
+    if req.normalize && req.normalize != pinned.normalize {
+        ignored.push("normalize");
+    }
+    if req.noop && req.noop != pinned.noop {
+        ignored.push("noop");
+    }
+    if req.truncation_direction != 0 && req.truncation_direction != pinned.truncation_direction {
+        ignored.push("truncation_direction");
+    }
+    if req.prompt_name.is_some() && req.prompt_name != pinned.prompt_name {
+        ignored.push("prompt_name");
+    }
+    if req.dimensions.is_some() && req.dimensions != pinned.dimensions {
+        ignored.push("dimensions");
+    }
+    if req.compression != 0 && req.compression != pinned.compression {
+        ignored.push("compression");
+    }
+    if req.output_dtype != 0 && req.output_dtype != pinned.output_dtype {
+        ignored.push("output_dtype");
+    }
+    if req.max_concurrent_batches != 0
+        && req.max_concurrent_batches != pinned.max_concurrent_batches
+    {
+        ignored.push("max_concurrent_batches");
+    }
+    ignored
+}
+
+/// Record `seq` as failed, keeping the frontier at the MINIMUM failing seq.
+/// The frontier may DECREASE when an earlier batch fails after a later one;
+/// the collector's in-order emission makes the lowest seq terminal either way.
+fn lower_frontier(tx: &watch::Sender<Option<u64>>, seq: u64) {
+    tx.send_if_modified(|frontier| {
+        if frontier.is_none_or(|cur| seq < cur) {
+            *frontier = Some(seq);
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// Resolve when the failure frontier drops BELOW `seq`: this batch's result
+/// can never be emitted and the batch must be abandoned. Batches at or below
+/// the frontier run to completion — they are owed to the client.
+async fn frontier_passed(rx: &mut watch::Receiver<Option<u64>>, seq: u64) {
+    if rx
+        .wait_for(|frontier| matches!(frontier, Some(cur) if *cur < seq))
+        .await
+        .is_err()
+    {
+        // Every frontier sender is gone: no failure can ever pass this seq.
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Resolve as soon as any failure frontier exists (the stream is failing, so
+/// the reader must not admit further batches).
+async fn frontier_exists(rx: &mut watch::Receiver<Option<u64>>) {
+    if rx.wait_for(Option::is_some).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Reader/collector machinery of `EmbedArrowStream`, generic over the batch
+/// processor so tests can drive it with scripted batches (the production
+/// processor is `ArrowStreamJob::run_batch`). Returns when the stream is
+/// finished, terminally failed, or the client went away.
+///
+/// Three stages, bounded by a semaphore of `max_concurrent` (K) permits:
+///
+/// - READER (spawned): assigns seq i from 0, acquires a permit BEFORE
+///   admitting batch i, spawns the batch task. Stops on inbound EOF (all
+///   in-flight batches drain; clean close), on an inbound transport error
+///   (synthesized as a failure at the next unadmitted seq, so every batch
+///   admitted before it drains and emits first — "drain then fail"), and on
+///   cancellation.
+/// - BATCH TASK i: runs the processor; on failure lowers the failure
+///   frontier to min(frontier, i). Aborts — its result, even a completed
+///   one, is discarded — as soon as the frontier drops below i; it never
+///   aborts while i is at or below the frontier. There is NO server-side
+///   retry of a failed batch on another instance: the contract is
+///   discard-and-let-the-client-resume.
+/// - COLLECTOR (this future): reorders completions in a `BTreeMap` and emits
+///   the contiguous prefix in seq order, releasing each batch's permit ON
+///   EMISSION (not completion). An `Err` at the emission head is terminal:
+///   it is emitted and the stream shuts down, so the terminal status is
+///   always the LOWEST-sequence failure. A closed response channel (client
+///   gone) cancels the reader and every batch task.
+async fn run_arrow_stream_pipeline<S, P, Fut>(
+    mut stream: S,
+    mut first: mux::EmbedArrowRequest,
+    max_concurrent: usize,
+    tx: mpsc::Sender<Result<mux::EmbedArrowResponse, Status>>,
+    process: P,
+) -> ArrowStreamStats
+where
+    S: futures::Stream<Item = Result<mux::EmbedArrowRequest, Status>> + Unpin + Send + 'static,
+    P: Fn(u64, Vec<u8>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<mux::EmbedArrowResponse, Status>> + Send + 'static,
+{
+    let max_concurrent = max_concurrent.max(1);
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let (frontier_tx, frontier_rx) = watch::channel(None::<u64>);
+    // One slot per admitted batch plus the reader's synthetic failure entry,
+    // so no sender ever blocks the collector.
+    let (comp_tx, mut comp_rx) = mpsc::channel::<BatchCompletion>(max_concurrent + 1);
+    let ignored_batches = Arc::new(AtomicU64::new(0));
+
+    // READER
+    let reader_ignored = ignored_batches.clone();
+    let reader_comp_tx = comp_tx.clone();
+    let mut reader_frontier_rx = frontier_rx.clone();
+    tokio::spawn(async move {
+        let comp_tx = reader_comp_tx;
+        let mut next_seq: u64 = 0;
+        let mut pending_ipc = Some(std::mem::take(&mut first.arrow_ipc));
+        let pinned = first; // options-only copy for the ignored-field check
+        loop {
+            let ipc = match pending_ipc.take() {
+                Some(ipc) => ipc,
+                None => {
+                    let item = tokio::select! {
+                        // Collector gone: stop reading.
+                        _ = comp_tx.closed() => return,
+                        item = stream.next() => item,
+                    };
+                    match item {
+                        // Inbound EOF: admit no more; in-flight batches drain.
+                        None => return,
+                        Some(Ok(req)) => {
+                            let ignored = ignored_option_fields(&pinned, &req);
+                            if !ignored.is_empty() {
+                                reader_ignored.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(
+                                    seq = next_seq,
+                                    fields = ?ignored,
+                                    "ignoring option fields set after the first request"
+                                );
+                            }
+                            req.arrow_ipc
+                        }
+                        Some(Err(e)) => {
+                            // Inbound transport error: fail at the next
+                            // unadmitted seq so every batch admitted before
+                            // it drains and emits first ("drain then fail").
+                            lower_frontier(&frontier_tx, next_seq);
+                            let _ = comp_tx
+                                .send(BatchCompletion {
+                                    seq: next_seq,
+                                    permit: None,
+                                    result: Err(Status::internal(format!("Stream error: {}", e))),
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            };
+            // A permit gates ADMISSION of this batch; the collector releases
+            // it once the batch's response has been emitted to the client.
+            let permit = tokio::select! {
+                _ = comp_tx.closed() => return,
+                // The stream is failing: admit no more batches.
+                _ = frontier_exists(&mut reader_frontier_rx) => return,
+                permit = semaphore.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return, // semaphore closed (defensive; unused)
+                },
+            };
+            let seq = next_seq;
+            next_seq += 1;
+            let fut = process(seq, ipc);
+            let comp_tx = comp_tx.clone();
+            let frontier_tx = frontier_tx.clone();
+            let mut frontier_rx = frontier_rx.clone();
+            // BATCH TASK
+            tokio::spawn(async move {
+                tokio::select! {
+                    // Collector gone (terminal status emitted, or the client
+                    // hung up): abandon the batch.
+                    _ = comp_tx.closed() => {}
+                    // An earlier batch failed: this result can never be
+                    // emitted. Abandon it — the client resends after resume.
+                    _ = frontier_passed(&mut frontier_rx, seq) => {}
+                    result = std::panic::AssertUnwindSafe(fut).catch_unwind() => {
+                        let result = result
+                            .unwrap_or_else(|_| Err(Status::internal("batch task panicked")));
+                        if result.is_err() {
+                            lower_frontier(&frontier_tx, seq);
+                        }
+                        let _ = comp_tx
+                            .send(BatchCompletion { seq, permit: Some(permit), result })
+                            .await;
+                    }
+                }
+            });
+        }
+    });
+    // The completion channel closes once the reader and all batch tasks are
+    // done — that is the collector's clean-close signal.
+    drop(comp_tx);
+
+    // COLLECTOR
+    let mut buffered: BTreeMap<u64, BatchCompletion> = BTreeMap::new();
+    let mut next_emit: u64 = 0;
+    'collect: loop {
+        let completion = tokio::select! {
+            // Client hung up: dropping `comp_rx` on exit cancels the reader
+            // and every batch task.
+            _ = tx.closed() => {
+                tracing::debug!("EmbedArrowStream client went away; cancelling in-flight batches");
+                break 'collect;
+            }
+            completion = comp_rx.recv() => match completion {
+                Some(completion) => completion,
+                // Inbound EOF and every in-flight batch drained: clean close.
+                None => break 'collect,
+            },
+        };
+        buffered.insert(completion.seq, completion);
+        // Emit the contiguous prefix in seq order.
+        while let Some(completion) = buffered.remove(&next_emit) {
+            match completion.result {
+                Ok(response) => {
+                    if tx.send(Ok(response)).await.is_err() {
+                        tracing::debug!(
+                            "EmbedArrowStream client went away; cancelling in-flight batches"
+                        );
+                        break 'collect;
+                    }
+                    // Emitted: release the batch's admission permit.
+                    drop(completion.permit);
+                    next_emit += 1;
+                }
+                Err(status) => {
+                    // The lowest-sequence failure reaches the emission head
+                    // first, so it is always the stream's terminal status;
+                    // results buffered beyond it are discarded.
+                    let _ = tx.send(Err(status)).await;
+                    break 'collect;
+                }
+            }
+        }
+    }
+    ArrowStreamStats {
+        batches_with_ignored_fields: ignored_batches.load(Ordering::Relaxed),
     }
 }
 
@@ -3005,10 +3395,15 @@ mod tests {
         let mut first = arrow_stream_request(&["a"], true);
         first.output_dtype = mux::OutputDtype::F16 as i32;
         // The second request tries to flip the dtype (and drops noop); only
-        // its arrow_ipc may be read.
+        // its arrow_ipc may be read. It also sets several other option
+        // fields, all of which must be ignored (they are surfaced via the
+        // stream's ignored-fields counter, tested at the pipeline level).
         let mut second = arrow_stream_request(&["b", "c"], false);
         second.output_dtype = mux::OutputDtype::F32 as i32;
         second.noop = false;
+        second.truncate = true;
+        second.dimensions = Some(8);
+        second.max_concurrent_batches = 63;
 
         let stream = service
             .embed_arrow_stream_core(tokio_stream::iter(vec![Ok(first), Ok(second)]))
@@ -3583,5 +3978,787 @@ mod tests {
                 r#"status="error""#,
             ],
         );
+    }
+
+    // ========================================================================
+    // EmbedArrowStream concurrent pipeline tests (scripted processor)
+    // ========================================================================
+
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    /// Scripted per-seq behavior driving the stream machinery with no backend.
+    #[derive(Clone)]
+    enum BatchScript {
+        /// Succeed after the paused-time delay (payload = the seq's bytes)
+        Ok(Duration),
+        /// Fail with this status after the delay
+        Fail(Duration, Code, &'static str),
+        /// Park until cancelled — never completes
+        Never,
+        /// Park until the Notify fires, then succeed
+        Gate(Arc<Notify>),
+    }
+
+    /// Records processor activity: the concurrency high-water mark, started /
+    /// finished counts, and the seqs whose futures were dropped mid-run
+    /// (= batches that observed cancellation).
+    #[derive(Default)]
+    struct Recorder {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        started: AtomicUsize,
+        finished: AtomicUsize,
+        cancelled: Mutex<Vec<u64>>,
+    }
+
+    impl Recorder {
+        fn cancelled_sorted(&self) -> Vec<u64> {
+            let mut cancelled = self.cancelled.lock().unwrap().clone();
+            cancelled.sort_unstable();
+            cancelled
+        }
+    }
+
+    /// Tracks one processor run; recorded as cancelled when dropped unfinished.
+    struct RunGuard {
+        seq: u64,
+        finished: bool,
+        rec: Arc<Recorder>,
+    }
+
+    impl RunGuard {
+        fn start(seq: u64, rec: Arc<Recorder>) -> Self {
+            rec.started.fetch_add(1, Ordering::SeqCst);
+            let now = rec.active.fetch_add(1, Ordering::SeqCst) + 1;
+            rec.max_active.fetch_max(now, Ordering::SeqCst);
+            Self {
+                seq,
+                finished: false,
+                rec,
+            }
+        }
+
+        fn finish(mut self) {
+            self.finished = true;
+            self.rec.finished.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for RunGuard {
+        fn drop(&mut self) {
+            self.rec.active.fetch_sub(1, Ordering::SeqCst);
+            if !self.finished {
+                self.rec.cancelled.lock().unwrap().push(self.seq);
+            }
+        }
+    }
+
+    fn seq_response(seq: u64) -> mux::EmbedArrowResponse {
+        mux::EmbedArrowResponse {
+            arrow_ipc: seq.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn decode_seq(response: mux::EmbedArrowResponse) -> u64 {
+        u64::from_le_bytes(response.arrow_ipc.as_slice().try_into().unwrap())
+    }
+
+    fn scripted_processor(
+        scripts: Vec<BatchScript>,
+        rec: Arc<Recorder>,
+    ) -> impl Fn(
+        u64,
+        Vec<u8>,
+    ) -> futures::future::BoxFuture<'static, Result<mux::EmbedArrowResponse, Status>> {
+        move |seq, _ipc| {
+            let script = scripts[seq as usize].clone();
+            let rec = rec.clone();
+            Box::pin(async move {
+                let guard = RunGuard::start(seq, rec);
+                let result = match script {
+                    BatchScript::Ok(delay) => {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        Ok(seq_response(seq))
+                    }
+                    BatchScript::Fail(delay, code, msg) => {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        Err(Status::new(code, msg))
+                    }
+                    BatchScript::Never => std::future::pending().await,
+                    BatchScript::Gate(gate) => {
+                        gate.notified().await;
+                        Ok(seq_response(seq))
+                    }
+                };
+                guard.finish();
+                result
+            })
+        }
+    }
+
+    /// Run the pipeline over the given requests and processor, draining the
+    /// response channel to the end. `Ok` payloads decode back to their seq.
+    async fn drive_pipeline_with<P, Fut>(
+        requests: Vec<Result<mux::EmbedArrowRequest, Status>>,
+        k: usize,
+        response_cap: usize,
+        process: P,
+    ) -> (Vec<Result<u64, Status>>, ArrowStreamStats)
+    where
+        P: Fn(u64, Vec<u8>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<mux::EmbedArrowResponse, Status>> + Send + 'static,
+    {
+        let mut it = requests.into_iter();
+        let first = it
+            .next()
+            .expect("at least one request")
+            .expect("first is Ok");
+        let rest: Vec<_> = it.collect();
+        let (tx, mut rx) = mpsc::channel(response_cap);
+        let pipeline = tokio::spawn(run_arrow_stream_pipeline(
+            tokio_stream::iter(rest),
+            first,
+            k,
+            tx,
+            process,
+        ));
+        let mut emitted = Vec::new();
+        while let Some(item) = rx.recv().await {
+            emitted.push(item.map(decode_seq));
+        }
+        let stats = pipeline.await.expect("pipeline task");
+        (emitted, stats)
+    }
+
+    async fn drive_pipeline(
+        scripts: Vec<BatchScript>,
+        k: usize,
+        rec: Arc<Recorder>,
+    ) -> (Vec<Result<u64, Status>>, ArrowStreamStats) {
+        let requests = (0..scripts.len())
+            .map(|_| Ok(mux::EmbedArrowRequest::default()))
+            .collect();
+        drive_pipeline_with(requests, k, 32, scripted_processor(scripts, rec)).await
+    }
+
+    /// The leading run of successful seqs.
+    fn ok_prefix(emitted: &[Result<u64, Status>]) -> Vec<u64> {
+        emitted
+            .iter()
+            .map_while(|r| r.as_ref().ok().copied())
+            .collect()
+    }
+
+    /// Let every ready task run to quiescence without advancing paused time.
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_emits_in_seq_order_under_adversarial_completion() {
+        // Batch i completes after (16 - i) * 10ms — the completion order is
+        // the exact reverse of the request order.
+        let rec = Arc::new(Recorder::default());
+        let scripts: Vec<BatchScript> = (0..16u64)
+            .map(|i| BatchScript::Ok(Duration::from_millis((16 - i) * 10)))
+            .collect();
+        let (emitted, _) = drive_pipeline(scripts, 16, rec.clone()).await;
+        let seqs: Vec<u64> = emitted.into_iter().map(Result::unwrap).collect();
+        assert_eq!(
+            seqs,
+            (0..16).collect::<Vec<_>>(),
+            "payloads match their seq, strictly in request order"
+        );
+        assert_eq!(rec.max_active.load(Ordering::SeqCst), 16);
+        assert!(rec.cancelled_sorted().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_admission_bounded_by_k_and_permit_released_on_emission() {
+        let gate = Arc::new(Notify::new());
+        let rec = Arc::new(Recorder::default());
+        let mut scripts = vec![BatchScript::Gate(gate.clone())];
+        scripts.extend((1..16).map(|_| BatchScript::Ok(Duration::ZERO)));
+        let requests: Vec<_> = (0..16)
+            .map(|_| Ok(mux::EmbedArrowRequest::default()))
+            .collect();
+        let mut it = requests.into_iter();
+        let first = it.next().unwrap().unwrap();
+        let rest: Vec<_> = it.collect();
+        let (tx, mut rx) = mpsc::channel(32);
+        let pipeline = tokio::spawn(run_arrow_stream_pipeline(
+            tokio_stream::iter(rest),
+            first,
+            4,
+            tx,
+            scripted_processor(scripts, rec.clone()),
+        ));
+        settle().await;
+        // The head is stalled; batches 1-3 completed but are unemitted, so
+        // their permits are still held: admission stops at exactly K. Were
+        // permits released on COMPLETION, batches 4-6 would already run.
+        assert_eq!(
+            rec.started.load(Ordering::SeqCst),
+            4,
+            "admission stops at exactly K while the head is stalled"
+        );
+        assert_eq!(rec.finished.load(Ordering::SeqCst), 3);
+        gate.notify_one();
+        let mut seqs = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seqs.push(decode_seq(item.unwrap()));
+        }
+        pipeline.await.unwrap();
+        assert_eq!(seqs, (0..16).collect::<Vec<_>>());
+        assert!(
+            rec.max_active.load(Ordering::SeqCst) <= 4,
+            "concurrency never exceeds K"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_lowest_seq_failure_is_terminal() {
+        // Batch 3 fails instantly, batch 1 fails much later: the terminal
+        // status must still be batch 1's — batch 3's error never surfaces.
+        let rec = Arc::new(Recorder::default());
+        let scripts = vec![
+            BatchScript::Ok(Duration::from_millis(5)),
+            BatchScript::Fail(
+                Duration::from_millis(50),
+                Code::InvalidArgument,
+                "slow fail 1",
+            ),
+            BatchScript::Ok(Duration::from_millis(5)),
+            BatchScript::Fail(Duration::ZERO, Code::Internal, "fast fail 3"),
+            BatchScript::Ok(Duration::from_millis(5)),
+        ];
+        let (emitted, _) = drive_pipeline(scripts, 8, rec).await;
+        assert_eq!(emitted.len(), 2, "batch 0 then the terminal error");
+        assert_eq!(ok_prefix(&emitted), vec![0]);
+        let err = emitted[1].as_ref().unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(err.message(), "slow fail 1", "batch 3's error is discarded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_failure_cancels_later_batches_completes_earlier() {
+        let rec = Arc::new(Recorder::default());
+        let scripts = vec![
+            BatchScript::Ok(Duration::from_millis(20)),
+            BatchScript::Ok(Duration::from_millis(30)),
+            BatchScript::Fail(Duration::from_millis(10), Code::Internal, "boom"),
+            BatchScript::Never,
+            BatchScript::Never,
+            BatchScript::Never,
+        ];
+        let (emitted, _) = drive_pipeline(scripts, 8, rec.clone()).await;
+        settle().await;
+        // Batches before the failure run to completion and are emitted...
+        assert_eq!(ok_prefix(&emitted), vec![0, 1]);
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(emitted[2].as_ref().unwrap_err().message(), "boom");
+        // ...batches after it observe cancellation.
+        assert_eq!(rec.cancelled_sorted(), vec![3, 4, 5]);
+        assert_eq!(rec.finished.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_later_lower_failure_supersedes() {
+        // Batch 5 fails first, batch 3 fails later: the frontier DECREASES
+        // and the terminal status is batch 3's.
+        let rec = Arc::new(Recorder::default());
+        let scripts = vec![
+            BatchScript::Ok(Duration::from_millis(10)),
+            BatchScript::Ok(Duration::from_millis(10)),
+            BatchScript::Ok(Duration::from_millis(10)),
+            BatchScript::Fail(Duration::from_millis(50), Code::ResourceExhausted, "fail 3"),
+            BatchScript::Never,
+            BatchScript::Fail(Duration::from_millis(1), Code::Internal, "fail 5"),
+        ];
+        let (emitted, _) = drive_pipeline(scripts, 8, rec.clone()).await;
+        settle().await;
+        assert_eq!(ok_prefix(&emitted), vec![0, 1, 2]);
+        assert_eq!(emitted.len(), 4);
+        let err = emitted[3].as_ref().unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted);
+        assert_eq!(err.message(), "fail 3", "the LOWER failing seq wins");
+        // Batch 4 outlived the first (higher) failure but was cancelled once
+        // the frontier dropped below it.
+        assert_eq!(rec.cancelled_sorted(), vec![4]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_client_disconnect_cancels_all() {
+        let rec = Arc::new(Recorder::default());
+        let scripts = vec![BatchScript::Never; 4];
+        let (tx, rx) = mpsc::channel(8);
+        let requests: Vec<Result<mux::EmbedArrowRequest, Status>> = (0..3)
+            .map(|_| Ok(mux::EmbedArrowRequest::default()))
+            .collect();
+        let pipeline = tokio::spawn(run_arrow_stream_pipeline(
+            tokio_stream::iter(requests),
+            mux::EmbedArrowRequest::default(),
+            4,
+            tx,
+            scripted_processor(scripts, rec.clone()),
+        ));
+        settle().await;
+        assert_eq!(rec.started.load(Ordering::SeqCst), 4);
+        drop(rx); // the client goes away mid-stream
+        pipeline.await.expect("pipeline ends without panicking");
+        settle().await;
+        assert_eq!(
+            rec.cancelled_sorted(),
+            vec![0, 1, 2, 3],
+            "every in-flight batch is cancelled"
+        );
+        assert_eq!(rec.finished.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_inbound_transport_error_drains_then_fails() {
+        // Two good requests, then the inbound stream errors: both admitted
+        // batches drain and emit first, then the transport error terminates.
+        let rec = Arc::new(Recorder::default());
+        let requests = vec![
+            Ok(mux::EmbedArrowRequest::default()),
+            Ok(mux::EmbedArrowRequest::default()),
+            Err(Status::aborted("client link broke")),
+        ];
+        let scripts = vec![
+            BatchScript::Ok(Duration::from_millis(20)),
+            BatchScript::Ok(Duration::from_millis(10)),
+        ];
+        let (emitted, _) =
+            drive_pipeline_with(requests, 4, 32, scripted_processor(scripts, rec)).await;
+        assert_eq!(ok_prefix(&emitted), vec![0, 1]);
+        assert_eq!(emitted.len(), 3);
+        let err = emitted[2].as_ref().unwrap_err();
+        assert_eq!(err.code(), Code::Internal);
+        assert!(err.message().contains("Stream error"), "{}", err.message());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_eof_drains_in_flight() {
+        // EOF with everything still in flight: full drain, clean close.
+        let rec = Arc::new(Recorder::default());
+        let scripts: Vec<BatchScript> = (0..5u64)
+            .map(|i| BatchScript::Ok(Duration::from_millis((5 - i) * 10)))
+            .collect();
+        let (emitted, stats) = drive_pipeline(scripts, 5, rec.clone()).await;
+        assert_eq!(ok_prefix(&emitted), vec![0, 1, 2, 3, 4]);
+        assert_eq!(emitted.len(), 5, "no terminal error on clean close");
+        assert_eq!(rec.finished.load(Ordering::SeqCst), 5);
+        assert!(rec.cancelled_sorted().is_empty());
+        assert_eq!(stats.batches_with_ignored_fields, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_per_batch_timeout_fails_right_seq() {
+        // The per-batch deadline sits around each batch future exactly like
+        // `run_batch`'s timeout; an elapsed deadline is that batch's failure.
+        let rec = Arc::new(Recorder::default());
+        let scripts = vec![
+            BatchScript::Ok(Duration::from_millis(10)),
+            BatchScript::Ok(Duration::from_millis(10)),
+            BatchScript::Ok(Duration::from_secs(600)), // exceeds the deadline
+            BatchScript::Ok(Duration::from_millis(10)),
+        ];
+        let inner = scripted_processor(scripts, rec);
+        let process = move |seq: u64, ipc: Vec<u8>| {
+            let fut = inner(seq, ipc);
+            async move {
+                match timeout(Duration::from_millis(100), fut).await {
+                    Ok(result) => result,
+                    Err(_) => Err(Status::deadline_exceeded("Request timeout")),
+                }
+            }
+        };
+        let requests = (0..4)
+            .map(|_| Ok(mux::EmbedArrowRequest::default()))
+            .collect();
+        let (emitted, _) = drive_pipeline_with(requests, 4, 32, process).await;
+        assert_eq!(ok_prefix(&emitted), vec![0, 1], "earlier batches delivered");
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(
+            emitted[2].as_ref().unwrap_err().code(),
+            Code::DeadlineExceeded,
+            "the timeout is charged to the right seq"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_slow_client_bounds_admission() {
+        // Tiny response channel and a client that reads nothing: the
+        // collector's blocked emission holds permits, so admission stalls.
+        let rec = Arc::new(Recorder::default());
+        let scripts = vec![BatchScript::Ok(Duration::ZERO); 8];
+        let requests: Vec<_> = (0..8)
+            .map(|_| Ok(mux::EmbedArrowRequest::default()))
+            .collect();
+        let mut it = requests.into_iter();
+        let first = it.next().unwrap().unwrap();
+        let rest: Vec<_> = it.collect();
+        let (tx, mut rx) = mpsc::channel(1);
+        let pipeline = tokio::spawn(run_arrow_stream_pipeline(
+            tokio_stream::iter(rest),
+            first,
+            2,
+            tx,
+            scripted_processor(scripts, rec.clone()),
+        ));
+        settle().await;
+        // Batch 0 emitted (fills the channel, permit released), batch 1 is
+        // stuck in the collector's send (permit held), batch 2 was admitted
+        // with batch 0's released permit: admission stalls at 3 = K + cap.
+        assert_eq!(
+            rec.started.load(Ordering::SeqCst),
+            3,
+            "admission stalls while the client does not read"
+        );
+        // Draining the client releases everything, still strictly in order.
+        let mut seqs = Vec::new();
+        while let Some(item) = rx.recv().await {
+            seqs.push(decode_seq(item.unwrap()));
+        }
+        pipeline.await.unwrap();
+        assert_eq!(seqs, (0..8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_stream_pipeline_counts_batches_with_ignored_fields() {
+        let rec = Arc::new(Recorder::default());
+        let first = mux::EmbedArrowRequest {
+            truncate: true,
+            output_dtype: mux::OutputDtype::F16 as i32,
+            prompt_name: Some("p".to_string()),
+            ..Default::default()
+        };
+        // #2 flips output_dtype -> counted; #3 sets nothing -> not counted;
+        // #4 repeats the pinned values exactly -> not counted; #5 sets
+        // dimensions -> counted.
+        let second = mux::EmbedArrowRequest {
+            output_dtype: mux::OutputDtype::F32 as i32,
+            ..Default::default()
+        };
+        let third = mux::EmbedArrowRequest::default();
+        let fourth = mux::EmbedArrowRequest {
+            truncate: true,
+            output_dtype: mux::OutputDtype::F16 as i32,
+            prompt_name: Some("p".to_string()),
+            ..Default::default()
+        };
+        let fifth = mux::EmbedArrowRequest {
+            dimensions: Some(64),
+            ..Default::default()
+        };
+        let scripts = vec![BatchScript::Ok(Duration::ZERO); 5];
+        let (emitted, stats) = drive_pipeline_with(
+            vec![Ok(first), Ok(second), Ok(third), Ok(fourth), Ok(fifth)],
+            2,
+            32,
+            scripted_processor(scripts, rec),
+        )
+        .await;
+        assert_eq!(emitted.len(), 5);
+        assert_eq!(
+            stats.batches_with_ignored_fields, 2,
+            "only requests that SET differing option fields are counted"
+        );
+    }
+
+    #[test]
+    fn test_ignored_option_fields_semantics() {
+        let pinned = mux::EmbedArrowRequest {
+            truncate: true,
+            noop: true,
+            output_dtype: mux::OutputDtype::F16 as i32,
+            ..Default::default()
+        };
+        // Unset proto3 scalars are indistinguishable from defaults: not "set".
+        assert!(ignored_option_fields(&pinned, &mux::EmbedArrowRequest::default()).is_empty());
+        // Fields matching the pinned values are not ignored fields.
+        assert!(ignored_option_fields(&pinned, &pinned.clone()).is_empty());
+        let differing = mux::EmbedArrowRequest {
+            normalize: true,
+            output_dtype: mux::OutputDtype::F32 as i32,
+            max_concurrent_batches: 9,
+            ..Default::default()
+        };
+        assert_eq!(
+            ignored_option_fields(&pinned, &differing),
+            vec!["normalize", "output_dtype", "max_concurrent_batches"]
+        );
+    }
+
+    /// Deterministic LCG so the property-style test needs no rand crate.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_stream_pipeline_random_scripts_match_sequential_reference() {
+        // Seeded-random delay/failure scripts vs a reference sequential
+        // simulator: the emitted prefix and terminal status must be identical
+        // regardless of K and completion timing.
+        for seed in 0..50u64 {
+            let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1));
+            let n = 1 + (rng.next() % 12) as usize;
+            let k = 1 + (rng.next() % 6) as usize;
+            let mut scripts = Vec::with_capacity(n);
+            for _ in 0..n {
+                let delay = Duration::from_millis((rng.next() % 4) * 5);
+                if rng.next().is_multiple_of(5) {
+                    let code = match rng.next() % 3 {
+                        0 => Code::Internal,
+                        1 => Code::InvalidArgument,
+                        _ => Code::Unavailable,
+                    };
+                    scripts.push(BatchScript::Fail(delay, code, "scripted failure"));
+                } else {
+                    scripts.push(BatchScript::Ok(delay));
+                }
+            }
+            // Reference: run the same scripts strictly one at a time — Oks up
+            // to the first failure, which is terminal.
+            let mut reference: Vec<Result<u64, Code>> = Vec::new();
+            for (seq, script) in scripts.iter().enumerate() {
+                match script {
+                    BatchScript::Ok(_) => reference.push(Ok(seq as u64)),
+                    BatchScript::Fail(_, code, _) => {
+                        reference.push(Err(*code));
+                        break;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let rec = Arc::new(Recorder::default());
+            let (emitted, _) = drive_pipeline(scripts, k, rec.clone()).await;
+            let simplified: Vec<Result<u64, Code>> = emitted
+                .iter()
+                .map(|r| r.as_ref().map(|seq| *seq).map_err(Status::code))
+                .collect();
+            assert_eq!(simplified, reference, "seed {seed} (k={k}, n={n})");
+            assert!(
+                rec.max_active.load(Ordering::SeqCst) <= k,
+                "seed {seed}: concurrency exceeded K"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_effective_stream_concurrency_clamps() {
+        let service = create_test_service(); // server default: 4
+        assert_eq!(service.effective_stream_concurrency(0), 4);
+        assert_eq!(service.effective_stream_concurrency(7), 7);
+        assert_eq!(
+            service.effective_stream_concurrency(1000),
+            64,
+            "caller override clamped down to 64"
+        );
+        let service = service.with_stream_max_concurrent_batches(0);
+        assert_eq!(
+            service.effective_stream_concurrency(0),
+            1,
+            "server knob clamped up to 1"
+        );
+        let service = service.with_stream_max_concurrent_batches(999);
+        assert_eq!(
+            service.effective_stream_concurrency(0),
+            64,
+            "server knob clamped down to 64"
+        );
+        assert_eq!(
+            service.effective_stream_concurrency(1),
+            1,
+            "K=1 forces sequential execution"
+        );
+    }
+
+    /// Noop ModelId-target request; `with_target` only on the first request.
+    fn model_stream_request(
+        model: &str,
+        texts: &[&str],
+        with_target: bool,
+    ) -> mux::EmbedArrowRequest {
+        mux::EmbedArrowRequest {
+            target: with_target.then(|| mux::Target {
+                routing: Some(mux::target::Routing::ModelId(model.to_string())),
+            }),
+            arrow_ipc: ipc_from_array(Arc::new(StringArray::from(texts.to_vec())), "text"),
+            noop: true,
+            ..Default::default()
+        }
+    }
+
+    /// Value of the first sample of `name` carrying all `labels`.
+    fn metric_value(rendered: &str, name: &str, labels: &[&str]) -> u64 {
+        rendered
+            .lines()
+            .find(|line| line.starts_with(name) && labels.iter().all(|l| line.contains(l)))
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_model_routing_rotates_and_survives_death() {
+        let handle = crate::metrics::test_support::prometheus_handle();
+        let (service, registry) =
+            service_with_model_instances(&["rr-alpha", "rr-beta"], "rr/model").await;
+        let (req_tx, req_rx) = mpsc::channel::<Result<mux::EmbedArrowRequest, Status>>(4);
+        req_tx
+            .send(Ok(model_stream_request("rr/model", &["r0"], true)))
+            .await
+            .unwrap();
+        let mut responses = service
+            .embed_arrow_stream_core(ReceiverStream::new(req_rx))
+            .await
+            .unwrap();
+        // Fresh round-robin over the sorted running instances: batch 0 goes
+        // to rr-alpha, batch 1 to rr-beta. Awaiting each response before the
+        // next send keeps the alternation deterministic.
+        responses.next().await.unwrap().unwrap();
+        req_tx
+            .send(Ok(model_stream_request("rr/model", &["r1"], false)))
+            .await
+            .unwrap();
+        responses.next().await.unwrap().unwrap();
+        let rendered = handle.render();
+        let alpha = &[r#"instance="rr-alpha""#, r#"status="ok""#];
+        let beta = &[r#"instance="rr-beta""#, r#"status="ok""#];
+        assert_eq!(metric_value(&rendered, "tei_mux_rows_total", alpha), 1);
+        assert_eq!(metric_value(&rendered, "tei_mux_rows_total", beta), 1);
+        // rr-beta leaves Running MID-STREAM: the survivor takes the rest.
+        *registry.get("rr-beta").await.unwrap().status.write().await =
+            crate::instance::InstanceStatus::Failed;
+        for _ in 2..5 {
+            req_tx
+                .send(Ok(model_stream_request("rr/model", &["rN"], false)))
+                .await
+                .unwrap();
+            responses.next().await.unwrap().unwrap();
+        }
+        drop(req_tx);
+        assert!(responses.next().await.is_none(), "clean close after EOF");
+        let rendered = handle.render();
+        assert_eq!(metric_value(&rendered, "tei_mux_rows_total", alpha), 4);
+        assert_eq!(metric_value(&rendered, "tei_mux_rows_total", beta), 1);
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_model_routing_all_dead_mid_stream_not_found() {
+        let (service, registry) =
+            service_with_model_instances(&["dead-a", "dead-b"], "dead/model").await;
+        let (req_tx, req_rx) = mpsc::channel::<Result<mux::EmbedArrowRequest, Status>>(4);
+        req_tx
+            .send(Ok(model_stream_request("dead/model", &["r0"], true)))
+            .await
+            .unwrap();
+        let mut responses = service
+            .embed_arrow_stream_core(ReceiverStream::new(req_rx))
+            .await
+            .unwrap();
+        responses.next().await.unwrap().unwrap();
+        // Every instance of the model dies mid-stream.
+        for name in ["dead-a", "dead-b"] {
+            *registry.get(name).await.unwrap().status.write().await =
+                crate::instance::InstanceStatus::Failed;
+        }
+        req_tx
+            .send(Ok(model_stream_request("dead/model", &["r1"], false)))
+            .await
+            .unwrap();
+        let err = responses.next().await.unwrap().unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{}", err.message());
+        assert!(err.message().contains("dead/model"), "{}", err.message());
+        assert!(responses.next().await.is_none(), "the failure is terminal");
+    }
+
+    async fn collect_stream_ipc(
+        service: &TeiMultiplexerService,
+        requests: Vec<Result<mux::EmbedArrowRequest, Status>>,
+    ) -> Vec<Result<Vec<u8>, Status>> {
+        let mut stream = service
+            .embed_arrow_stream_core(tokio_stream::iter(requests))
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(result) = stream.next().await {
+            out.push(result.map(|response| response.arrow_ipc));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_k1_matches_sequential() {
+        // K=1 must behave exactly like the sequential v1 implementation, and
+        // K=4 must produce byte-identical responses (noop is deterministic).
+        // The unary EmbedArrow serves as the sequential reference output.
+        let service_k1 = create_test_service().with_stream_max_concurrent_batches(1);
+        let service_k4 = create_test_service().with_stream_max_concurrent_batches(4);
+        let batches: Vec<Vec<&str>> =
+            vec![vec!["a", "b"], vec!["c"], vec!["d", "e", "f"], vec!["g"]];
+        let requests = |batches: &[Vec<&str>]| -> Vec<Result<mux::EmbedArrowRequest, Status>> {
+            batches
+                .iter()
+                .enumerate()
+                .map(|(i, texts)| Ok(arrow_stream_request(texts, i == 0)))
+                .collect()
+        };
+        let k1_out = collect_stream_ipc(&service_k1, requests(&batches)).await;
+        let k4_out = collect_stream_ipc(&service_k4, requests(&batches)).await;
+        assert_eq!(k1_out.len(), batches.len());
+        assert_eq!(k4_out.len(), batches.len());
+        for (i, texts) in batches.iter().enumerate() {
+            let unary = service_k1
+                .embed_arrow(Request::new(arrow_stream_request(texts, true)))
+                .await
+                .unwrap()
+                .into_inner()
+                .arrow_ipc;
+            assert_eq!(k1_out[i].as_ref().unwrap(), &unary, "batch {i} at K=1");
+            assert_eq!(k4_out[i].as_ref().unwrap(), &unary, "batch {i} at K=4");
+        }
+
+        // Failure semantics are identical too: same prefix, same terminal code.
+        let failing = |batches: &[Vec<&str>]| -> Vec<Result<mux::EmbedArrowRequest, Status>> {
+            let mut requests = requests(batches);
+            let mut bad = arrow_stream_request(&[], false);
+            bad.arrow_ipc = vec![9, 9, 9];
+            requests[2] = Ok(bad);
+            requests
+        };
+        let k1_fail = collect_stream_ipc(&service_k1, failing(&batches)).await;
+        let k4_fail = collect_stream_ipc(&service_k4, failing(&batches)).await;
+        assert_eq!(k1_fail.len(), 3);
+        assert_eq!(k4_fail.len(), 3);
+        for (a, b) in k1_fail.iter().zip(&k4_fail) {
+            match (a, b) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => {
+                    assert_eq!(a.code(), Code::InvalidArgument);
+                    assert_eq!(a.code(), b.code());
+                }
+                _ => panic!("K=1 and K=4 disagree on the failure position"),
+            }
+        }
     }
 }

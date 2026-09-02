@@ -249,6 +249,13 @@ impl TeiContainer {
     pub fn grpc_port(&self) -> u16 {
         self.grpc_port
     }
+
+    /// Kill the underlying docker container immediately (SIGKILL), simulating
+    /// a backend dying mid-stream.
+    pub async fn stop_now(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.container.stop_with_timeout(Some(0)).await?;
+        Ok(())
+    }
 }
 
 /// Create Arrow IPC batch from texts

@@ -22,6 +22,9 @@ pub struct GrpcOptions {
     pub request_timeout_secs: u64,
     /// Element type for EmbedArrow responses when unspecified by the request
     pub default_output_dtype: ArrowOutputDtype,
+    /// Default number of concurrently executing batches per EmbedArrowStream
+    /// call (a stream's first request can override; clamped to 1..=64)
+    pub stream_max_concurrent_batches: usize,
 }
 
 impl Default for GrpcOptions {
@@ -31,6 +34,7 @@ impl Default for GrpcOptions {
             max_parallel_streams: 1024,
             request_timeout_secs: 30,
             default_output_dtype: ArrowOutputDtype::F32,
+            stream_max_concurrent_batches: 4,
         }
     }
 }
@@ -168,7 +172,8 @@ fn build_services(
         options.max_parallel_streams,
         options.request_timeout_secs,
     )
-    .with_default_output_dtype(options.default_output_dtype);
+    .with_default_output_dtype(options.default_output_dtype)
+    .with_stream_max_concurrent_batches(options.stream_max_concurrent_batches);
 
     // Enable gRPC reflection
     let file_descriptor_set: &[u8] = tonic::include_file_descriptor_set!("descriptor");

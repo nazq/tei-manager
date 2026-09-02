@@ -112,6 +112,15 @@ grpc_max_message_size_mb = 40
 # Higher values allow more parallelism but use more memory
 grpc_max_parallel_streams = 1024
 
+# Max Arrow request batches one EmbedArrowStream call executes concurrently
+# (default: 4). The stream's first request can override this via its
+# max_concurrent_batches field; either value is clamped to 1..=64. Responses
+# are always emitted strictly in request order regardless of this setting.
+# Memory: worst case one stream buffers about
+# grpc_stream_max_concurrent_batches x grpc_max_message_size_mb of responses
+# awaiting emission (e.g. 4 x 40MB = 160MB per stream at the defaults).
+grpc_stream_max_concurrent_batches = 4
+
 # Element type of EmbedArrow responses when a request leaves output_dtype
 # unspecified: "f32" (default) or "f16". f16 halves the payload; lossy —
 # validated to keep top-k ordering for normalized-cosine retrieval, measure

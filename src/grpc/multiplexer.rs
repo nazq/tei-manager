@@ -10,7 +10,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -30,6 +30,8 @@ use crate::config::ArrowOutputDtype;
 /// 2. **Instance routing**: Looks up the backend connection from the connection pool
 /// 3. **Stream forwarding**: Spawns a task to forward requests to the backend
 /// 4. **Response streaming**: Returns responses from the backend via a channel
+/// 5. **Metrics**: Counts the request in `tei_mux_requests_total` (no duration
+///    is recorded — the stream outlives the handler)
 ///
 /// # Arguments
 ///
@@ -85,6 +87,7 @@ use crate::config::ArrowOutputDtype;
 /// - Stream errors are logged and terminate the forwarding task
 macro_rules! impl_stream_rpc {
     ($self:ident, $request:ident, $mux_req:ty, $backend_client:ident, $backend_method:ident) => {{
+        let mut mux_metrics = MuxRequestMetrics::stream(stringify!($backend_method));
         let mut stream: Streaming<$mux_req> = $request.into_inner();
 
         // Read first request to get instance name
@@ -96,6 +99,7 @@ macro_rules! impl_stream_rpc {
 
         let instance_name = $self.resolve_target(first_req.target).await?;
         Span::current().record("tei.instance", instance_name.as_str());
+        mux_metrics.set_instance(&instance_name);
 
         // Get backend client
         let clients = $self.pool.get_clients(&instance_name).await?;
@@ -146,10 +150,101 @@ macro_rules! impl_stream_rpc {
             }
         });
 
+        mux_metrics.set_ok();
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
     }};
+}
+
+/// Prometheus metrics guard for one multiplexer RPC.
+///
+/// Created at handler entry and recorded on drop, so early `?` returns (and
+/// cancelled handlers) are counted as errors. Unary handlers record
+/// `tei_mux_requests_total` plus `tei_mux_request_duration_seconds`; streaming
+/// handlers record the counter only — the stream outlives the handler, so a
+/// handler-scoped duration would be meaningless.
+///
+/// The instance label is the resolved backend instance name, or `"unknown"`
+/// when the request fails before target resolution.
+struct MuxRequestMetrics {
+    method: &'static str,
+    instance: Option<String>,
+    started: Instant,
+    record_duration: bool,
+    ok: bool,
+}
+
+impl MuxRequestMetrics {
+    fn new(method: &'static str, record_duration: bool) -> Self {
+        Self {
+            method,
+            instance: None,
+            started: Instant::now(),
+            record_duration,
+            ok: false,
+        }
+    }
+
+    /// Start measuring a unary RPC (count + duration)
+    fn unary(method: &'static str) -> Self {
+        Self::new(method, true)
+    }
+
+    /// Start measuring a streaming RPC (count only)
+    fn stream(method: &'static str) -> Self {
+        Self::new(method, false)
+    }
+
+    /// Record the resolved backend instance name
+    fn set_instance(&mut self, name: &str) {
+        self.instance = Some(name.to_owned());
+    }
+
+    /// Mark the request as successful (anything else records as an error)
+    fn set_ok(&mut self) {
+        self.ok = true;
+    }
+}
+
+impl Drop for MuxRequestMetrics {
+    fn drop(&mut self) {
+        let instance = self.instance.take().unwrap_or_else(|| "unknown".to_owned());
+        let status = if self.ok { "ok" } else { "error" };
+        metrics::counter!(
+            crate::metrics::MUX_REQUESTS_TOTAL,
+            "method" => self.method,
+            "instance" => instance.clone(),
+            "status" => status
+        )
+        .increment(1);
+        if self.record_duration {
+            metrics::histogram!(
+                crate::metrics::MUX_REQUEST_DURATION_SECONDS,
+                "method" => self.method,
+                "instance" => instance
+            )
+            .record(self.started.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// Record per-row outcomes of an Arrow batch RPC in `tei_mux_rows_total`
+fn record_mux_rows<T>(instance: &str, outcome: &RowOutcomes<T>) {
+    let ok_rows = outcome.ok_count() as u64;
+    let failed_rows = outcome.rows.len() as u64 - ok_rows;
+    metrics::counter!(
+        crate::metrics::MUX_ROWS_TOTAL,
+        "instance" => instance.to_owned(),
+        "status" => "ok"
+    )
+    .increment(ok_rows);
+    metrics::counter!(
+        crate::metrics::MUX_ROWS_TOTAL,
+        "instance" => instance.to_owned(),
+        "status" => "failed"
+    )
+    .increment(failed_rows);
 }
 
 /// TeiMultiplexer service implementation
@@ -276,13 +371,15 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Info Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.info", skip(self, request), fields(tei.instance))]
     async fn info(
         &self,
         request: Request<mux::InfoRequest>,
     ) -> Result<Response<tei::InfoResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("info");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         // Record instance name in span for tracing
         Span::current().record("tei.instance", instance_name.as_str());
@@ -295,6 +392,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.info.clone().info(tei::InfoRequest {}).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
@@ -302,13 +400,15 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Embed Service - Unary RPCs
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(tei.instance, tei.inputs_len))]
+    #[instrument(name = "tei.embed", skip(self, request), fields(tei.instance, tei.inputs_len))]
     async fn embed(
         &self,
         request: Request<mux::EmbedRequest>,
     ) -> Result<Response<tei::EmbedResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("embed");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         // Extract inner request
         let embed_req = req
@@ -328,16 +428,19 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.embed.clone().embed(embed_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.embed_sparse", skip(self, request), fields(tei.instance))]
     async fn embed_sparse(
         &self,
         request: Request<mux::EmbedSparseRequest>,
     ) -> Result<Response<tei::EmbedSparseResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("embed_sparse");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         let inner_req = req
             .request
@@ -350,16 +453,19 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.embed.clone().embed_sparse(inner_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.embed_all", skip(self, request), fields(tei.instance))]
     async fn embed_all(
         &self,
         request: Request<mux::EmbedAllRequest>,
     ) -> Result<Response<tei::EmbedAllResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("embed_all");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         let inner_req = req
             .request
@@ -372,6 +478,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.embed.clone().embed_all(inner_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
@@ -382,7 +489,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type EmbedStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EmbedResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.embed_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn embed_stream(
         &self,
         request: Request<Streaming<mux::EmbedRequest>>,
@@ -393,7 +500,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type EmbedSparseStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EmbedSparseResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.embed_sparse_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn embed_sparse_stream(
         &self,
         request: Request<Streaming<mux::EmbedSparseRequest>>,
@@ -410,7 +517,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type EmbedAllStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EmbedAllResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.embed_all_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn embed_all_stream(
         &self,
         request: Request<Streaming<mux::EmbedAllRequest>>,
@@ -422,13 +529,15 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Predict Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.predict", skip(self, request), fields(tei.instance))]
     async fn predict(
         &self,
         request: Request<mux::PredictRequest>,
     ) -> Result<Response<tei::PredictResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("predict");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         let inner_req = req
             .request
@@ -441,16 +550,19 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.predict.clone().predict(inner_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.predict_pair", skip(self, request), fields(tei.instance))]
     async fn predict_pair(
         &self,
         request: Request<mux::PredictPairRequest>,
     ) -> Result<Response<tei::PredictResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("predict_pair");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         let inner_req = req
             .request
@@ -463,13 +575,14 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.predict.clone().predict_pair(inner_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
     type PredictStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::PredictResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.predict_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn predict_stream(
         &self,
         request: Request<Streaming<mux::PredictRequest>>,
@@ -480,7 +593,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     type PredictPairStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::PredictResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.predict_pair_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn predict_pair_stream(
         &self,
         request: Request<Streaming<mux::PredictPairRequest>>,
@@ -498,13 +611,15 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Rerank Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.rerank", skip(self, request), fields(tei.instance))]
     async fn rerank(
         &self,
         request: Request<mux::RerankRequest>,
     ) -> Result<Response<tei::RerankResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("rerank");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         let inner_req = req
             .request
@@ -517,14 +632,16 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.rerank.clone().rerank(inner_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.rerank_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn rerank_stream(
         &self,
         request: Request<Streaming<mux::RerankStreamRequest>>,
     ) -> Result<Response<tei::RerankResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::stream("rerank_stream");
         let mut stream = request.into_inner();
 
         let first_req = stream
@@ -535,6 +652,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
 
         let instance_name = self.resolve_target(first_req.target).await?;
         Span::current().record("tei.instance", instance_name.as_str());
+        mux_metrics.set_instance(&instance_name);
 
         let clients = self.pool.get_clients(&instance_name).await?;
 
@@ -561,6 +679,7 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         // RerankStream returns single response (not streaming)
         let response = clients.rerank.clone().rerank_stream(backend_stream).await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
@@ -568,13 +687,15 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
     // Tokenize Service
     // ========================================================================
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.tokenize", skip(self, request), fields(tei.instance))]
     async fn tokenize(
         &self,
         request: Request<mux::EncodeRequest>,
     ) -> Result<Response<tei::EncodeResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("tokenize");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         let inner_req = req
             .request
@@ -587,13 +708,14 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.tokenize.clone().tokenize(inner_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
     type TokenizeStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::EncodeResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.tokenize_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn tokenize_stream(
         &self,
         request: Request<Streaming<mux::EncodeRequest>>,
@@ -601,13 +723,15 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         impl_stream_rpc!(self, request, mux::EncodeRequest, tokenize, tokenize_stream)
     }
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.decode", skip(self, request), fields(tei.instance))]
     async fn decode(
         &self,
         request: Request<mux::DecodeRequest>,
     ) -> Result<Response<tei::DecodeResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("decode");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
 
         let inner_req = req
             .request
@@ -620,13 +744,14 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .with_timeout(async { clients.tokenize.clone().decode(inner_req).await })
             .await?;
 
+        mux_metrics.set_ok();
         Ok(response)
     }
 
     type DecodeStreamStream =
         tokio_stream::wrappers::ReceiverStream<Result<tei::DecodeResponse, Status>>;
 
-    #[instrument(skip(self, request), fields(tei.instance))]
+    #[instrument(name = "tei.decode_stream_rpc", skip(self, request), fields(tei.instance))]
     async fn decode_stream(
         &self,
         request: Request<Streaming<mux::DecodeRequest>>,
@@ -647,8 +772,10 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         &self,
         request: Request<mux::EmbedArrowRequest>,
     ) -> Result<Response<mux::EmbedArrowResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("embed_arrow");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
         Span::current().record("tei.instance", instance_name.as_str());
 
         let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
@@ -686,9 +813,11 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             .map(|r| r.embeddings)
         };
 
+        record_mux_rows(&instance_name, &outcome);
         Span::current().record("tei.rows_failed", outcome.rows.len() - outcome.ok_count());
         let batch = arrow_batch::dense_batch(&outcome, output_dtype)?;
         let buffer = arrow_batch::serialize(&batch, req.compression)?;
+        mux_metrics.set_ok();
         Ok(Response::new(mux::EmbedArrowResponse { arrow_ipc: buffer }))
     }
 
@@ -701,8 +830,10 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         &self,
         request: Request<mux::EmbedSparseArrowRequest>,
     ) -> Result<Response<mux::EmbedSparseArrowResponse>, Status> {
+        let mut mux_metrics = MuxRequestMetrics::unary("embed_sparse_arrow");
         let req = request.into_inner();
         let instance_name = self.resolve_target(req.target).await?;
+        mux_metrics.set_instance(&instance_name);
         Span::current().record("tei.instance", instance_name.as_str());
 
         let rows = arrow_batch::parse_text_rows(&req.arrow_ipc)?;
@@ -741,9 +872,11 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             })
         };
 
+        record_mux_rows(&instance_name, &outcome);
         Span::current().record("tei.rows_failed", outcome.rows.len() - outcome.ok_count());
         let batch = arrow_batch::sparse_batch(&outcome)?;
         let buffer = arrow_batch::serialize(&batch, req.compression)?;
+        mux_metrics.set_ok();
         Ok(Response::new(mux::EmbedSparseArrowResponse {
             arrow_ipc: buffer,
         }))
@@ -3046,5 +3179,96 @@ mod tests {
         let status = result.unwrap_err();
         assert_eq!(status.code(), Code::DeadlineExceeded);
         assert!(status.message().contains("timeout"));
+    }
+
+    // ========================================================================
+    // Prometheus Metrics Tests
+    // ========================================================================
+
+    /// Assert that `rendered` contains a sample line for `name` carrying all
+    /// `labels` (label order in the rendered output is not stable)
+    fn assert_metric_line(rendered: &str, name: &str, labels: &[&str]) {
+        let found = rendered
+            .lines()
+            .any(|line| line.starts_with(name) && labels.iter().all(|l| line.contains(l)));
+        assert!(
+            found,
+            "expected a `{name}` sample with labels {labels:?} in:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_noop_records_prometheus_metrics() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::ipc::writer::StreamWriter;
+        use arrow::record_batch::RecordBatch;
+
+        let handle = crate::metrics::test_support::prometheus_handle();
+        let service = create_test_service();
+
+        let text_array = StringArray::from(vec!["Hello", "World"]);
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(text_array) as ArrayRef]).unwrap();
+        let mut arrow_ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut arrow_ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let request = Request::new(mux::EmbedArrowRequest {
+            target: Some(mux::Target {
+                routing: Some(mux::target::Routing::InstanceName(
+                    "metrics-inst".to_string(),
+                )),
+            }),
+            arrow_ipc,
+            truncate: true,
+            normalize: true,
+            noop: true,
+            ..Default::default()
+        });
+        service.embed_arrow(request).await.unwrap();
+
+        let rendered = handle.render();
+        assert_metric_line(
+            &rendered,
+            "tei_mux_requests_total",
+            &[
+                r#"method="embed_arrow""#,
+                r#"instance="metrics-inst""#,
+                r#"status="ok""#,
+            ],
+        );
+        assert_metric_line(
+            &rendered,
+            "tei_mux_rows_total",
+            &[r#"instance="metrics-inst""#, r#"status="ok""#],
+        );
+        assert_metric_line(
+            &rendered,
+            "tei_mux_request_duration_seconds",
+            &[r#"method="embed_arrow""#, r#"instance="metrics-inst""#],
+        );
+
+        // A request that fails target resolution is counted with
+        // instance="unknown" and status="error".
+        let err = service
+            .embed_arrow(Request::new(mux::EmbedArrowRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        let rendered = handle.render();
+        assert_metric_line(
+            &rendered,
+            "tei_mux_requests_total",
+            &[
+                r#"method="embed_arrow""#,
+                r#"instance="unknown""#,
+                r#"status="error""#,
+            ],
+        );
     }
 }

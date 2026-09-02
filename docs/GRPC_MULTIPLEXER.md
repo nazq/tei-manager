@@ -125,7 +125,15 @@ grpcurl -plaintext localhost:9001 list
 
 ### Rust Client Example
 
-For a complete Rust client implementation, see the built-in benchmark client at `src/bin/bench-client.rs`. It demonstrates:
+For a complete Rust client integration guide, see **[RUST_CLIENT.md](RUST_CLIENT.md)**. It covers:
+
+- Proto compilation with `tonic-build`
+- All RPC methods with code examples
+- Arrow batch processing
+- mTLS configuration
+- Error handling
+
+The built-in benchmark client at `src/bin/bench-client.rs` serves as a reference implementation demonstrating:
 
 - Connecting to the gRPC multiplexer with/without TLS
 - Creating Arrow IPC batches (LZ4-compressed on the text side)
@@ -294,16 +302,28 @@ target = Target(model="BAAI/bge-small-en-v1.5")  # Auto-select instance
 
 ### Metrics
 
-The multiplexer exposes Prometheus metrics:
+The multiplexer exposes Prometheus metrics on the manager's `/metrics` endpoint:
 
 ```
-# Connection pool stats
-tei_grpc_pool_connections_total{instance="bge-small"} 1
-tei_grpc_pool_requests_total{instance="bge-small", method="embed"} 1234
+# Requests by RPC method, backend instance, and outcome (ok|error)
+tei_mux_requests_total{method="embed", instance="bge-small", status="ok"} 1234
 
-# Request latency histogram
-tei_grpc_multiplexer_request_duration_seconds{method="embed"} {...}
+# Unary request latency (streaming RPCs record no duration -- the stream
+# outlives the handler)
+tei_mux_request_duration_seconds{method="embed", instance="bge-small"} {...}
+
+# Per-row outcomes of the Arrow batch RPCs (EmbedArrow / EmbedSparseArrow)
+tei_mux_rows_total{instance="bge-small", status="ok"} 1200
 ```
+
+Requests that fail before target resolution are counted with `instance="unknown"`.
+
+### Tracing
+
+Every multiplexer RPC handler creates a span named `tei.<rpc>` (e.g. `tei.embed`,
+`tei.embed_arrow`); streaming handlers use `tei.<rpc>_rpc` (e.g. `tei.embed_stream_rpc`),
+because `tei.embed_stream` is the internal per-batch forwarding span. Filter on the
+`tei.` prefix (e.g. `span:tei.` in Cloud Trace) to isolate multiplexer spans.
 
 ### Health Checks
 

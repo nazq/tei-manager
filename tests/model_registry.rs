@@ -67,6 +67,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
         auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
+        seed_instances: Vec::new(),
     };
 
     let app = create_router(state);
@@ -343,6 +344,7 @@ async fn test_downloading_state_visible() {
         auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
+        seed_instances: Vec::new(),
     };
 
     let app = create_router(state);
@@ -418,6 +420,7 @@ async fn test_concurrent_download_rejected() {
         auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
+        seed_instances: Vec::new(),
     };
 
     let app = create_router(state);

@@ -99,6 +99,9 @@ pub struct StateManager {
     storage: Arc<dyn StorageBackend>,
     /// Guard to prevent concurrent restore operations
     restore_in_progress: AtomicBool,
+    /// Serializes writes to the state file: concurrent saves share one
+    /// temp-file path, so unserialized rename pairs can race and fail
+    save_lock: tokio::sync::Mutex<()>,
 }
 
 impl StateManager {
@@ -115,6 +118,7 @@ impl StateManager {
             tei_binary_path: Arc::from(tei_binary_path),
             storage,
             restore_in_progress: AtomicBool::new(false),
+            save_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -130,6 +134,7 @@ impl StateManager {
 
     /// Save current state to disk atomically
     pub async fn save(&self) -> Result<()> {
+        let _write_guard = self.save_lock.lock().await;
         let instances = self.registry.list().await;
 
         let state = SavedState {
@@ -195,17 +200,31 @@ impl StateManager {
     /// Start every config-file instance that is not already in the registry
     /// (e.g. not present in the restored state). Failures are logged per
     /// instance; returns how many were seeded.
-    pub async fn seed_missing_instances(&self, configs: &[crate::config::InstanceConfig]) -> usize {
+    ///
+    /// `max_batch_tokens = 0` (auto) is resolved against `gpu` only for
+    /// instances actually being seeded — already-present (restored) instances
+    /// keep their persisted value. When a config entry is skipped because the
+    /// name already exists, drift between the config and the persisted
+    /// instance is reported with a warning (persisted state wins).
+    pub async fn seed_missing_instances(
+        &self,
+        configs: &[crate::config::InstanceConfig],
+        gpu: &crate::gpu::GpuInfo,
+        per_gib: u32,
+    ) -> usize {
         let mut seeded = 0;
         for config in configs {
-            if self.registry.get(&config.name).await.is_some() {
+            if let Some(existing) = self.registry.get(&config.name).await {
                 tracing::debug!(
                     instance = %config.name,
                     "Config instance already present (restored); not seeding"
                 );
+                Self::warn_on_config_drift(config, &existing.config);
                 continue;
             }
             tracing::info!(instance = %config.name, "Seeding instance from config");
+            let mut config = config.clone();
+            config.resolve_auto_max_batch_tokens(gpu, per_gib);
             match self.registry.add(config.clone()).await {
                 Ok(instance) => {
                     if let Err(e) = instance.start(&self.tei_binary_path).await {
@@ -228,6 +247,106 @@ impl StateManager {
             }
         }
         seeded
+    }
+
+    /// Warn when a config entry differs from the persisted instance it was
+    /// skipped in favor of. `max_batch_tokens = 0` (auto) and `port = 0`
+    /// (auto-assign) cannot be compared to resolved values and are ignored.
+    fn warn_on_config_drift(
+        config: &crate::config::InstanceConfig,
+        existing: &crate::config::InstanceConfig,
+    ) {
+        let mut drifted: Vec<&str> = Vec::new();
+        if config.model_id != existing.model_id {
+            drifted.push("model_id");
+        }
+        if config.port != 0 && config.port != existing.port {
+            drifted.push("port");
+        }
+        if config.pooling != existing.pooling {
+            drifted.push("pooling");
+        }
+        if config.gpu_id != existing.gpu_id {
+            drifted.push("gpu_id");
+        }
+        if config.extra_args != existing.extra_args {
+            drifted.push("extra_args");
+        }
+        if config.max_batch_tokens != 0 && config.max_batch_tokens != existing.max_batch_tokens {
+            drifted.push("max_batch_tokens");
+        }
+        if !drifted.is_empty() {
+            tracing::warn!(
+                instance = %config.name,
+                fields = ?drifted,
+                "Config [[instances]] entry differs from persisted state; persisted state \
+                 takes precedence. POST /state/reset drops state and reseeds from config"
+            );
+        }
+    }
+
+    /// Clear the persisted state by writing an empty-instances state file.
+    ///
+    /// The storage backend has no delete primitive, so an empty state is
+    /// saved instead — equivalent for restore purposes, and it cannot be
+    /// resurrected by the shutdown handler's final save.
+    pub async fn clear(&self) -> Result<()> {
+        let _write_guard = self.save_lock.lock().await;
+        let state = SavedState {
+            last_updated: chrono::Utc::now(),
+            instances: Vec::new(),
+        };
+        let toml_content =
+            toml::to_string_pretty(&state).context("Failed to serialize empty state to TOML")?;
+        self.storage.save(&self.state_file, &toml_content).await?;
+        tracing::info!(path = ?self.state_file, "Persisted state cleared");
+        Ok(())
+    }
+
+    /// Drop all persisted state and reseed from the given config instances:
+    /// stop and remove every registry instance, clear the state file, seed
+    /// the config entries (all missing at that point), then persist the
+    /// result. Returns `(stopped, seeded)`.
+    ///
+    /// Shares the restore guard, so it cannot run concurrently with a
+    /// restore or another reset.
+    pub async fn reset_and_reseed(
+        &self,
+        configs: &[crate::config::InstanceConfig],
+        gpu: &crate::gpu::GpuInfo,
+        per_gib: u32,
+    ) -> Result<(usize, usize)> {
+        if self
+            .restore_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            anyhow::bail!("Restore or reset operation already in progress");
+        }
+        let _guard = RestoreGuard {
+            flag: &self.restore_in_progress,
+        };
+
+        let mut stopped = 0;
+        for instance in self.registry.list().await {
+            let name = instance.config.name.clone();
+            match self.registry.remove(&name).await {
+                Ok(()) => stopped += 1,
+                Err(e) => {
+                    tracing::error!(instance = %name, error = %e, "Failed to remove instance during state reset");
+                }
+            }
+        }
+
+        self.clear().await?;
+
+        let seeded = self.seed_missing_instances(configs, gpu, per_gib).await;
+
+        // Persist the reseeded set so the state file matches the registry
+        self.save().await?;
+
+        tracing::info!(stopped, seeded, "State reset complete");
+        Ok((stopped, seeded))
     }
 
     pub async fn restore(&self) -> Result<()> {
@@ -1110,13 +1229,256 @@ max_concurrent_requests = 10
                 ..Default::default()
             },
         ];
-        let seeded = state_manager.seed_missing_instances(&configs).await;
+        let gpu = crate::gpu::GpuInfo::default();
+        let seeded = state_manager
+            .seed_missing_instances(&configs, &gpu, 2048)
+            .await;
         assert_eq!(seeded, 1);
         assert!(registry.get("from-config").await.is_some());
         assert_eq!(registry.count().await, 2);
 
         // Idempotent: nothing new on a second pass
-        assert_eq!(state_manager.seed_missing_instances(&configs).await, 0);
+        assert_eq!(
+            state_manager
+                .seed_missing_instances(&configs, &gpu, 2048)
+                .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seed_resolves_auto_only_for_seeded_instances() {
+        let state_file = PathBuf::from("/test/seed_auto.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(None, "/bin/sleep".to_string(), 8080, 8180));
+
+        // Restored instance carries a persisted (already-resolved) value
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "restored"
+model_id = "model-a"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+        storage.save(&state_file, state_content).await.unwrap();
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry.clone(),
+            "/bin/sleep".to_string(),
+            storage,
+        );
+        state_manager.restore_with_options(false).await.unwrap();
+
+        // 8192 MiB free at 2048 tokens/GiB resolves auto (0) to 16384
+        let gpu = crate::gpu::parse_nvidia_smi("0, X, 8.0, 16384, 8192\n");
+        let configs = vec![
+            crate::config::InstanceConfig {
+                name: "restored".to_string(),
+                model_id: "model-a".to_string(),
+                port: 8080,
+                max_batch_tokens: 0, // auto
+                ..Default::default()
+            },
+            crate::config::InstanceConfig {
+                name: "fresh".to_string(),
+                model_id: "model-b".to_string(),
+                port: 8081,
+                max_batch_tokens: 0, // auto
+                ..Default::default()
+            },
+        ];
+
+        let seeded = state_manager
+            .seed_missing_instances(&configs, &gpu, 2048)
+            .await;
+        assert_eq!(seeded, 1);
+
+        // Restored instance keeps its persisted value: no resolution applied
+        let restored = registry.get("restored").await.unwrap();
+        assert_eq!(restored.config.max_batch_tokens, 1024);
+
+        // Newly seeded instance had auto resolved against the GPU
+        let fresh = registry.get("fresh").await.unwrap();
+        assert_eq!(fresh.config.max_batch_tokens, 16384);
+    }
+
+    #[tokio::test]
+    async fn test_seed_warns_on_config_drift_without_seeding() {
+        let state_file = PathBuf::from("/test/seed_drift.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(None, "/bin/sleep".to_string(), 8080, 8180));
+
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "restored"
+model_id = "model-a"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+        storage.save(&state_file, state_content).await.unwrap();
+        let state_manager = StateManager::new_with_storage(
+            state_file,
+            registry.clone(),
+            "/bin/sleep".to_string(),
+            storage,
+        );
+        state_manager.restore_with_options(false).await.unwrap();
+
+        // Same name, drifted model_id/pooling/extra_args: skipped with a
+        // warning, persisted state wins.
+        let configs = vec![crate::config::InstanceConfig {
+            name: "restored".to_string(),
+            model_id: "model-b".to_string(),
+            port: 8080,
+            max_batch_tokens: 4096,
+            pooling: Some("splade".to_string()),
+            extra_args: vec!["--dtype".to_string(), "float16".to_string()],
+            ..Default::default()
+        }];
+
+        let gpu = crate::gpu::GpuInfo::default();
+        let seeded = state_manager
+            .seed_missing_instances(&configs, &gpu, 2048)
+            .await;
+        assert_eq!(seeded, 0);
+        assert_eq!(registry.count().await, 1);
+
+        // Persisted config untouched
+        let restored = registry.get("restored").await.unwrap();
+        assert_eq!(restored.config.model_id, "model-a");
+        assert_eq!(restored.config.max_batch_tokens, 1024);
+        assert_eq!(restored.config.pooling, None);
+    }
+
+    #[tokio::test]
+    async fn test_clear_writes_empty_state() {
+        let state_file = PathBuf::from("/test/clear.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(None, "/bin/sleep".to_string(), 8080, 8180));
+
+        let state_manager = StateManager::new_with_storage(
+            state_file.clone(),
+            registry.clone(),
+            "/bin/sleep".to_string(),
+            storage.clone(),
+        );
+
+        storage
+            .save(&state_file, "last_updated = \"2025-01-01T00:00:00Z\"\n")
+            .await
+            .unwrap();
+        state_manager.clear().await.unwrap();
+
+        let content = storage.get_file(&state_file).await.unwrap();
+        assert!(content.contains("instances = []"));
+
+        // Cleared state loads as empty
+        let loaded = state_manager.load().await.unwrap();
+        assert!(loaded.instances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reset_and_reseed() {
+        let state_file = PathBuf::from("/test/reset.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(None, "/bin/sleep".to_string(), 8080, 8180));
+
+        let state_content = r#"
+last_updated = "2025-01-01T00:00:00Z"
+
+[[instances]]
+name = "old-a"
+model_id = "model-a"
+port = 8080
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+
+[[instances]]
+name = "old-b"
+model_id = "model-b"
+port = 8081
+max_batch_tokens = 1024
+max_concurrent_requests = 10
+"#;
+        storage.save(&state_file, state_content).await.unwrap();
+        let state_manager = StateManager::new_with_storage(
+            state_file.clone(),
+            registry.clone(),
+            "/bin/sleep".to_string(),
+            storage.clone(),
+        );
+        state_manager.restore_with_options(false).await.unwrap();
+        assert_eq!(registry.count().await, 2);
+
+        let configs = vec![crate::config::InstanceConfig {
+            name: "seeded".to_string(),
+            model_id: "model-c".to_string(),
+            port: 8090,
+            max_batch_tokens: 2048,
+            ..Default::default()
+        }];
+
+        let gpu = crate::gpu::GpuInfo::default();
+        let (stopped, seeded) = state_manager
+            .reset_and_reseed(&configs, &gpu, 2048)
+            .await
+            .unwrap();
+        assert_eq!(stopped, 2);
+        assert_eq!(seeded, 1);
+
+        // Registry holds only the reseeded config set
+        assert_eq!(registry.count().await, 1);
+        assert!(registry.get("seeded").await.is_some());
+        assert!(registry.get("old-a").await.is_none());
+
+        // Persisted state reflects the reseeded set, not the old one
+        let content = storage.get_file(&state_file).await.unwrap();
+        assert!(content.contains("name = \"seeded\""));
+        assert!(!content.contains("old-a"));
+    }
+
+    #[tokio::test]
+    async fn test_reset_and_reseed_rejected_while_restore_in_progress() {
+        use std::sync::atomic::Ordering;
+
+        let state_file = PathBuf::from("/test/reset_guard.toml");
+        let storage = Arc::new(MockStorage::new());
+        let registry = Arc::new(Registry::new(None, "/bin/sleep".to_string(), 8080, 8180));
+
+        let state_manager =
+            StateManager::new_with_storage(state_file, registry, "/bin/sleep".to_string(), storage);
+
+        state_manager
+            .restore_in_progress
+            .store(true, Ordering::SeqCst);
+
+        let gpu = crate::gpu::GpuInfo::default();
+        let result = state_manager.reset_and_reseed(&[], &gpu, 2048).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("already in progress")
+        );
+
+        state_manager
+            .restore_in_progress
+            .store(false, Ordering::SeqCst);
+
+        // Guard released: reset works and is itself released afterwards
+        let (stopped, seeded) = state_manager
+            .reset_and_reseed(&[], &gpu, 2048)
+            .await
+            .unwrap();
+        assert_eq!((stopped, seeded), (0, 0));
+        assert!(!state_manager.restore_in_progress.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

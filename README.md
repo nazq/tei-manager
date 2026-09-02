@@ -285,11 +285,21 @@ The bench-client source (`src/bin/bench-client.rs`) demonstrates:
 | `GET` | `/models/{id}` | Get model details | 200 | 404 `MODEL_NOT_FOUND` |
 | `POST` | `/models/{id}/download` | Download model to cache | 200 | 409 `MODEL_BUSY`, 500 |
 | `POST` | `/models/{id}/load` | Smoke test model loading | 200 | 409 `MODEL_BUSY`, 500 |
+| `POST` | `/state/reset` | Drop persisted state, reseed from config | 200 | 500 |
 
 Error responses include a machine-readable `code` field:
 ```json
 {"error": "Instance not found", "code": "INSTANCE_NOT_FOUND", "timestamp": "..."}
 ```
+
+### Reset State
+
+Persisted state takes precedence over the config file: `[[instances]]` entries
+only seed instances whose names are missing from the state. When the state has
+drifted and the config should win, `POST /state/reset` stops and removes every
+instance, clears the persisted state file, and reseeds all `[[instances]]` from
+the manager's config (deleting the state file by hand does not work — the
+shutdown handler rewrites it). Responds with `{"stopped": n, "seeded": m}`.
 
 ### Create Instance
 

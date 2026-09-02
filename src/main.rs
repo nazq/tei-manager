@@ -146,11 +146,13 @@ async fn main() -> Result<()> {
         state_manager.restore().await?;
     }
     if !config.instances.is_empty() {
-        let mut seed_configs = config.instances.clone();
-        for seed in &mut seed_configs {
-            seed.resolve_auto_max_batch_tokens(gpu_info, config.auto_max_batch_tokens_per_gib);
-        }
-        state_manager.seed_missing_instances(&seed_configs).await;
+        state_manager
+            .seed_missing_instances(
+                &config.instances,
+                gpu_info,
+                config.auto_max_batch_tokens_per_gib,
+            )
+            .await;
     }
 
     // Start health monitor
@@ -186,6 +188,7 @@ async fn main() -> Result<()> {
         model_registry,
         model_loader,
         auto_max_batch_tokens_per_gib: config.auto_max_batch_tokens_per_gib,
+        seed_instances: config.instances.clone(),
     };
 
     let app = api::create_router(app_state);

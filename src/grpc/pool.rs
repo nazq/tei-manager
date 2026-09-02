@@ -167,17 +167,21 @@ impl BackendPool {
             return Ok(entry.clients.clone()); // Cheap Arc clone
         }
 
-        // Slow path: create new connection
-        // Using entry API prevents race condition where two threads both try to create connection
+        // Slow path: connect FIRST, then insert. The connect await must not
+        // run while holding a DashMap shard lock: shard locks are blocking,
+        // so a second task hitting the same shard would block its worker
+        // thread mid-await — a deadlock on a current-thread runtime.
+        // EmbedArrowStream's per-batch model routing issues exactly such
+        // concurrent lookups. Racing creators are tolerated: the first
+        // insert wins and the losing channel is simply dropped.
+        let clients = self.create_connection(instance_name).await?;
         match self.connections.entry(instance_name.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                // Another thread created it while we were waiting
+                // Another task connected while we were; use the pooled one.
                 entry.get_mut().touch();
                 Ok(entry.get().clients.clone())
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                // We got the lock, create the connection
-                let clients = self.create_connection(instance_name).await?;
                 entry.insert(ConnectionEntry::new(clients.clone()));
                 Ok(clients)
             }

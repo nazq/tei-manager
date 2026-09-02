@@ -462,6 +462,71 @@ Requesting `OutputDtype::F16` halves the payload; widen to `f32` on the client. 
 arrow = { version = "59", features = ["ipc_compression"] }
 ```
 
+### Streaming Batches (EmbedArrowStream)
+
+When a job is bigger than one message, stream Arrow IPC batches on a single bidirectional RPC instead of juggling multiple in-flight `EmbedArrow` calls. Each streamed batch only has to fit under the server's `grpc_max_message_size_mb` individually, so the overall job size is unbounded.
+
+The **first** request establishes the target and all options (`truncate`, `normalize`, `truncation_direction`, `prompt_name`, `dimensions`, `compression`, `output_dtype`, `max_concurrent_batches`). On subsequent requests only `arrow_ipc` is read — their other fields are ignored (the server logs and counts requests that set differing option fields). Responses are 1:1 with request batches, **strictly in request order**, and each keeps the unary response shape (nullable `embeddings` + per-row `error` columns; see [Response Shape](#response-shape-check-the-error-column)). A batch-level failure (invalid IPC, dead backend, timeout) terminates the stream with a gRPC status; per-row failures still land in the `error` column of that batch's response.
+
+#### Concurrency (server-side)
+
+The server executes up to K batches of one stream concurrently while still emitting responses strictly in request order. K defaults to the server's `grpc_stream_max_concurrent_batches` knob (4 unless configured); the stream's **first** request can override it via `max_concurrent_batches` (0 = use the server default). Either value is clamped to `1..=64`, and K=1 gives fully sequential execution. Memory: the server may buffer up to K unemitted responses per stream, so the worst case is about K × `grpc_max_message_size_mb` per stream.
+
+#### Resume after a mid-stream failure
+
+When a batch fails, the stream's terminal status is that of the **lowest-sequence** failed batch: every batch before it is delivered first, and no batch after it is ever delivered. The contract: **N responses received ⇒ batches `0..N-1` are durable; on a mid-stream status, reopen the stream and resend from batch N.** Batches after N may have partially executed server-side, but their results were discarded — resending them is safe (embedding is idempotent). The server never retries a failed batch on another instance; discard-and-let-the-client-resume is the contract.
+
+#### Multi-GPU (ModelId streams)
+
+With a `model_id` target the stream is **not** pinned to one instance: every batch re-resolves round-robin across the model's running instances, so a single stream spreads its batches over a multi-GPU deployment and routes around instances that stop running. A batch in flight on an instance that dies fails the stream — resume as above and the resent batches route to the survivors.
+
+```rust
+use arrow::ipc::reader::StreamReader;
+use arrow::record_batch::RecordBatch;
+use proto::multiplexer::v1::{
+    tei_multiplexer_client::TeiMultiplexerClient,
+    EmbedArrowRequest, Target, target::Routing,
+};
+use std::io::Cursor;
+use tokio_stream::StreamExt;
+
+async fn embed_arrow_stream(
+    client: &mut TeiMultiplexerClient<Channel>,
+    instance: &str,
+    ipc_batches: Vec<Vec<u8>>,  // pre-serialized Arrow IPC batches (see above)
+) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
+    let instance = instance.to_string();
+
+    // First request sets target + options; later requests only need `arrow_ipc`.
+    let request_stream = tokio_stream::iter(ipc_batches.into_iter().enumerate().map(
+        move |(i, arrow_ipc)| EmbedArrowRequest {
+            target: (i == 0).then(|| Target {
+                routing: Some(Routing::InstanceName(instance.clone())),
+            }),
+            arrow_ipc,
+            truncate: true,
+            normalize: true,
+            ..Default::default()
+        },
+    ));
+    // For an open-ended producer, back the request stream with an mpsc
+    // channel (`tokio_stream::wrappers::ReceiverStream`) instead of `iter`.
+
+    let mut response_stream = client.embed_arrow_stream(request_stream).await?.into_inner();
+
+    // One response per request batch, in order — decode each exactly like a
+    // unary EmbedArrow reply (embeddings + error columns).
+    let mut batches = Vec::new();
+    while let Some(response) = response_stream.next().await {
+        let cursor = Cursor::new(response?.arrow_ipc);
+        let mut reader = StreamReader::try_new(cursor, None)?;
+        batches.push(reader.next().ok_or("No batch in response")??);
+    }
+
+    Ok(batches)
+}
+```
+
 ## Connection Options
 
 ### With Keepalive
@@ -585,7 +650,7 @@ match client.embed(request).await {
 }
 ```
 
-Note that for `EmbedArrow`/`EmbedSparseArrow`, per-row failures do **not** produce a gRPC error — the call succeeds and the failures land in the response's `error` column (see [Arrow Batch Embeddings](#arrow-batch-embeddings)).
+Note that for `EmbedArrow`/`EmbedArrowStream`/`EmbedSparseArrow`, per-row failures do **not** produce a gRPC error — the call succeeds and the failures land in the response's `error` column (see [Arrow Batch Embeddings](#arrow-batch-embeddings)).
 
 ## Reference Implementation
 
@@ -618,7 +683,7 @@ message Target {
 }
 ```
 
-`instance_name` routes to that specific instance. `model_id` routes to any *running* instance serving that model — round-robin across matches, with the whole RPC (including a full stream) pinned to one instance, so a batch is never split. Zero running matches returns `NotFound` naming the model. On a multi-GPU box, create one instance per GPU with the same `model_id` and simply target the model:
+`instance_name` routes to that specific instance. `model_id` routes to any *running* instance serving that model — round-robin across matches, with the whole RPC pinned to one instance, so a batch is never split. The exception is `EmbedArrowStream`, which re-resolves per batch and spreads a stream's batches across the model's running instances (see [Multi-GPU](#multi-gpu-modelid-streams)). Zero running matches returns `NotFound` naming the model. On a multi-GPU box, create one instance per GPU with the same `model_id` and simply target the model:
 
 ```rust
 Target {
@@ -640,6 +705,7 @@ Target {
 | `EmbedAll` | `EmbedAllRequest` | `tei.v1.EmbedAllResponse` | Token-level embeddings |
 | `EmbedAllStream` | `stream EmbedAllRequest` | `stream tei.v1.EmbedAllResponse` | Streaming token-level |
 | `EmbedArrow` | `EmbedArrowRequest` | `EmbedArrowResponse` | Arrow batch dense |
+| `EmbedArrowStream` | `stream EmbedArrowRequest` | `stream EmbedArrowResponse` | Streaming Arrow batch dense |
 | `EmbedSparseArrow` | `EmbedSparseArrowRequest` | `EmbedSparseArrowResponse` | Arrow batch sparse |
 | `Predict` | `PredictRequest` | `tei.v1.PredictResponse` | Classification |
 | `PredictPair` | `PredictPairRequest` | `tei.v1.PredictResponse` | Pair classification |

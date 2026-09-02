@@ -97,6 +97,9 @@ tonic-build = "0.14"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
+# test-util enables tokio::time::pause / start_paused for deterministic
+# concurrency tests (feature-unified onto the main tokio dep in test builds)
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 tokio-test = "0.4"
 axum-test = "21"

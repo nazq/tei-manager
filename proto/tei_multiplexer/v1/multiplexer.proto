@@ -23,6 +23,30 @@ service TeiMultiplexer {
 
     // Arrow batch embedding - High-performance batch processing
     rpc EmbedArrow (EmbedArrowRequest) returns (EmbedArrowResponse);
+    // Bidirectional streaming variant of EmbedArrow: the client streams IPC
+    // request batches and receives one response per batch, strictly in
+    // request order. The FIRST request establishes the target and all
+    // options (truncate, normalize, truncation_direction, prompt_name,
+    // dimensions, compression, output_dtype, noop, max_concurrent_batches);
+    // on SUBSEQUENT requests only `arrow_ipc` is read and every other field
+    // is ignored. The server may execute up to max_concurrent_batches
+    // batches concurrently, but responses are always emitted 1:1 in request
+    // order. Each response follows the same schema contract as EmbedArrow:
+    // one row per input row, nullable embeddings and error columns.
+    //
+    // A batch-level failure (invalid IPC, backend death, timeout) ends the
+    // stream with the status of the LOWEST-sequence failed batch: every
+    // batch before it is delivered first, no batch after it is ever
+    // delivered. Receiving N responses therefore guarantees batches 0..N-1
+    // are durable; after a mid-stream status, reopen the stream and resend
+    // from batch N (later batches may have partially executed server-side
+    // and were discarded — resending them is safe). Per-row errors ride in
+    // the error column and never end the stream.
+    //
+    // An `instance_name` target is resolved once and pins the whole stream;
+    // a `model_id` target is re-resolved per batch (round-robin), spreading
+    // a stream's batches across all running instances of the model.
+    rpc EmbedArrowStream (stream EmbedArrowRequest) returns (stream EmbedArrowResponse);
     rpc EmbedSparseArrow (EmbedSparseArrowRequest) returns (EmbedSparseArrowResponse);
 
     // Predict service - Classification/prediction
@@ -46,7 +70,7 @@ service TeiMultiplexer {
 message Target {
     oneof routing {
         string instance_name = 1;  // Route by instance name (e.g., "bge-small")
-        string model_id = 2;        // Route to a running instance serving this model (round-robin across matches; whole RPC pins to one instance)
+        string model_id = 2;        // Route to a running instance serving this model (round-robin across matches; the RPC pins to one instance, except EmbedArrowStream which re-resolves per batch)
         uint32 instance_index = 3;  // Route by instance index (0-based)
     }
 }
@@ -136,6 +160,13 @@ message EmbedArrowRequest {
     optional uint32 dimensions = 8;    // Matryoshka truncation of the output vector
     ArrowCompression compression = 9;  // Response IPC compression (default NONE)
     OutputDtype output_dtype = 10;     // Element type of `embeddings` (default: server config)
+    // EmbedArrowStream only: how many request batches the server may execute
+    // concurrently for this stream. Read from the FIRST request only, like
+    // every other option. 0 = use the server default
+    // (grpc_stream_max_concurrent_batches, 4 unless configured). The
+    // effective value is clamped to 1..=64; responses are always emitted
+    // strictly in request order regardless of this setting.
+    uint32 max_concurrent_batches = 11;
 }
 
 // Response RecordBatch has exactly one row per input row, in input order:

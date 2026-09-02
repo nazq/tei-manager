@@ -166,6 +166,7 @@ The gRPC multiplexer provides a unified endpoint for routing embedding requests 
 | `EmbedStream` | Streaming dense embeddings |
 | `EmbedSparse` | Generate sparse embeddings (SPLADE) |
 | `EmbedArrow` | **High-throughput batch dense embedding via Arrow IPC** |
+| `EmbedArrowStream` | **Streaming Arrow batch embedding — one response per request batch, in order** |
 | `EmbedSparseArrow` | **High-throughput batch sparse embedding via Arrow IPC** |
 | `Rerank` | Rerank documents by relevance |
 | `Tokenize` | Tokenize text |
@@ -204,6 +205,8 @@ grpcurl -plaintext -d '{
 - Process thousands of texts in a single request; keep 2–4 requests in flight per instance to keep the GPU queue full
 - Skip-and-record per row: one bad document no longer fails the batch
 - Dense: zero-copy access to a contiguous `Float32` buffer
+
+**Streaming:** `EmbedArrowStream` accepts a stream of `EmbedArrowRequest` batches on one bidirectional RPC and returns one response per batch, in order — the first request fixes the target and all options (later requests contribute only `arrow_ipc`), each response keeps the unary schema contract (per-row `error` column included), and since only each individual batch must fit under `grpc_max_message_size_mb`, the overall job size is unbounded.
 
 ---
 

@@ -218,9 +218,9 @@ RUN touch /etc/s6-overlay/s6-rc.d/user/contents.d/tei-manager
 # Expose ports (9000 for HTTP API, 9001 for gRPC - matches default config)
 EXPOSE 9000 9001
 
-# Health check
+# Health check (respects TEI_MANAGER_API_PORT override, defaults to 9000)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD ["sh", "-c", "curl -f http://localhost:9000/health || exit 1"]
+    CMD ["sh", "-c", "curl -f http://localhost:${TEI_MANAGER_API_PORT:-9000}/health || exit 1"]
 
 # S6 overlay init as PID 1
 ENTRYPOINT ["/init"]

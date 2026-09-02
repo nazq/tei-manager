@@ -91,6 +91,15 @@ pub trait ProcessManager: Send + Sync {
     async fn last_log_write(&self, _handle: &ProcessHandle) -> Option<std::time::SystemTime> {
         None
     }
+
+    /// Evidence from the process log that TEI fell back to CPU, if any.
+    ///
+    /// Used to catch an instance that is healthy but silently serving
+    /// embeddings on CPU (e.g. the host driver is older than the image's
+    /// CUDA userspace).
+    async fn gpu_fallback_evidence(&self, _handle: &ProcessHandle) -> Option<String> {
+        None
+    }
 }
 
 /// Read the last error-level line from a TEI log file.
@@ -128,6 +137,40 @@ pub(crate) fn last_log_error(path: &std::path::Path) -> Option<String> {
             .find(|l| l.starts_with("Error:"))
             .map(|l| l.trim().to_string())
     })
+}
+
+/// Scan the head of a TEI log for evidence that the model fell back to CPU.
+///
+/// When the CUDA userspace cannot initialize (e.g. the host driver supports
+/// an older CUDA than the image requires), TEI logs `Could not create
+/// backend` warnings followed by `Using CPU instead` — early in the log,
+/// right after startup — and then serves embeddings on CPU. Returns the
+/// message of the last matching line. A later `... on Cuda(...)` line clears
+/// earlier evidence: instance logs are opened in append mode across
+/// restarts, and only the latest run's backend choice counts.
+pub(crate) fn gpu_fallback_evidence(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+
+    const HEAD_BYTES: u64 = 64 * 1024;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(HEAD_BYTES).read_to_end(&mut bytes).ok()?;
+    let buf = String::from_utf8_lossy(&bytes);
+
+    let mut evidence = None;
+    for line in buf.lines() {
+        if line.contains("on Cuda(") {
+            evidence = None;
+        } else if line.contains("Using CPU instead") || line.contains("Could not create backend") {
+            let message = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| Some(v.get("message")?.as_str()?.to_string()))
+                .unwrap_or_else(|| line.trim().to_string());
+            evidence = Some(message);
+        }
+    }
+    evidence
 }
 
 // ============================================================================
@@ -375,6 +418,11 @@ impl ProcessManager for SystemProcessManager {
         let path = self.log_paths.read().await.get(&handle.id).cloned()?;
         std::fs::metadata(path).and_then(|m| m.modified()).ok()
     }
+
+    async fn gpu_fallback_evidence(&self, handle: &ProcessHandle) -> Option<String> {
+        let path = self.log_paths.read().await.get(&handle.id).cloned()?;
+        gpu_fallback_evidence(&path)
+    }
 }
 
 // ============================================================================
@@ -517,6 +565,12 @@ impl TeiInstance {
         self.process_manager.last_log_write(&handle).await
     }
 
+    /// Evidence from this instance's TEI log that it fell back to CPU, if any
+    pub async fn gpu_fallback_evidence(&self) -> Option<String> {
+        let handle = self.process_handle.read().await.clone()?;
+        self.process_manager.gpu_fallback_evidence(&handle).await
+    }
+
     pub async fn exit_status(&self) -> Option<ProcessExit> {
         let handle_guard = self.process_handle.read().await;
         match handle_guard.as_ref() {
@@ -558,6 +612,7 @@ pub mod mocks {
         processes: Arc<RwLock<HashMap<String, ProcessState>>>,
         next_id: Arc<RwLock<u32>>,
         log_write: Arc<RwLock<Option<std::time::SystemTime>>>,
+        fallback_evidence: Arc<RwLock<Option<String>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -580,6 +635,7 @@ pub mod mocks {
                 processes: Arc::new(RwLock::new(HashMap::new())),
                 next_id: Arc::new(RwLock::new(1000)),
                 log_write: Arc::new(RwLock::new(None)),
+                fallback_evidence: Arc::new(RwLock::new(None)),
             }
         }
 
@@ -605,6 +661,11 @@ pub mod mocks {
         /// Set what `last_log_write` reports for every process
         pub async fn set_last_log_write(&self, when: Option<std::time::SystemTime>) {
             *self.log_write.write().await = when;
+        }
+
+        /// Set what `gpu_fallback_evidence` reports for every process
+        pub async fn set_gpu_fallback_evidence(&self, line: Option<String>) {
+            *self.fallback_evidence.write().await = line;
         }
 
         /// Simulate every spawned process having exited with `exit`
@@ -661,6 +722,10 @@ pub mod mocks {
 
         async fn last_log_write(&self, _handle: &ProcessHandle) -> Option<std::time::SystemTime> {
             *self.log_write.read().await
+        }
+
+        async fn gpu_fallback_evidence(&self, _handle: &ProcessHandle) -> Option<String> {
+            self.fallback_evidence.read().await.clone()
         }
 
         async fn exit_status(&self, handle: &ProcessHandle) -> Option<ProcessExit> {
@@ -740,6 +805,70 @@ mod tests {
         let path = write_log(&dir, &[r#"{"level":"INFO","message":"fine"}"#]);
         assert_eq!(last_log_error(&path), None);
         assert_eq!(last_log_error(&dir.path().join("missing.log")), None);
+    }
+
+    #[test]
+    fn test_gpu_fallback_evidence_detects_cpu_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(
+            &dir,
+            &[
+                r#"{"level":"INFO","message":"Args { model_id: \"BAAI/bge-small-en-v1.5\" }"}"#,
+                r#"{"level":"WARN","message":"Could not create backend","target":"text_embeddings_backend"}"#,
+                r#"{"level":"WARN","message":"Could not create backend","target":"text_embeddings_backend"}"#,
+                r#"{"level":"WARN","message":"Using CPU instead","target":"text_embeddings_backend"}"#,
+                r#"{"level":"INFO","message":"Ready"}"#,
+            ],
+        );
+        // The last matching line wins and its JSON message is extracted
+        assert_eq!(
+            gpu_fallback_evidence(&path).as_deref(),
+            Some("Using CPU instead")
+        );
+    }
+
+    #[test]
+    fn test_gpu_fallback_evidence_backend_failure_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(
+            &dir,
+            &["Could not create backend: CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE"],
+        );
+        // Non-JSON line: returned verbatim
+        assert_eq!(
+            gpu_fallback_evidence(&path).as_deref(),
+            Some("Could not create backend: CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE")
+        );
+    }
+
+    #[test]
+    fn test_gpu_fallback_evidence_none_for_healthy_cuda_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(
+            &dir,
+            &[
+                r#"{"level":"INFO","message":"Starting FlashBert model on Cuda(CudaDevice(DeviceId(1)))"}"#,
+                r#"{"level":"INFO","message":"Ready"}"#,
+            ],
+        );
+        assert_eq!(gpu_fallback_evidence(&path), None);
+        assert_eq!(gpu_fallback_evidence(&dir.path().join("missing.log")), None);
+    }
+
+    #[test]
+    fn test_gpu_fallback_evidence_cleared_by_later_cuda_start() {
+        // Logs are appended across restarts: a failed CPU run followed by a
+        // successful GPU run must not be flagged.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_log(
+            &dir,
+            &[
+                r#"{"level":"WARN","message":"Could not create backend"}"#,
+                r#"{"level":"WARN","message":"Using CPU instead"}"#,
+                r#"{"level":"INFO","message":"Starting FlashBert model on Cuda(CudaDevice(DeviceId(0)))"}"#,
+            ],
+        );
+        assert_eq!(gpu_fallback_evidence(&path), None);
     }
 
     #[test]

@@ -417,6 +417,7 @@ deployment_environment = "dev"
 ### Running on rented GPUs (vast.ai, RunPod)
 
 - Pick the image for the card (see [Docker Images](#docker-images)). On start, tei-manager compares every visible GPU's compute capability with the TEI build in the image and logs a mismatch with the tag to use instead (`gpu_preflight = "fail"` turns that into a hard stop).
+- The same preflight compares the host driver's supported CUDA version (from the `nvidia-smi` banner) with the CUDA userspace the image requires (`NVIDIA_REQUIRE_CUDA`). Rental hosts often run older drivers: e.g. driver 570 supports CUDA 12.8, and under a CUDA 12.9 image TEI gets `CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE` and silently serves embeddings on CPU, ~50x slower, behind green health. As a second line of defense, when an instance first reports healthy its TEI log is scanned for `Using CPU instead`: with `gpu_fallback = "fail"` (default) the instance is marked `failed` with the log line as the reason; `"warn"` keeps it running and surfaces the line in the instance's `last_error`; `"off"` disables the check.
 - Create instances with `"max_batch_tokens": "auto"` — the value is derived from the free VRAM of the target GPU at creation time and reported back in the instance JSON.
 - For batch export over the network, request `output_dtype: OUTPUT_DTYPE_F16` on `EmbedArrow` (or set `arrow_output_dtype = "f16"`) to halve egress; f16 is lossy, so validate retrieval on your own data first.
 

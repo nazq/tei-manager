@@ -43,6 +43,12 @@ graceful_shutdown_timeout_secs = 30
 
 # Auto-restore instances from state file on manager restart (default: false)
 # When true, instances are automatically recreated from saved state
+#
+# Precedence: persisted state wins for instance names it already contains;
+# [[instances]] entries in this file only seed instances missing from the
+# state. To discard drifted state and reseed everything from this file,
+# call POST /state/reset on the running manager (deleting the state file
+# by hand does not help — it is rewritten on shutdown).
 auto_restore_on_restart = true
 
 # Maximum number of instances (default: no limit)

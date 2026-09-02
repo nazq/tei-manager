@@ -78,6 +78,7 @@ async fn create_test_server() -> (TestServer, TempDir) {
         auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
+        seed_instances: Vec::new(),
     };
 
     let app = create_router(state);
@@ -192,7 +193,9 @@ async fn test_instance_that_exits_on_start_reports_failed_with_reason() {
         .json(&json!({
             "name": "exits-immediately",
             "model_id": "BAAI/bge-small-en-v1.5",
-            "port": 8081,
+            // Not 808x: a dev box running real TEI instances on the usual
+            // ports would answer the readiness probe for the stub.
+            "port": 8111,
         }))
         .await;
     assert_eq!(response.status_code(), 201);
@@ -498,6 +501,7 @@ async fn test_max_instances_limit() {
         auto_max_batch_tokens_per_gib: 2048,
         model_registry,
         model_loader,
+        seed_instances: Vec::new(),
     };
 
     let app = create_router(state);
@@ -1491,4 +1495,77 @@ async fn test_list_models_after_add() {
         .collect();
     assert!(model_ids.contains(&"BAAI/bge-small-en-v1.5"));
     assert!(model_ids.contains(&"sentence-transformers/all-MiniLM-L6-v2"));
+}
+
+#[tokio::test]
+async fn test_state_reset_endpoint() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let state_file = temp_dir.path().join("state.toml");
+
+    let config = ManagerConfig {
+        state_file: state_file.clone(),
+        tei_binary_path: STUB_BINARY.to_string(),
+        max_instances: Some(10),
+        ..Default::default()
+    };
+
+    let registry = Arc::new(Registry::new(
+        config.max_instances,
+        config.tei_binary_path.clone(),
+        config.instance_port_start,
+        config.instance_port_end,
+    ));
+
+    let state_manager = Arc::new(StateManager::new(
+        state_file,
+        registry.clone(),
+        config.tei_binary_path.clone(),
+    ));
+
+    // Fixed seed set the reset endpoint reseeds from
+    let seed_instances = vec![tei_manager::config::InstanceConfig {
+        name: "seeded-a".to_string(),
+        model_id: "model-a".to_string(),
+        port: 8085,
+        max_batch_tokens: 2048,
+        ..Default::default()
+    }];
+
+    let state = AppState {
+        registry,
+        state_manager,
+        prometheus_handle: get_metrics_handle(),
+        auth_manager: None,
+        require_cert_headers: false,
+        auto_max_batch_tokens_per_gib: 2048,
+        model_registry: Arc::new(ModelRegistry::new()),
+        model_loader: Arc::new(ModelLoader::new()),
+        seed_instances,
+    };
+
+    let app = create_router(state);
+    let server = TestServer::new(app);
+
+    // Create an instance through the API
+    let create_req = json!({
+        "name": "user-made",
+        "model_id": "BAAI/bge-small-en-v1.5",
+        "port": 8095
+    });
+    let response = server.post("/instances").json(&create_req).await;
+    assert_eq!(response.status_code(), 201);
+
+    // Reset: drops all instances and reseeds from the configured list
+    let response = server.post("/state/reset").await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    let body: serde_json::Value = response.json();
+    assert!(body["stopped"].as_u64().unwrap() >= 1);
+    assert_eq!(body["seeded"].as_u64().unwrap(), 1);
+
+    // The instance list now reflects the reseeded config set
+    let response = server.get("/instances").await;
+    assert_eq!(response.status_code(), 200);
+    let instances: Vec<serde_json::Value> = response.json();
+    assert_eq!(instances.len(), 1);
+    assert_eq!(instances[0]["name"], "seeded-a");
 }

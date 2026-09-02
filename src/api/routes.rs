@@ -27,6 +27,8 @@ pub struct AppState {
     pub model_loader: Arc<ModelLoader>,
     /// Tokens per GiB of free VRAM for `max_batch_tokens = "auto"`
     pub auto_max_batch_tokens_per_gib: u32,
+    /// Config-file `[[instances]]` used to reseed after POST /state/reset
+    pub seed_instances: Vec<crate::config::InstanceConfig>,
 }
 
 /// Create the main API router
@@ -55,6 +57,8 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Instance logs
         .route("/instances/{name}/logs", get(handlers::get_logs))
+        // State administration
+        .route("/state/reset", post(handlers::reset_state))
         // Model management
         .route("/models", get(handlers::list_models))
         .route("/models", post(handlers::add_model))
@@ -158,6 +162,7 @@ mod tests {
             auto_max_batch_tokens_per_gib: 2048,
             model_registry,
             model_loader,
+            seed_instances: Vec::new(),
         }
     }
 

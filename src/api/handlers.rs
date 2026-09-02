@@ -178,6 +178,35 @@ pub async fn delete_instance(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// POST /state/reset - Drop persisted state and reseed from config
+///
+/// Stops and removes every instance, clears the persisted state file, then
+/// seeds the manager's config `[[instances]]` afresh. Use when persisted
+/// state has drifted from the config and the config should win (deleting
+/// the state file by hand is futile — the shutdown handler rewrites it).
+pub async fn reset_state(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, TeiError> {
+    let gpu = crate::gpu::get_or_init();
+    let (stopped, seeded) = state
+        .state_manager
+        .reset_and_reseed(
+            &state.seed_instances,
+            gpu,
+            state.auto_max_batch_tokens_per_gib,
+        )
+        .await
+        .map_err(|e| TeiError::Internal {
+            message: e.to_string(),
+        })?;
+
+    crate::metrics::update_instance_count(state.registry.count().await);
+
+    Ok(Json(
+        serde_json::json!({ "stopped": stopped, "seeded": seeded }),
+    ))
+}
+
 /// POST /instances/:name/start - Start a stopped instance
 pub async fn start_instance(
     State(state): State<AppState>,

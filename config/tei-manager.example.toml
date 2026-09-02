@@ -103,10 +103,21 @@ arrow_output_dtype = "f32"
 # GPU
 # =============================================================================
 
-# Check visible GPUs against the compute capability this image's TEI was
-# compiled for (the image sets TEI_VARIANT). "warn" (default) logs a mismatch,
-# "fail" refuses to start, "off" skips the check.
+# Startup checks of the host against this image: every visible GPU's compute
+# capability vs the TEI build (the image sets TEI_VARIANT), and the host
+# driver's supported CUDA version (nvidia-smi banner) vs the CUDA userspace
+# this image requires (NVIDIA_REQUIRE_CUDA) — an older host driver makes TEI
+# silently fall back to CPU. "warn" (default) logs problems, "fail" refuses
+# to start, "off" skips the checks.
 gpu_preflight = "warn"
+
+# After an instance first reports healthy, scan the head of its TEI log for a
+# silent CPU fallback ("Using CPU instead" / "Could not create backend").
+# "fail" (default) marks the instance Failed with the log line as the reason,
+# "warn" keeps it running but records the line in the instance's last_error,
+# "off" skips the check. Only applies when the host has GPUs or the instance
+# has gpu_id set.
+gpu_fallback = "fail"
 
 # max_batch_tokens = 0 / "auto" on an instance derives the value from the
 # free VRAM of its GPU: this many tokens per GiB (default 2048, so 32 GiB free

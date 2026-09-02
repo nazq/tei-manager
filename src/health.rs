@@ -1,5 +1,6 @@
 //! Health monitoring for TEI instances with dependency injection and testability
 
+use crate::config::GpuFallback;
 use crate::instance::{InstanceStatus, TeiInstance};
 use crate::registry::Registry;
 use async_trait::async_trait;
@@ -291,6 +292,9 @@ pub struct HealthMonitorConfig {
     /// this window is treated as still loading and given more time; only a
     /// dead process or a stalled log fails the instance.
     pub startup_log_stall: Duration,
+    /// What to do when an instance that just became healthy shows
+    /// CPU-fallback evidence in its TEI log.
+    pub gpu_fallback: GpuFallback,
 }
 
 impl Default for HealthMonitorConfig {
@@ -302,6 +306,7 @@ impl Default for HealthMonitorConfig {
             max_failures_before_restart: 3,
             auto_restart: true,
             startup_log_stall: Duration::from_secs(crate::config::DEFAULT_STARTUP_LOG_STALL_SECS),
+            gpu_fallback: GpuFallback::default(),
         }
     }
 }
@@ -310,6 +315,12 @@ impl HealthMonitor {
     /// Override the startup log-stall window (builder-style, used by main)
     pub fn with_startup_log_stall(mut self, window: Duration) -> Self {
         self.config.startup_log_stall = window;
+        self
+    }
+
+    /// Override the CPU-fallback policy (builder-style, used by main)
+    pub fn with_gpu_fallback(mut self, policy: GpuFallback) -> Self {
+        self.config.gpu_fallback = policy;
         self
     }
 }
@@ -329,6 +340,7 @@ pub struct HealthMonitorConfigBuilder {
     max_failures_before_restart: Option<u32>,
     auto_restart: Option<bool>,
     startup_log_stall: Option<Duration>,
+    gpu_fallback: Option<GpuFallback>,
 }
 
 impl HealthMonitorConfigBuilder {
@@ -362,6 +374,11 @@ impl HealthMonitorConfigBuilder {
         self
     }
 
+    pub fn gpu_fallback(mut self, policy: GpuFallback) -> Self {
+        self.gpu_fallback = Some(policy);
+        self
+    }
+
     pub fn build(self) -> HealthMonitorConfig {
         let defaults = HealthMonitorConfig::default();
         HealthMonitorConfig {
@@ -373,6 +390,7 @@ impl HealthMonitorConfigBuilder {
                 .unwrap_or(defaults.max_failures_before_restart),
             auto_restart: self.auto_restart.unwrap_or(defaults.auto_restart),
             startup_log_stall: self.startup_log_stall.unwrap_or(defaults.startup_log_stall),
+            gpu_fallback: self.gpu_fallback.unwrap_or(defaults.gpu_fallback),
         }
     }
 }
@@ -479,24 +497,39 @@ impl HealthMonitor {
 
     async fn handle_success(&self, instance: &TeiInstance) {
         // Reset failure count on success
-        let mut stats = instance.stats.write().await;
-        stats.health_check_failures = 0;
-        stats.last_health_check = Some(chrono::Utc::now());
+        {
+            let mut stats = instance.stats.write().await;
+            stats.health_check_failures = 0;
+            stats.last_health_check = Some(chrono::Utc::now());
+        }
 
         // Update status to Running if it was Starting
-        let mut status = instance.status.write().await;
-        let old_status = *status;
+        let became_running = {
+            let mut status = instance.status.write().await;
+            if *status == InstanceStatus::Starting {
+                *status = InstanceStatus::Running;
+                true
+            } else {
+                false
+            }
+        };
 
-        if old_status == InstanceStatus::Starting {
-            *status = InstanceStatus::Running;
-
+        if became_running {
             self.event_handler
                 .handle(HealthEvent::StatusTransition {
                     instance_name: instance.config.name.clone(),
-                    from: old_status,
+                    from: InstanceStatus::Starting,
                     to: InstanceStatus::Running,
                 })
                 .await;
+
+            // A "healthy" instance may still have silently fallen back to
+            // CPU (e.g. host driver older than the image's CUDA userspace);
+            // its log is the only place that shows.
+            if self.check_gpu_fallback(instance).await {
+                // Marked Failed — do not report the check as a success
+                return;
+            }
         }
 
         self.event_handler
@@ -504,6 +537,45 @@ impl HealthMonitor {
                 instance_name: instance.config.name.clone(),
             })
             .await;
+    }
+
+    /// On the Starting→Running transition, check the instance log for a
+    /// silent CPU fallback. Returns true when the instance was marked Failed.
+    async fn check_gpu_fallback(&self, instance: &TeiInstance) -> bool {
+        if self.config.gpu_fallback == GpuFallback::Off {
+            return false;
+        }
+        // Only meaningful where a GPU was expected
+        if instance.config.gpu_id.is_none() && crate::gpu::get_or_init().count() == 0 {
+            return false;
+        }
+        let Some(line) = instance.gpu_fallback_evidence().await else {
+            return false;
+        };
+        let reason = format!("running on CPU: {line}");
+        match self.config.gpu_fallback {
+            GpuFallback::Fail => {
+                instance.mark_failed(reason).await;
+                self.event_handler
+                    .handle(HealthEvent::StatusTransition {
+                        instance_name: instance.config.name.clone(),
+                        from: InstanceStatus::Running,
+                        to: InstanceStatus::Failed,
+                    })
+                    .await;
+                true
+            }
+            GpuFallback::Warn => {
+                tracing::warn!(
+                    instance = %instance.config.name,
+                    evidence = %line,
+                    "Instance fell back to CPU; leaving it running (gpu_fallback = \"warn\")"
+                );
+                instance.stats.write().await.last_error = Some(reason);
+                false
+            }
+            GpuFallback::Off => false,
+        }
     }
 
     /// Decide whether a Starting instance has definitively failed to start.
@@ -1668,5 +1740,187 @@ mod tests {
             .has_event_type(|e| matches!(e, HealthEvent::RestartTriggered { .. }))
             .await;
         assert!(has_restart_events);
+    }
+
+    /// Starting instance pinned to a GPU, so the CPU-fallback check applies
+    /// regardless of whether the test host has GPUs
+    async fn starting_gpu_instance_with_mock(
+        name: &str,
+    ) -> (
+        Arc<TeiInstance>,
+        Arc<crate::instance::mocks::MockProcessManager>,
+    ) {
+        use crate::instance::mocks::MockProcessManager;
+
+        let manager = Arc::new(MockProcessManager::new());
+        let config = InstanceConfig {
+            name: name.to_string(),
+            model_id: "model".to_string(),
+            port: 8080,
+            max_batch_tokens: 1024,
+            max_concurrent_requests: 10,
+            gpu_id: Some(0),
+            ..Default::default()
+        };
+        let instance = Arc::new(TeiInstance::new_with_manager(config, manager.clone()));
+        instance.start("mock").await.unwrap();
+        (instance, manager)
+    }
+
+    #[tokio::test]
+    async fn test_gpu_fallback_fail_policy_marks_instance_failed() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, manager) = starting_gpu_instance_with_mock("cpu-fallback-fail").await;
+        manager
+            .set_gpu_fallback_evidence(Some("Using CPU instead".to_string()))
+            .await;
+
+        let events = Arc::new(RecordingEventHandler::new());
+        let monitor = monitor_with(
+            Arc::new(MockHealthChecker::new()), // healthy
+            Arc::new(MockRestartStrategy::new()),
+            events.clone(),
+            HealthMonitorConfig::default(), // gpu_fallback defaults to Fail
+        );
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(*instance.status.read().await, InstanceStatus::Failed);
+        let err = instance.stats.read().await.last_error.clone().unwrap();
+        assert!(err.contains("CPU"), "{err}");
+        assert_eq!(err, "running on CPU: Using CPU instead");
+
+        // Starting→Running then Running→Failed transitions both recorded,
+        // and the check is not reported as a success
+        assert!(
+            events
+                .has_event_type(|e| matches!(
+                    e,
+                    HealthEvent::StatusTransition {
+                        from: InstanceStatus::Starting,
+                        to: InstanceStatus::Running,
+                        ..
+                    }
+                ))
+                .await
+        );
+        assert!(
+            events
+                .has_event_type(|e| matches!(
+                    e,
+                    HealthEvent::StatusTransition {
+                        from: InstanceStatus::Running,
+                        to: InstanceStatus::Failed,
+                        ..
+                    }
+                ))
+                .await
+        );
+        assert!(
+            !events
+                .has_event_type(|e| matches!(e, HealthEvent::CheckSucceeded { .. }))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gpu_fallback_warn_policy_keeps_running_and_records_error() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, manager) = starting_gpu_instance_with_mock("cpu-fallback-warn").await;
+        manager
+            .set_gpu_fallback_evidence(Some("Using CPU instead".to_string()))
+            .await;
+
+        let events = Arc::new(RecordingEventHandler::new());
+        let monitor = monitor_with(
+            Arc::new(MockHealthChecker::new()),
+            Arc::new(MockRestartStrategy::new()),
+            events.clone(),
+            HealthMonitorConfig::builder()
+                .gpu_fallback(GpuFallback::Warn)
+                .build(),
+        );
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(*instance.status.read().await, InstanceStatus::Running);
+        let err = instance.stats.read().await.last_error.clone().unwrap();
+        assert!(err.contains("running on CPU"), "{err}");
+        // Warn still reports the check as a success
+        assert!(
+            events
+                .has_event_type(|e| matches!(e, HealthEvent::CheckSucceeded { .. }))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gpu_fallback_off_policy_ignores_evidence() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, manager) = starting_gpu_instance_with_mock("cpu-fallback-off").await;
+        manager
+            .set_gpu_fallback_evidence(Some("Using CPU instead".to_string()))
+            .await;
+
+        let monitor = monitor_with(
+            Arc::new(MockHealthChecker::new()),
+            Arc::new(MockRestartStrategy::new()),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::builder()
+                .gpu_fallback(GpuFallback::Off)
+                .build(),
+        );
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(*instance.status.read().await, InstanceStatus::Running);
+        assert!(instance.stats.read().await.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gpu_fallback_no_evidence_leaves_instance_untouched() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        let (instance, _manager) = starting_gpu_instance_with_mock("gpu-healthy").await;
+
+        let events = Arc::new(RecordingEventHandler::new());
+        let monitor = monitor_with(
+            Arc::new(MockHealthChecker::new()),
+            Arc::new(MockRestartStrategy::new()),
+            events.clone(),
+            HealthMonitorConfig::default(),
+        );
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(*instance.status.read().await, InstanceStatus::Running);
+        assert!(instance.stats.read().await.last_error.is_none());
+        assert!(
+            events
+                .has_event_type(|e| matches!(e, HealthEvent::CheckSucceeded { .. }))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gpu_fallback_checked_only_on_transition_to_running() {
+        use mocks::{MockHealthChecker, MockRestartStrategy, RecordingEventHandler};
+
+        // Instance already Running: evidence appearing later must not fail it
+        let (instance, manager) = starting_gpu_instance_with_mock("already-running").await;
+        *instance.status.write().await = InstanceStatus::Running;
+        manager
+            .set_gpu_fallback_evidence(Some("Using CPU instead".to_string()))
+            .await;
+
+        let monitor = monitor_with(
+            Arc::new(MockHealthChecker::new()),
+            Arc::new(MockRestartStrategy::new()),
+            Arc::new(RecordingEventHandler::new()),
+            HealthMonitorConfig::default(),
+        );
+        monitor.check_single_instance(&instance).await;
+
+        assert_eq!(*instance.status.read().await, InstanceStatus::Running);
+        assert!(instance.stats.read().await.last_error.is_none());
     }
 }

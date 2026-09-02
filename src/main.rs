@@ -69,12 +69,20 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Compute-capability preflight: does the bundled TEI run on these GPUs?
+    // GPU preflight: does the bundled TEI run on these GPUs (compute
+    // capability), and can this image's CUDA userspace run on the host
+    // driver at all (an older driver makes TEI silently fall back to CPU)?
     if config.gpu_preflight != tei_manager::config::GpuPreflight::Off {
         let variant = std::env::var(tei_manager::gpu::TEI_VARIANT_ENV).ok();
-        let problems = tei_manager::gpu::preflight(gpu_info, variant.as_deref());
+        let host_driver = tei_manager::gpu::detect_host_driver();
+        let required_cuda = std::env::var(tei_manager::gpu::NVIDIA_REQUIRE_CUDA_ENV)
+            .ok()
+            .as_deref()
+            .and_then(tei_manager::gpu::parse_required_cuda);
+        let problems =
+            tei_manager::gpu::preflight(gpu_info, variant.as_deref(), &host_driver, required_cuda);
         for problem in &problems {
-            tracing::error!(%problem, "GPU compute capability mismatch");
+            tracing::error!(%problem, "GPU preflight problem");
         }
         if !problems.is_empty() && config.gpu_preflight == tei_manager::config::GpuPreflight::Fail {
             anyhow::bail!(
@@ -157,7 +165,8 @@ async fn main() -> Result<()> {
         )
         .with_startup_log_stall(std::time::Duration::from_secs(
             config.startup_log_stall_secs,
-        )),
+        ))
+        .with_gpu_fallback(config.gpu_fallback),
     );
 
     let monitor_handle = tokio::spawn({

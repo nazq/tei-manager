@@ -116,21 +116,13 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use std::sync::OnceLock;
+    use metrics_exporter_prometheus::PrometheusHandle;
     use tower::ServiceExt;
 
-    // Global prometheus handle to avoid multiple recorder installations
-    static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
-
+    // Prometheus handle shared across the test binary (the `metrics` crate
+    // allows only one global recorder per process)
     fn get_prometheus_handle() -> PrometheusHandle {
-        PROMETHEUS_HANDLE
-            .get_or_init(|| {
-                PrometheusBuilder::new()
-                    .install_recorder()
-                    .expect("Prometheus recorder should install")
-            })
-            .clone()
+        crate::metrics::test_support::prometheus_handle()
     }
 
     fn create_test_state() -> AppState {

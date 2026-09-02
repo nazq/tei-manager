@@ -168,7 +168,12 @@ async fn main() -> Result<()> {
         .with_startup_log_stall(std::time::Duration::from_secs(
             config.startup_log_stall_secs,
         ))
-        .with_gpu_fallback(config.gpu_fallback),
+        .with_gpu_fallback(config.gpu_fallback)
+        .with_restart_backoff(
+            std::time::Duration::from_secs(config.restart_backoff_base_secs),
+            std::time::Duration::from_secs(config.restart_backoff_max_secs),
+            config.max_restarts,
+        ),
     );
 
     let monitor_handle = tokio::spawn({

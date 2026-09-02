@@ -453,11 +453,21 @@ pub enum InstanceStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct InstanceStats {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Lifetime restart count (manual and automatic)
     pub restarts: u32,
     pub last_health_check: Option<chrono::DateTime<chrono::Utc>>,
     pub health_check_failures: u32,
     /// Why the instance last transitioned to `Failed`, if it has
     pub last_error: Option<String>,
+    /// When the health monitor last attempted an automatic restart.
+    /// In-memory backoff bookkeeping only; never persisted to the state file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_restart_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Consecutive automatic (health-monitor) restart attempts since the
+    /// instance last passed a health check or was manually restarted. Drives
+    /// restart backoff and the `max_restarts` give-up; `restarts` above keeps
+    /// its lifetime-total meaning.
+    pub backoff_restarts: u32,
 }
 
 impl TeiInstance {
@@ -577,6 +587,17 @@ impl TeiInstance {
             Some(handle) => self.process_manager.exit_status(handle).await,
             None => None,
         }
+    }
+
+    /// Clear automatic-restart backoff bookkeeping.
+    ///
+    /// Called when an operator manually starts or restarts the instance via
+    /// the API: manual intervention means the health monitor should manage the
+    /// instance from a clean slate again (fresh backoff, fresh restart budget).
+    pub async fn reset_restart_backoff(&self) {
+        let mut stats = self.stats.write().await;
+        stats.backoff_restarts = 0;
+        stats.last_restart_at = None;
     }
 
     /// Transition to `Failed`, recording the reason for the API and logs

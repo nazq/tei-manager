@@ -225,6 +225,9 @@ pub async fn start_instance(
             message: e.to_string(),
         })?;
 
+    // Manual intervention: give the health monitor a fresh restart budget
+    instance.reset_restart_backoff().await;
+
     // Wait for instance to be ready in background
     spawn_readiness_watch(instance.clone());
 
@@ -270,6 +273,11 @@ pub async fn restart_instance(
         .map_err(|e| TeiError::Internal {
             message: e.to_string(),
         })?;
+
+    // Manual intervention: clear automatic-restart backoff bookkeeping so the
+    // health monitor manages the instance from a clean slate. The lifetime
+    // `restarts` stat keeps counting as before.
+    instance.reset_restart_backoff().await;
 
     let info = InstanceInfo::from_instance(&instance).await;
 

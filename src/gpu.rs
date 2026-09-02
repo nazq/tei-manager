@@ -65,6 +65,65 @@ impl GpuInfo {
             None => self.devices.iter().filter_map(|d| d.memory_free_mib).min(),
         }
     }
+
+    /// [`Self::free_vram_mib`], falling back to a conservative fraction of
+    /// system memory on unified-memory platforms (Grace / DGX Spark GB10),
+    /// where nvidia-smi reports `[N/A]` for memory.total/memory.free.
+    ///
+    /// The fallback only applies when at least one GPU is visible but none of
+    /// them reports memory — a GPU-less host still returns `None`.
+    pub fn free_vram_mib_or_unified(&self, gpu_id: Option<u32>) -> Option<u64> {
+        self.free_vram_mib_with_meminfo(gpu_id, read_proc_meminfo().as_deref())
+    }
+
+    /// [`Self::free_vram_mib_or_unified`] with `/proc/meminfo` content
+    /// injected, for deterministic tests.
+    pub fn free_vram_mib_with_meminfo(
+        &self,
+        gpu_id: Option<u32>,
+        meminfo: Option<&str>,
+    ) -> Option<u64> {
+        if let Some(vram) = self.free_vram_mib(gpu_id) {
+            return Some(vram);
+        }
+        // Unified memory is only plausible when GPUs are visible yet none of
+        // them reports dedicated memory; otherwise (no GPUs, or a bad gpu_id
+        // alongside GPUs that do report VRAM) stay on the default path.
+        if self.devices.is_empty() || self.devices.iter().any(|d| d.memory_free_mib.is_some()) {
+            return None;
+        }
+        let available_mib = meminfo.and_then(meminfo_available_kib)? / 1024;
+        let budget_mib = available_mib / UNIFIED_MEMORY_DIVISOR;
+        tracing::info!(
+            gpu_id = ?gpu_id,
+            mem_available_mib = available_mib,
+            budget_mib = budget_mib,
+            "GPUs report no dedicated VRAM (unified memory); using {}% of system MemAvailable as the free-VRAM budget",
+            100 / UNIFIED_MEMORY_DIVISOR
+        );
+        Some(budget_mib)
+    }
+}
+
+/// On unified-memory platforms, this fraction (1/N) of `MemAvailable` is
+/// treated as the free-VRAM budget. Conservative on purpose: system memory is
+/// shared with everything else on the box.
+const UNIFIED_MEMORY_DIVISOR: u64 = 4;
+
+/// Parse `MemAvailable` (in KiB) from `/proc/meminfo` content.
+pub fn meminfo_available_kib(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        line.strip_prefix("MemAvailable:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })
+}
+
+/// Read `/proc/meminfo`, if it exists (Linux only).
+pub fn read_proc_meminfo() -> Option<String> {
+    std::fs::read_to_string("/proc/meminfo").ok()
 }
 
 /// Parse `nvidia-smi --query-gpu=index,name,compute_cap,memory.total,memory.free --format=csv,noheader,nounits`
@@ -407,6 +466,71 @@ mod tests {
         assert_eq!(info.devices[0].compute_cap, None);
         assert_eq!(info.free_vram_mib(None), None);
         assert!(parse_nvidia_smi("").devices.is_empty());
+    }
+
+    /// nvidia-smi output on a Grace unified-memory box (DGX Spark GB10)
+    const SMI_UNIFIED: &str = "0, NVIDIA GB10, 12.1, [N/A], [N/A]\n";
+    /// 40 GiB MemAvailable
+    const MEMINFO: &str = "MemTotal:       131072000 kB\nMemFree:        10485760 kB\nMemAvailable:   41943040 kB\nBuffers:          123456 kB\n";
+
+    #[test]
+    fn test_meminfo_available_kib() {
+        assert_eq!(meminfo_available_kib(MEMINFO), Some(41_943_040));
+        // Missing MemAvailable
+        assert_eq!(
+            meminfo_available_kib("MemTotal:       131072000 kB\nMemFree: 1 kB\n"),
+            None
+        );
+        // Garbage value / garbage content / empty
+        assert_eq!(meminfo_available_kib("MemAvailable:   lots kB\n"), None);
+        assert_eq!(meminfo_available_kib("complete garbage\n\x00\x01"), None);
+        assert_eq!(meminfo_available_kib(""), None);
+    }
+
+    #[test]
+    fn test_free_vram_mib_or_unified() {
+        // Unified-memory box: no GPU reports VRAM → 25% of MemAvailable
+        // (41943040 KiB = 40960 MiB → 10240 MiB)
+        let unified = parse_nvidia_smi(SMI_UNIFIED);
+        assert_eq!(
+            unified.free_vram_mib_with_meminfo(None, Some(MEMINFO)),
+            Some(10240)
+        );
+        assert_eq!(
+            unified.free_vram_mib_with_meminfo(Some(0), Some(MEMINFO)),
+            Some(10240)
+        );
+        // No meminfo, or meminfo without MemAvailable → None
+        assert_eq!(unified.free_vram_mib_with_meminfo(None, None), None);
+        assert_eq!(
+            unified.free_vram_mib_with_meminfo(None, Some("MemFree: 1 kB\n")),
+            None
+        );
+
+        // GPU-less host: never consults meminfo
+        assert_eq!(
+            GpuInfo::default().free_vram_mib_with_meminfo(None, Some(MEMINFO)),
+            None
+        );
+
+        // GPUs with real VRAM: unchanged behavior, meminfo ignored
+        let discrete = parse_nvidia_smi(SMI);
+        assert_eq!(
+            discrete.free_vram_mib_with_meminfo(None, Some(MEMINFO)),
+            Some(27662)
+        );
+        assert_eq!(
+            discrete.free_vram_mib_with_meminfo(Some(1), Some(MEMINFO)),
+            Some(80000)
+        );
+
+        // Mixed: some GPU reports VRAM, so a device without memory does not
+        // trigger the unified path
+        let mixed = parse_nvidia_smi("0, Weird, 12.1, [N/A], [N/A]\n1, A100, 8.0, 81920, 80000\n");
+        assert_eq!(
+            mixed.free_vram_mib_with_meminfo(Some(0), Some(MEMINFO)),
+            None
+        );
     }
 
     #[test]

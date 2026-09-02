@@ -47,6 +47,7 @@ The gRPC multiplexer provides a unified endpoint for routing embedding requests 
 
 ### Streaming RPCs
 - `EmbedStream` - Streaming embedding generation
+- `EmbedArrowStream` - Streaming Arrow batch embeddings (one response per request batch, in order)
 - `EmbedSparseStream` - Streaming sparse embeddings
 - `EmbedAllStream` - Streaming all embedding types
 - `PredictStream` - Streaming classification
@@ -152,6 +153,20 @@ bench-client -e http://localhost:9001 -i bge-small \
 bench-client -e http://localhost:9001 -i bge-small \
   --mode arrow --num-texts 100000 --batch-size 1000
 ```
+
+### Streaming Batches (EmbedArrowStream)
+
+Prefer `EmbedArrowStream` over unary `EmbedArrow` when a job spans more than
+one message: each streamed batch only has to fit under
+`grpc_max_message_size_mb` individually — the overall job size is unbounded —
+and the multiplexer pipelines the batches for you, so the client no longer
+juggles multiple in-flight unary RPCs. The **first** request establishes the
+target and all options; subsequent requests contribute only their `arrow_ipc`
+payload. Responses are 1:1 with request batches, in request order, each
+keeping the unary schema contract (nullable `embeddings` + per-row `error`
+columns). See
+[Streaming Batches in the Rust client guide](RUST_CLIENT.md#streaming-batches-embedarrowstream)
+for the full contract and a tonic client example.
 
 ## Performance Benchmarks
 
@@ -312,7 +327,7 @@ tei_mux_requests_total{method="embed", instance="bge-small", status="ok"} 1234
 # outlives the handler)
 tei_mux_request_duration_seconds{method="embed", instance="bge-small"} {...}
 
-# Per-row outcomes of the Arrow batch RPCs (EmbedArrow / EmbedSparseArrow)
+# Per-row outcomes of the Arrow batch RPCs (EmbedArrow / EmbedArrowStream / EmbedSparseArrow)
 tei_mux_rows_total{instance="bge-small", status="ok"} 1200
 ```
 
@@ -361,6 +376,12 @@ bench-client -e http://localhost:9001 -i bge-small \
 - Efficient memory layout for batch processing
 - Dense (`EmbedArrow`): Returns `FixedSizeList<Float32>` for zero-copy access
 - Sparse (`EmbedSparseArrow`): Returns `List<Struct<index:u32, value:f32>>` for variable-length sparse vectors
+
+**Streaming Arrow batches:** for jobs larger than one message, stream IPC
+request batches on a single bidirectional `EmbedArrowStream` RPC instead of
+juggling multiple unary `EmbedArrow` calls — see
+[Streaming Batches (EmbedArrowStream)](#streaming-batches-embedarrowstream)
+for the contract and a client example.
 
 ## Troubleshooting
 

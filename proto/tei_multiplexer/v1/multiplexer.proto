@@ -23,6 +23,16 @@ service TeiMultiplexer {
 
     // Arrow batch embedding - High-performance batch processing
     rpc EmbedArrow (EmbedArrowRequest) returns (EmbedArrowResponse);
+    // Bidirectional streaming variant of EmbedArrow: the client streams IPC
+    // request batches and receives one response per batch, in arrival order.
+    // The FIRST request establishes the target and all options (truncate,
+    // normalize, truncation_direction, prompt_name, dimensions, compression,
+    // output_dtype, noop); on SUBSEQUENT requests only `arrow_ipc` is read
+    // and every other field is ignored. Each response follows the same schema
+    // contract as EmbedArrow: one row per input row, nullable embeddings and
+    // error columns. A batch-level failure (invalid IPC, backend death) ends
+    // the stream with that status; per-row errors ride in the error column.
+    rpc EmbedArrowStream (stream EmbedArrowRequest) returns (stream EmbedArrowResponse);
     rpc EmbedSparseArrow (EmbedSparseArrowRequest) returns (EmbedSparseArrowResponse);
 
     // Predict service - Classification/prediction

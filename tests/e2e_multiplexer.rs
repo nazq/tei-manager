@@ -375,3 +375,116 @@ async fn test_embed_arrow_via_multiplexer_f16_output() {
         assert!((f32_row.value(i) - f16_row.value(i).to_f32()).abs() < 1e-3);
     }
 }
+
+#[tokio::test]
+async fn test_embed_arrow_stream_via_multiplexer_ordered_with_per_row_errors() {
+    use arrow::array::{Array, FixedSizeListArray, StringArray};
+    use arrow::ipc::reader::StreamReader;
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use tei_manager::config::InstanceConfig;
+    use tei_manager::grpc::multiplexer::TeiMultiplexerService;
+    use tei_manager::grpc::pool::BackendPool;
+    use tei_manager::grpc::proto::multiplexer::v1 as mux;
+    use tei_manager::registry::Registry;
+
+    let tei = TeiContainer::start_dense(DENSE_MODEL)
+        .await
+        .expect("Failed to start dense TEI container");
+
+    let registry = Arc::new(Registry::new(
+        None,
+        "text-embeddings-router".to_string(),
+        8080,
+        8180,
+    ));
+    registry
+        .add(InstanceConfig {
+            name: "e2e-stream".to_string(),
+            model_id: DENSE_MODEL.to_string(),
+            port: tei.grpc_port(),
+            ..Default::default()
+        })
+        .await
+        .expect("registry add");
+    let service = TeiMultiplexerService::new(BackendPool::new(registry), 1024, 60);
+
+    // The first request fixes target and options (truncate=false). Batch 2
+    // contains an over-long row that TEI must reject per-row; it also sets
+    // truncate=true, which must be IGNORED — otherwise the row would embed.
+    let too_long = "word ".repeat(3000);
+    let first = mux::EmbedArrowRequest {
+        target: Some(mux::Target {
+            routing: Some(mux::target::Routing::InstanceName("e2e-stream".to_string())),
+        }),
+        arrow_ipc: create_arrow_batch(&["Hello world", "Rust is great"]),
+        truncate: false,
+        normalize: true,
+        ..Default::default()
+    };
+    let second = mux::EmbedArrowRequest {
+        arrow_ipc: create_arrow_batch(&["a fine row", &too_long]),
+        truncate: true, // ignored: options come from the first request
+        ..Default::default()
+    };
+    let third = mux::EmbedArrowRequest {
+        arrow_ipc: create_arrow_batch(&["later batches still embed"]),
+        ..Default::default()
+    };
+
+    let stream = service
+        .embed_arrow_stream_core(tokio_stream::iter(vec![
+            Ok::<_, tonic::Status>(first),
+            Ok(second),
+            Ok(third),
+        ]))
+        .await
+        .expect("embed_arrow_stream");
+
+    let mut batches = Vec::new();
+    let mut stream = stream;
+    while let Some(result) = tokio_stream::StreamExt::next(&mut stream).await {
+        let response = result.expect("stream error");
+        let mut reader = StreamReader::try_new(Cursor::new(response.arrow_ipc), None).unwrap();
+        batches.push(reader.next().unwrap().unwrap());
+    }
+
+    assert_eq!(batches.len(), 3, "one response per request batch, in order");
+    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(batches[1].num_rows(), 2);
+    assert_eq!(batches[2].num_rows(), 1);
+
+    for batch in &batches {
+        let emb = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(emb.value_length(), 384);
+    }
+
+    // Batch 1: all rows embed
+    assert_eq!(batches[0].column(0).null_count(), 0);
+
+    // Batch 2: row 0 embeds, row 1 (over-long, truncate=false) carries a
+    // per-row error without failing the batch or the stream
+    let emb = batches[1]
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .unwrap();
+    let err = batches[1]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(emb.is_valid(0) && err.is_null(0));
+    assert!(emb.is_null(1), "over-long row must be null");
+    assert!(
+        !err.value(1).is_empty(),
+        "over-long row must carry a reason"
+    );
+
+    // Batch 3: later batches still embed after a per-row failure
+    assert_eq!(batches[2].column(0).null_count(), 0);
+}

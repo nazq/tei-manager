@@ -363,6 +363,90 @@ impl TeiMultiplexerService {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(matches[i % matches.len()].clone())
     }
+
+    /// Core of the `EmbedArrowStream` RPC, generic over the inbound stream so
+    /// it can be driven by tonic's `Streaming` as well as plain streams in
+    /// tests (mirroring how `embed_rows` is tested via generic streams).
+    ///
+    /// The FIRST request establishes the target and all options; subsequent
+    /// requests contribute only their `arrow_ipc` payload. Batches run
+    /// through the same pipeline as the unary `EmbedArrow`, sequentially in
+    /// arrival order, each yielding exactly one response. A batch-level
+    /// failure (invalid IPC, backend death, timeout) is sent as `Err(Status)`
+    /// and terminates the stream; per-row errors ride in the `error` column.
+    pub async fn embed_arrow_stream_core<S>(
+        &self,
+        mut stream: S,
+    ) -> Result<
+        tokio_stream::wrappers::ReceiverStream<Result<mux::EmbedArrowResponse, Status>>,
+        Status,
+    >
+    where
+        S: futures::Stream<Item = Result<mux::EmbedArrowRequest, Status>> + Unpin + Send + 'static,
+    {
+        let mut mux_metrics = MuxRequestMetrics::stream("embed_arrow_stream");
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("Empty stream"))?
+            .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
+
+        let instance_name = self.resolve_target(first.target.clone()).await?;
+        Span::current().record("tei.instance", instance_name.as_str());
+        mux_metrics.set_instance(&instance_name);
+
+        let job = ArrowStreamJob {
+            instance: instance_name.clone(),
+            // Noop mode never dials the backend, exactly like the unary RPC.
+            embed: if first.noop {
+                None
+            } else {
+                Some(self.pool.get_clients(&instance_name).await?.embed.clone())
+            },
+            opts: EmbedArrowOptions::from_request(&first),
+            output_dtype: self.output_dtype(first.output_dtype)?,
+            compression: first.compression,
+            timeout: self.request_timeout,
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(self.max_parallel_stream_requests);
+        tokio::spawn(async move {
+            let mut next_ipc = Some(first.arrow_ipc);
+            loop {
+                let ipc = match next_ipc.take() {
+                    Some(ipc) => ipc,
+                    None => match stream.next().await {
+                        None => break,
+                        // Only `arrow_ipc` is read on requests after the
+                        // first; target/options are fixed by the first one.
+                        Some(Ok(req)) => req.arrow_ipc,
+                        Some(Err(e)) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!("Stream error: {}", e))))
+                                .await;
+                            break;
+                        }
+                    },
+                };
+                match job.run_batch(&ipc).await {
+                    Ok(response) => {
+                        if tx.send(Ok(response)).await.is_err() {
+                            break; // client hung up
+                        }
+                    }
+                    Err(status) => {
+                        // A failure the unary RPC would return as a Status
+                        // terminates the stream, matching tonic semantics.
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
+                }
+            }
+        });
+
+        mux_metrics.set_ok();
+        Ok(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
 }
 
 #[tonic::async_trait]
@@ -773,8 +857,8 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         request: Request<mux::EmbedArrowRequest>,
     ) -> Result<Response<mux::EmbedArrowResponse>, Status> {
         let mut mux_metrics = MuxRequestMetrics::unary("embed_arrow");
-        let req = request.into_inner();
-        let instance_name = self.resolve_target(req.target).await?;
+        let mut req = request.into_inner();
+        let instance_name = self.resolve_target(req.target.take()).await?;
         mux_metrics.set_instance(&instance_name);
         Span::current().record("tei.instance", instance_name.as_str());
 
@@ -792,25 +876,9 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
             RowOutcomes::noop(rows.len(), || vec![0.0f32; NOOP_EMBEDDING_DIM])
         } else {
             let clients = self.pool.get_clients(&instance_name).await?;
-            let truncate = req.truncate;
-            let normalize = Some(req.normalize);
-            let truncation_direction = req.truncation_direction;
-            let prompt_name = req.prompt_name.clone();
-            let dimensions = req.dimensions;
-            let build = |text: &str| tei::EmbedRequest {
-                inputs: text.to_string(),
-                truncate,
-                normalize,
-                truncation_direction,
-                prompt_name: prompt_name.clone(),
-                dimensions,
-            };
-            let embed = clients.embed.clone();
-            self.with_timeout(embed_rows(rows, build, embed, |mut c, s| {
-                Box::pin(async move { c.embed_stream(s).await.map(Response::into_inner) })
-            }))
-            .await?
-            .map(|r| r.embeddings)
+            let opts = EmbedArrowOptions::from_request(&req);
+            self.with_timeout(embed_dense_rows(rows, opts, clients.embed.clone()))
+                .await?
         };
 
         record_mux_rows(&instance_name, &outcome);
@@ -819,6 +887,18 @@ impl mux::tei_multiplexer_server::TeiMultiplexer for TeiMultiplexerService {
         let buffer = arrow_batch::serialize(&batch, req.compression)?;
         mux_metrics.set_ok();
         Ok(Response::new(mux::EmbedArrowResponse { arrow_ipc: buffer }))
+    }
+
+    type EmbedArrowStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<mux::EmbedArrowResponse, Status>>;
+
+    #[instrument(name = "tei.embed_arrow_stream_rpc", skip_all, fields(tei.instance))]
+    async fn embed_arrow_stream(
+        &self,
+        request: Request<Streaming<mux::EmbedArrowRequest>>,
+    ) -> Result<Response<Self::EmbedArrowStreamStream>, Status> {
+        let stream = request.into_inner();
+        Ok(Response::new(self.embed_arrow_stream_core(stream).await?))
     }
 
     #[instrument(
@@ -912,6 +992,99 @@ impl<T> RowOutcomes<T> {
 
 /// Error reported for a null input text.
 const NULL_INPUT_ERROR: &str = "input text is null";
+
+/// Backend client for the dense embed RPCs.
+type DenseEmbedClient = tei::embed_client::EmbedClient<super::pool::BackendChannel>;
+
+/// Per-row request options for a dense Arrow embedding job, fixed for its
+/// lifetime (one unary `EmbedArrow` call, or one whole `EmbedArrowStream`).
+#[derive(Clone)]
+struct EmbedArrowOptions {
+    truncate: bool,
+    normalize: bool,
+    truncation_direction: i32,
+    prompt_name: Option<String>,
+    dimensions: Option<u32>,
+}
+
+impl EmbedArrowOptions {
+    fn from_request(req: &mux::EmbedArrowRequest) -> Self {
+        Self {
+            truncate: req.truncate,
+            normalize: req.normalize,
+            truncation_direction: req.truncation_direction,
+            prompt_name: req.prompt_name.clone(),
+            dimensions: req.dimensions,
+        }
+    }
+}
+
+/// Stream `rows` through the backend dense embed RPC with `opts` applied to
+/// every row, keeping the per-row error handling of `embed_rows`.
+async fn embed_dense_rows(
+    rows: Vec<Option<String>>,
+    opts: EmbedArrowOptions,
+    embed: DenseEmbedClient,
+) -> Result<RowOutcomes<Vec<f32>>, Status> {
+    let build = |text: &str| tei::EmbedRequest {
+        inputs: text.to_string(),
+        truncate: opts.truncate,
+        normalize: Some(opts.normalize),
+        truncation_direction: opts.truncation_direction,
+        prompt_name: opts.prompt_name.clone(),
+        dimensions: opts.dimensions,
+    };
+    Ok(embed_rows(rows, build, embed, |mut c, s| {
+        Box::pin(async move { c.embed_stream(s).await.map(Response::into_inner) })
+    })
+    .await?
+    .map(|r| r.embeddings))
+}
+
+/// Everything fixed by the first request of an `EmbedArrowStream` call.
+struct ArrowStreamJob {
+    /// Resolved backend instance name (metrics label)
+    instance: String,
+    /// Backend dense-embed client; `None` in noop mode (backend never dialed).
+    embed: Option<DenseEmbedClient>,
+    opts: EmbedArrowOptions,
+    output_dtype: ArrowOutputDtype,
+    compression: i32,
+    /// Per-batch timeout (`None` = no timeout), mirroring the unary RPC.
+    timeout: Option<Duration>,
+}
+
+impl ArrowStreamJob {
+    /// Run one request batch through the same pipeline as the unary
+    /// `EmbedArrow`: parse rows, embed (or noop), build the dense batch and
+    /// serialize it.
+    #[instrument(
+        name = "tei.embed_arrow_batch",
+        skip_all,
+        fields(tei.rows, tei.rows_failed)
+    )]
+    async fn run_batch(&self, ipc: &[u8]) -> Result<mux::EmbedArrowResponse, Status> {
+        let rows = arrow_batch::parse_text_rows(ipc)?;
+        Span::current().record("tei.rows", rows.len());
+        let outcome: RowOutcomes<Vec<f32>> = match &self.embed {
+            None => RowOutcomes::noop(rows.len(), || vec![0.0f32; NOOP_EMBEDDING_DIM]),
+            Some(embed) => {
+                let fut = embed_dense_rows(rows, self.opts.clone(), embed.clone());
+                match self.timeout {
+                    Some(duration) => timeout(duration, fut)
+                        .await
+                        .map_err(|_| Status::deadline_exceeded("Request timeout"))?,
+                    None => fut.await,
+                }?
+            }
+        };
+        record_mux_rows(&self.instance, &outcome);
+        Span::current().record("tei.rows_failed", outcome.rows.len() - outcome.ok_count());
+        let batch = arrow_batch::dense_batch(&outcome, self.output_dtype)?;
+        let buffer = arrow_batch::serialize(&batch, self.compression)?;
+        Ok(mux::EmbedArrowResponse { arrow_ipc: buffer })
+    }
+}
 
 /// Stream `rows` through a TEI streaming RPC, tolerating per-row failures.
 ///
@@ -2752,6 +2925,146 @@ mod tests {
         let batch = reader.next().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 2);
+    }
+
+    // ========================================================================
+    // EmbedArrowStream RPC Tests
+    // ========================================================================
+
+    /// Noop request carrying `texts` as its IPC batch; `target` only on the
+    /// first request of a stream.
+    fn arrow_stream_request(texts: &[&str], with_target: bool) -> mux::EmbedArrowRequest {
+        mux::EmbedArrowRequest {
+            target: with_target.then(|| mux::Target {
+                routing: Some(mux::target::Routing::InstanceName("test".to_string())),
+            }),
+            arrow_ipc: ipc_from_array(Arc::new(StringArray::from(texts.to_vec())), "text"),
+            noop: true,
+            ..Default::default()
+        }
+    }
+
+    /// Drain the response stream, decoding each IPC payload to a RecordBatch.
+    async fn collect_arrow_stream(
+        mut stream: tokio_stream::wrappers::ReceiverStream<Result<mux::EmbedArrowResponse, Status>>,
+    ) -> Vec<Result<RecordBatch, Status>> {
+        let mut out = Vec::new();
+        while let Some(result) = stream.next().await {
+            out.push(result.map(|response| {
+                let mut reader =
+                    StreamReader::try_new(Cursor::new(response.arrow_ipc), None).unwrap();
+                reader.next().unwrap().unwrap()
+            }));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_noop_batches_in_order() {
+        let service = create_test_service();
+        let requests = vec![
+            Ok(arrow_stream_request(&["a", "b"], true)),
+            Ok(arrow_stream_request(&["c", "d", "e"], false)),
+            Ok(arrow_stream_request(&["f"], false)),
+        ];
+        let stream = service
+            .embed_arrow_stream_core(tokio_stream::iter(requests))
+            .await
+            .unwrap();
+        let batches = collect_arrow_stream(stream).await;
+        assert_eq!(batches.len(), 3);
+        let rows: Vec<usize> = batches
+            .into_iter()
+            .map(|b| {
+                let b = b.unwrap();
+                assert_eq!(b.num_columns(), 2);
+                assert_eq!(b.schema().field(0).name(), "embeddings");
+                assert_eq!(b.schema().field(1).name(), "error");
+                b.num_rows()
+            })
+            .collect();
+        assert_eq!(rows, vec![2, 3, 1], "responses arrive in request order");
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_first_request_missing_target() {
+        let service = create_test_service();
+        let requests = vec![Ok(arrow_stream_request(&["a"], false))];
+        let err = service
+            .embed_arrow_stream_core(tokio_stream::iter(requests))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Missing target"));
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_later_options_ignored() {
+        use arrow::array::FixedSizeListArray;
+        let service = create_test_service();
+        let mut first = arrow_stream_request(&["a"], true);
+        first.output_dtype = mux::OutputDtype::F16 as i32;
+        // The second request tries to flip the dtype (and drops noop); only
+        // its arrow_ipc may be read.
+        let mut second = arrow_stream_request(&["b", "c"], false);
+        second.output_dtype = mux::OutputDtype::F32 as i32;
+        second.noop = false;
+
+        let stream = service
+            .embed_arrow_stream_core(tokio_stream::iter(vec![Ok(first), Ok(second)]))
+            .await
+            .unwrap();
+        let batches = collect_arrow_stream(stream).await;
+        assert_eq!(batches.len(), 2);
+        for (batch, expected_rows) in batches.into_iter().zip([1usize, 2]) {
+            let batch = batch.unwrap();
+            assert_eq!(batch.num_rows(), expected_rows);
+            let emb = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+            assert_eq!(
+                emb.value_type(),
+                DataType::Float16,
+                "dtype comes from the first request only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_empty_stream() {
+        let service = create_test_service();
+        let err = service
+            .embed_arrow_stream_core(tokio_stream::iter(Vec::<
+                Result<mux::EmbedArrowRequest, Status>,
+            >::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Empty stream"));
+    }
+
+    #[tokio::test]
+    async fn test_embed_arrow_stream_bad_batch_terminates_stream() {
+        let service = create_test_service();
+        let mut bad = arrow_stream_request(&[], false);
+        bad.arrow_ipc = vec![1, 2, 3, 4]; // invalid Arrow IPC
+        let requests = vec![
+            Ok(arrow_stream_request(&["a"], true)),
+            Ok(bad),
+            Ok(arrow_stream_request(&["never processed"], false)),
+        ];
+        let stream = service
+            .embed_arrow_stream_core(tokio_stream::iter(requests))
+            .await
+            .unwrap();
+        let batches = collect_arrow_stream(stream).await;
+        assert_eq!(batches.len(), 2, "stream ends at the failing batch");
+        assert_eq!(batches[0].as_ref().unwrap().num_rows(), 1);
+        let err = batches[1].as_ref().unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Invalid Arrow IPC"));
     }
 
     // ========================================================================

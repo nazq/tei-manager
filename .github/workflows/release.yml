@@ -133,3 +133,23 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ needs.build-config.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push slim image
+        if: ${{ matrix.variant.name != 'cpu' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: slim
+          push: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}-slim
+          build-args: |
+            TEI_VARIANT=${{ matrix.variant.tei_variant }}
+            TEI_VERSION=${{ matrix.tei_version }}
+            VARIANT_NAME=${{ matrix.variant.name == 'default' && '' || matrix.variant.name }}
+            VARIANT_DESC=${{ matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || matrix.variant.name == 'blackwell' && ' - Optimized for RTX 5090/5080 (sm_120)' || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.version=${{ needs.build-config.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+

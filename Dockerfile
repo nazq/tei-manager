@@ -50,6 +50,9 @@
 # Build arguments
 ARG TEI_VARIANT=
 ARG TEI_VERSION=1.9.2
+# Full TEI base image override (e.g. a digest-pinned rolling image for
+# arches without a tagged upstream release); empty = the upstream tag below
+ARG TEI_IMAGE=
 ARG VARIANT_SUFFIX=
 ARG VARIANT_NAME=
 ARG VARIANT_DESC=
@@ -121,6 +124,80 @@ RUN cargo build --release --target x86_64-unknown-linux-musl --locked && \
 ARG TEI_VARIANT
 ARG TEI_VERSION
 FROM ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-grpc AS tei
+
+# ============================================================================
+# Slim stages — pruned burst runtime, built from scratch like the fat image
+# (TEI base + our builder; never FROM a published tei-manager tag)
+# ============================================================================
+# The router links no CUDA libraries (candle dlopens at runtime); the full GPU
+# embed path needs exactly five: nvrtc, cuBLAS, cuBLASLt, cuRAND, cudart —
+# proven with bge-m3 fp16 (FlashBert on CUDA, 10,250 rows/s, 0 failures).
+# NCCL/NPP/cuSPARSE/cuSOLVER/cuFFT and the datacenter-only cuda-compat shim
+# are ballast on burst hosts. 5.17 GB → 2.55 GB; compressed pull 3.17 GB →
+# 1.48 GB (gzip). Field-proven: pull-to-serving 240 s on a 1 Gb/s vast host
+# where the fat image never finished inside a 20-minute window.
+#
+# Trap encoded here: docker COPY dereferences symlinks, so copying lib globs
+# doubles every library. The cudalibs stage resolves each soname to its real
+# file at build time (version-agnostic) and the loader symlinks are recreated.
+FROM ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:${TEI_VARIANT}${TEI_VERSION}-grpc} AS cudalibs
+# Real files only — a symlink here would be dereferenced by the later COPY
+# and double every library. The soname links are recreated via mklinks.sh.
+RUN mkdir /cudalibs && cd /usr/local/cuda/lib64 && \
+    for so in libnvrtc.so.12 libnvrtc-builtins.so.12.9 libnvJitLink.so.12 \
+              libcublas.so.12 libcublasLt.so.12 libcurand.so.10 libcudart.so.12; do \
+        real=$(readlink -f "$so") && cp "$real" /cudalibs/ && \
+        echo "ln -sf $(basename "$real") $so" >> /cudalibs/mklinks.sh; \
+    done
+
+FROM ubuntu:24.04 AS slim
+ARG VARIANT_NAME
+ARG VARIANT_DESC
+LABEL org.opencontainers.image.title="TEI Manager Slim${VARIANT_NAME:+ (${VARIANT_NAME})}"
+LABEL org.opencontainers.image.description="Dynamic TEI Instance Manager (slim burst runtime)${VARIANT_DESC}"
+LABEL org.opencontainers.image.source="https://github.com/nazq/tei-manager"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+ARG S6_OVERLAY_VERSION=3.2.0.2
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl libssl3 jq xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+# s6-overlay (same init as the fat image)
+RUN case "${TARGETARCH}" in \
+    "amd64")  S6_ARCH=x86_64  ;; \
+    "arm64")  S6_ARCH=aarch64 ;; \
+    "arm")    S6_ARCH=armhf   ;; \
+    *)        S6_ARCH=${TARGETARCH} ;; \
+    esac && \
+    curl -L "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz" -o /tmp/n.tar.xz && \
+    curl -L "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz" -o /tmp/a.tar.xz && \
+    tar -C / -Jxpf /tmp/n.tar.xz && tar -C / -Jxpf /tmp/a.tar.xz && rm /tmp/n.tar.xz /tmp/a.tar.xz
+COPY --from=cudalibs /cudalibs/ /usr/local/cuda/lib64/
+RUN cd /usr/local/cuda/lib64 && sh mklinks.sh && rm mklinks.sh && \
+    echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda.conf && ldconfig
+ARG TEI_VARIANT
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
+    HUGGINGFACE_HUB_CACHE=/data \
+    USE_FLASH_ATTENTION=True \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    TEI_VARIANT=${TEI_VARIANT}
+COPY --from=tei /usr/local/bin/text-embeddings-router /usr/local/bin/text-embeddings-router
+COPY --from=builder /tmp/tei-manager /usr/local/bin/tei-manager
+COPY --from=builder /tmp/bench-client /usr/local/bin/bench-client
+RUN mkdir -p /data && chmod 777 /data
+COPY config/tei-manager.toml /etc/tei-manager/config/tei-manager.toml
+RUN mkdir -p /etc/s6-overlay/s6-rc.d/tei-manager/dependencies.d /etc/s6-overlay/s6-rc.d/user/contents.d && \
+    echo '#!/command/execlineb -P' > /etc/s6-overlay/s6-rc.d/tei-manager/run && \
+    echo '/usr/local/bin/tei-manager -c /etc/tei-manager/config/tei-manager.toml' >> /etc/s6-overlay/s6-rc.d/tei-manager/run && \
+    chmod +x /etc/s6-overlay/s6-rc.d/tei-manager/run && \
+    echo 'longrun' > /etc/s6-overlay/s6-rc.d/tei-manager/type && \
+    touch /etc/s6-overlay/s6-rc.d/tei-manager/dependencies.d/base && \
+    touch /etc/s6-overlay/s6-rc.d/user/contents.d/tei-manager
+EXPOSE 9000 9001
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD ["sh", "-c", "curl -f http://localhost:${TEI_MANAGER_API_PORT:-9000}/health || exit 1"]
+ENTRYPOINT ["/init"]
 
 # ============================================================================
 # Runtime stage - Use TEI image as base (has CUDA support)

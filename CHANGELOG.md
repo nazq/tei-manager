@@ -5,6 +5,13 @@ All notable changes to TEI Manager will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0](https://github.com/nazq/tei-manager/compare/v0.19.0...v0.20.0) (2026-09-29)
+
+
+### Features
+
+* update TEI to 1.9.4 and add DGX Spark (sm_121) variant ([#119](https://github.com/nazq/tei-manager/issues/119)) ([eb621fc](https://github.com/nazq/tei-manager/commit/eb621fcf359a5177485ed5ef3523a5015b319449))
+
 ## [0.19.0](https://github.com/nazq/tei-manager/compare/v0.18.0...v0.19.0) (2026-09-04)
 
 

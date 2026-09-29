@@ -28,7 +28,7 @@ What actually happened. Include error messages.
 ## Environment
 
 - **TEI Manager version**: (from `tei-manager --version`)
-- **Docker image tag**: (e.g., `0.11.0-tei-1.9.2-ada`)
+- **Docker image tag**: (e.g., `0.19.0-tei-1.9.4-ada`)
 - **GPU**: (e.g., RTX 4090, H100)
 - **CUDA version**: (output of `nvidia-smi`)
 - **OS**: (e.g., Ubuntu 22.04)

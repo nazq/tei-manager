@@ -10,7 +10,7 @@
 [tei]
 # TEI versions supported by this release
 # Build matrix will create images for each version × variant combination
-versions = ["1.9.2"]
+versions = ["1.9.4"]
 
 [variants]
 # Docker variants to build (maps to build-all-variants.sh)
@@ -44,3 +44,8 @@ description = "Hopper (H100/H200 optimized)"
 tei_variant = "120-"
 suffix = "-blackwell"
 description = "Blackwell (RTX 5090/5080, sm_120)"
+
+[variants.spark]
+tei_variant = "121-"
+suffix = "-spark"
+description = "DGX Spark (GB10, sm_121, linux/arm64)"

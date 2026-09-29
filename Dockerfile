@@ -4,7 +4,7 @@
 #
 # Build arguments for variant selection:
 #   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"120-"/"cpu-")
-#   TEI_VERSION       - TEI version (default: 1.9.2)
+#   TEI_VERSION       - TEI version (default: 1.9.4)
 #   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"blackwell"/"cpu")
 #   VARIANT_NAME      - Human-readable variant name for labels
 #   VARIANT_DESC      - Additional description for labels
@@ -49,7 +49,7 @@
 
 # Build arguments
 ARG TEI_VARIANT=
-ARG TEI_VERSION=1.9.2
+ARG TEI_VERSION=1.9.4
 # Full TEI base image override (e.g. a digest-pinned rolling image for
 # arches without a tagged upstream release); empty = the upstream tag below
 ARG TEI_IMAGE=

@@ -64,10 +64,11 @@ jobs:
       - name: Parse release config
         id: config
         run: |
-          # Get version from release-please or Cargo.toml
-          if [[ -n "${{ needs.release-please.outputs.version }}" ]]; then
-            VERSION="${{ needs.release-please.outputs.version }}"
-          else
+          # Get version from release-please or Cargo.toml. On workflow_dispatch
+          # release-please emits empty components (version ".."), so require a
+          # real semver before trusting it.
+          VERSION="${{ needs.release-please.outputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -79,13 +80,14 @@ jobs:
           echo "TEI versions: $TEI_VERSIONS"
 
           # Build variants JSON array
-          VARIANTS='[{"name":"default","tei_variant":"","suffix":""},{"name":"cpu","tei_variant":"cpu-","suffix":"-cpu"},{"name":"ada","tei_variant":"89-","suffix":"-ada"},{"name":"hopper","tei_variant":"hopper-","suffix":"-hopper"},{"name":"blackwell","tei_variant":"120-","suffix":"-blackwell"}]'
+          VARIANTS='[{"name":"default","tei_variant":"","suffix":""},{"name":"cpu","tei_variant":"cpu-","suffix":"-cpu"},{"name":"ada","tei_variant":"89-","suffix":"-ada"},{"name":"hopper","tei_variant":"hopper-","suffix":"-hopper"},{"name":"blackwell","tei_variant":"120-","suffix":"-blackwell"},{"name":"spark","tei_variant":"121-","suffix":"-spark","runner":"ubuntu-24.04-arm","platform":"linux/arm64"}]'
           echo "variants=$VARIANTS" >> "$GITHUB_OUTPUT"
 
   build-and-push:
     name: Build ${{ matrix.variant.name }} (TEI ${{ matrix.tei_version }})
     needs: build-config
-    runs-on: ubuntu-latest
+    # arm64 variants (spark) build natively on GitHub's arm runners
+    runs-on: ${{ matrix.variant.runner || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,6 +122,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: ${{ matrix.variant.platform || 'linux/amd64' }}
           push: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}
           build-args: |
@@ -127,7 +130,7 @@ jobs:
             TEI_VERSION=${{ matrix.tei_version }}
             VARIANT_SUFFIX=${{ matrix.variant.name }}
             VARIANT_NAME=${{ matrix.variant.name == 'default' && '' || matrix.variant.name }}
-            VARIANT_DESC=${{ matrix.variant.name == 'cpu' && ' - CPU-only, no GPU required' || matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || matrix.variant.name == 'blackwell' && ' - Optimized for RTX 5090/5080 (sm_120)' || '' }}
+            VARIANT_DESC=${{ matrix.variant.name == 'cpu' && ' - CPU-only, no GPU required' || matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || matrix.variant.name == 'blackwell' && ' - Optimized for RTX 5090/5080 (sm_120)' || matrix.variant.name == 'spark' && ' - DGX Spark GB10 (sm_121, arm64)' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |
@@ -139,6 +142,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: ${{ matrix.variant.platform || 'linux/amd64' }}
           target: slim
           push: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.tag }}-slim
@@ -146,7 +150,7 @@ jobs:
             TEI_VARIANT=${{ matrix.variant.tei_variant }}
             TEI_VERSION=${{ matrix.tei_version }}
             VARIANT_NAME=${{ matrix.variant.name == 'default' && '' || matrix.variant.name }}
-            VARIANT_DESC=${{ matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || matrix.variant.name == 'blackwell' && ' - Optimized for RTX 5090/5080 (sm_120)' || '' }}
+            VARIANT_DESC=${{ matrix.variant.name == 'ada' && ' - Optimized for RTX 4090/4080' || matrix.variant.name == 'hopper' && ' for H100/H200 GPUs' || matrix.variant.name == 'blackwell' && ' - Optimized for RTX 5090/5080 (sm_120)' || matrix.variant.name == 'spark' && ' - DGX Spark GB10 (sm_121, arm64)' || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |

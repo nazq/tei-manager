@@ -4,7 +4,7 @@
 #
 # Build arguments for variant selection:
 #   TEI_VARIANT       - TEI base image variant prefix (empty/"89-"/"hopper-"/"120-"/"cpu-")
-#   TEI_VERSION       - TEI version (default: 1.9.2)
+#   TEI_VERSION       - TEI version (default: 1.9.4)
 #   VARIANT_SUFFIX    - Image tag suffix (empty/"ada"/"hopper"/"blackwell"/"cpu")
 #   VARIANT_NAME      - Human-readable variant name for labels
 #   VARIANT_DESC      - Additional description for labels
@@ -49,7 +49,7 @@
 
 # Build arguments
 ARG TEI_VARIANT=
-ARG TEI_VERSION=1.9.2
+ARG TEI_VERSION=1.9.4
 # Full TEI base image override (e.g. a digest-pinned rolling image for
 # arches without a tagged upstream release); empty = the upstream tag below
 ARG TEI_IMAGE=
@@ -91,15 +91,21 @@ RUN apt-get update && apt-get install -y \
     musl-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# Add musl target for static linking (works on any Linux distro)
-RUN rustup target add x86_64-unknown-linux-musl
+# Add musl target for static linking (works on any Linux distro).
+# Resolved from TARGETARCH so the same stage builds natively on amd64 and
+# arm64 (spark) runners.
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+      arm64) echo aarch64-unknown-linux-musl > /rust-target ;; \
+      *)     echo x86_64-unknown-linux-musl  > /rust-target ;; \
+    esac && rustup target add "$(cat /rust-target)"
 
 # Copy recipe from planner stage
 COPY --from=planner /build/recipe.json recipe.json
 
 # Build dependencies only - this layer is cached unless Cargo.toml/Cargo.lock change
 # This is the key optimization: dependencies are built in a separate layer
-RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+RUN cargo chef cook --release --target "$(cat /rust-target)" --recipe-path recipe.json
 
 # Copy build script and proto files for gRPC compilation
 COPY build.rs ./
@@ -113,10 +119,10 @@ COPY src ./src
 COPY benches ./benches
 
 # Build the actual binaries - only recompiles if source changed
-RUN cargo build --release --target x86_64-unknown-linux-musl --locked && \
-    cargo build --release --target x86_64-unknown-linux-musl --bin bench-client --locked && \
-    cp target/x86_64-unknown-linux-musl/release/tei-manager /tmp/tei-manager && \
-    cp target/x86_64-unknown-linux-musl/release/bench-client /tmp/bench-client
+RUN cargo build --release --target "$(cat /rust-target)" --locked && \
+    cargo build --release --target "$(cat /rust-target)" --bin bench-client --locked && \
+    cp "target/$(cat /rust-target)/release/tei-manager" /tmp/tei-manager && \
+    cp "target/$(cat /rust-target)/release/bench-client" /tmp/bench-client
 
 # ============================================================================
 # TEI stage - Extract text-embeddings-router binary

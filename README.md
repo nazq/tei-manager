@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![codecov](https://codecov.io/gh/nazq/tei-manager/branch/main/graph/badge.svg)](https://codecov.io/gh/nazq/tei-manager)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](Dockerfile)
-[![TEI](https://img.shields.io/badge/TEI-1.9.2-purple.svg)](https://github.com/huggingface/text-embeddings-inference)
+[![TEI](https://img.shields.io/badge/TEI-1.9.4-purple.svg)](https://github.com/huggingface/text-embeddings-inference)
 
 Dynamic multi-instance manager for [HuggingFace Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) (TEI). Run multiple embedding models simultaneously with intelligent resource management, health monitoring, and automatic recovery.
 
@@ -95,6 +95,7 @@ TEI Manager images are built on the [TEI gRPC base images](https://github.com/hu
 | Ada | `-ada` | `text-embeddings-inference:89-{tei}-grpc` | RTX 40xx, L4, L40, L40S |
 | Hopper | `-hopper` | `text-embeddings-inference:hopper-{tei}-grpc` | H100, H200 |
 | Blackwell | `-blackwell` | `text-embeddings-inference:120-{tei}-grpc` | RTX 50xx (5090, 5080) |
+| Spark | `-spark` | `text-embeddings-inference:121-{tei}-grpc` | DGX Spark (GB10, sm_121, linux/arm64) |
 
 ---
 
@@ -109,6 +110,7 @@ docker pull ghcr.io/nazq/tei-manager:<version>-cpu     # CPU-only (no GPU)
 docker pull ghcr.io/nazq/tei-manager:<version>-ada     # Ada (RTX 40xx, L4, L40, L40S)
 docker pull ghcr.io/nazq/tei-manager:<version>-hopper  # Hopper (H100, H200)
 docker pull ghcr.io/nazq/tei-manager:<version>-blackwell  # Blackwell (RTX 5090, 5080)
+docker pull ghcr.io/nazq/tei-manager:<version>-spark  # DGX Spark (GB10, arm64)
 
 # Run with GPU support
 docker run -d --gpus all \
@@ -419,7 +421,7 @@ deployment_environment = "dev"
 
 ### Running on rented GPUs (vast.ai, RunPod)
 
-For rentals, prefer the **`-slim` variants**, published for every GPU variant (`<version>-tei-<tei>-<variant>-slim`, e.g. `0.19.0-tei-1.9.2-blackwell-slim`): a pruned drop-in runtime carrying only the five CUDA libraries the router actually loads — 2.55 GB vs 5.17 GB, roughly half the pull on a fresh host, GPU-verified at full throughput. Recipe: the `slim` target of the main Dockerfile — built from scratch (TEI base + our builder) in the same release run as the full images; layer deployment-specific certs/config on top. The CPU variant has no slim twin — it is already ~273 MB compressed.
+For rentals, prefer the **`-slim` variants**, published for every GPU variant (`<version>-tei-<tei>-<variant>-slim`, e.g. `0.19.0-tei-1.9.4-blackwell-slim`): a pruned drop-in runtime carrying only the five CUDA libraries the router actually loads — 2.55 GB vs 5.17 GB, roughly half the pull on a fresh host, GPU-verified at full throughput. Recipe: the `slim` target of the main Dockerfile — built from scratch (TEI base + our builder) in the same release run as the full images; layer deployment-specific certs/config on top. The CPU variant has no slim twin — it is already ~273 MB compressed.
 
 - Pick the image for the card (see [Docker Images](#docker-images)). On start, tei-manager compares every visible GPU's compute capability with the TEI build in the image and logs a mismatch with the tag to use instead (`gpu_preflight = "fail"` turns that into a hard stop).
 - The same preflight compares the host driver's supported CUDA version (from the `nvidia-smi` banner) with the CUDA userspace the image requires (`NVIDIA_REQUIRE_CUDA`). Rental hosts often run older drivers: e.g. driver 570 supports CUDA 12.8, and under a CUDA 12.9 image TEI gets `CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE` and silently serves embeddings on CPU, ~50x slower, behind green health. As a second line of defense, when an instance first reports healthy its TEI log is scanned for `Using CPU instead`: with `gpu_fallback = "fail"` (default) the instance is marked `failed` with the log line as the reason; `"warn"` keeps it running and surfaces the line in the instance's `last_error`; `"off"` disables the check.

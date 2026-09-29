@@ -59,7 +59,7 @@ impl Image for TeiImage {
 
     fn tag(&self) -> &str {
         // Use CPU gRPC image for CI compatibility
-        "cpu-1.9.2-grpc"
+        "cpu-1.9.4-grpc"
     }
 
     fn ready_conditions(&self) -> Vec<WaitFor> {

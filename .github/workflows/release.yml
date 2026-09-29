@@ -64,10 +64,11 @@ jobs:
       - name: Parse release config
         id: config
         run: |
-          # Get version from release-please or Cargo.toml
-          if [[ -n "${{ needs.release-please.outputs.version }}" ]]; then
-            VERSION="${{ needs.release-please.outputs.version }}"
-          else
+          # Get version from release-please or Cargo.toml. On workflow_dispatch
+          # release-please emits empty components (version ".."), so require a
+          # real semver before trusting it.
+          VERSION="${{ needs.release-please.outputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
